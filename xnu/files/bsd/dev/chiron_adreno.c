@@ -836,47 +836,120 @@ step_counter_after_power(void)
  * GPU's micro-MMU passes through by default while no context is programmed. If that assumption
  * is wrong the micro engine will fault and CP_HW_FAULT will say so -- which is why that
  * register is read before and after, and printed raw either way.
- *
- * (The allocation helpers arrive with step 4, which is the first step that needs memory of its
- * own; step 3 takes the microcode's address from the loader instead.)
  */
+extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+extern uint64_t kvtophys(vm_offset_t va);
+
+/* The kernel's own view of a page it just wrote, before the GPU is told to read it. */
+static void
+to_memory(vm_offset_t start, vm_size_t size)
+{
+	/* The GPU reads memory, not this processor's cache (redwood_adreno.c:1217). */
+	for (vm_offset_t at = start; at < start + size; at += 64) {
+		__asm__ volatile ("dc civac, %0" : : "r" (at) : "memory");
+	}
+	__asm__ volatile ("dsb sy" : : : "memory");
+}
 
 /*
- * The microcode itself. The files travel with the kernel in the small image, as redwood's do
- * (fw/ of the RAM disk, redwood_image.c) -- but this step has no reader for them yet, so what
- * it does instead is worth stating plainly rather than hiding:
- *
- *   the file is not in the repository and cannot be shipped in it, so this step loads the
- *   microcode only if the boot-arg chiron_microcode names a physical address where the loader
- *   has already put the bytes. Without it, this step runs everything up to the point where
- *   microcode is needed, and says exactly what is missing.
- *
- * That keeps the step useful when the firmware is not available (all of RBBM is still set and
- * read back, which is most of what can be verified without a micro engine) and honest when it
- * is: with the address given, the whole path is exercised.
+ * A file of the small image that travels with the kernel, the way redwood's driver finds its
+ * firmware: userland/build.sh puts what is in fw-gpu/ into the image's directory fw/, and
+ * redwood_image.c hands back a pointer to it (bsd/dev/redwood_image.c:26).
  */
+extern const uint8_t *redwood_image_file(const char *dir, const char *name, uint64_t *size, int *disk_out);
+
+static const uint8_t *
+firmware_file(const char *name, uint64_t *size)
+{
+	int disk = -1;
+	const uint8_t *data = redwood_image_file("fw", name, size, &disk);
+
+	if (data != NULL) {
+		say("chiron-adreno: %u: fw/%s: %llu bytes from the image of /dev/md%d\n",
+		    step, name, (unsigned long long)*size, disk);
+		return data;
+	}
+	say("chiron-adreno: %u: no fw/%s in the small image (put the phone's /vendor/firmware/%s into\n"
+	    "chiron-adreno: %u:   fw-gpu/ and run userland/build.sh)\n", step, name, name, step);
+	return NULL;
+}
+
+/*
+ * Put one microcode file where the GPU can read it, and return its physical address.
+ *
+ * The file is the microcode with one dword of version in front of it:
+ *   adreno_a5xx.c:2547  memcpy(ucode->hostptr, &fw->data[4], fw->size - 4);
+ *   adreno_a5xx.c:2549  *ucode_version = *(unsigned int *)&fw->data[4];
+ * The version is printed -- for this phone's a530_pm4.fw it should be 0x005ff063 -- because a
+ * file that is not what we think it is should say so before it is handed to a micro engine.
+ */
+static uint64_t
+microcode_in_memory(const char *name, uint32_t *version)
+{
+	const uint8_t *data;
+	uint64_t size = 0;
+	vm_offset_t memory = 0;
+	uint32_t dwords;
+
+	data = firmware_file(name, &size);
+	if (data == NULL) {
+		return 0;
+	}
+	if (size <= UCODE_HEADER_DWORDS * 4) {
+		say("chiron-adreno: %u: fw/%s is %llu bytes: too short to hold a version and any code\n",
+		    step, name, (unsigned long long)size);
+		return 0;
+	}
+
+	*version = *(const uint32_t *)data;
+	dwords = (uint32_t)((size - UCODE_HEADER_DWORDS * 4) / 4);
+	say("chiron-adreno: %u: fw/%s: version %#010x, %u dwords of code after it\n",
+	    step, name, *version, dwords);
+
+	if (kmem_alloc(kernel_map, &memory, round_page(size),
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || memory == 0) {
+		say("chiron-adreno: %u: cannot allocate %llu bytes for fw/%s\n", step,
+		    (unsigned long long)size, name);
+		return 0;
+	}
+	memcpy((void *)memory, data + UCODE_HEADER_DWORDS * 4, size - UCODE_HEADER_DWORDS * 4);
+	to_memory(memory, size);
+
+	say("chiron-adreno: %u: fw/%s: %u dwords at %#llx (physical), kernel address %#lx\n",
+	    step, name, dwords, (unsigned long long)kvtophys(memory), (unsigned long)memory);
+	return kvtophys(memory);
+}
+
+/*
+ * The microcode itself, from the phone's own /vendor/firmware, found in the small image that
+ * travels with the kernel. a540 uses a530's command processor firmware -- there is no
+ * "a540_pm4.fw", which is the kind of thing that costs a day if it is assumed:
+ *   adreno-gpulist.h:251  .pm4fw_name = "a530_pm4.fw"
+ *   adreno-gpulist.h:252  .pfpfw_name = "a530_pfp.fw"
+ * (the a540 entry of that table).
+ */
+#define A540_PM4_FW             "a530_pm4.fw"
+#define A540_PFP_FW             "a530_pfp.fw"
+
 static uint64_t microcode_pm4, microcode_pfp;
 
 static bool
-step_microcode(uint32_t named_pm4, uint32_t named_pfp)
+step_microcode(void)
 {
-	uint64_t pm4 = 0, pfp = 0;
+	uint32_t pm4_version = 0, pfp_version = 0;
 
-	announce("the command processor's microcode");
-	if (named_pm4 == 0 || named_pfp == 0) {
-		say("chiron-adreno: %u: no microcode: chiron_microcode=<pm4 phys>,<pfp phys> was not given.\n"
-		    "chiron-adreno: %u:   a540 uses \"a530_pm4.fw\" and \"a530_pfp.fw\" (adreno-gpulist.h:251),\n"
-		    "chiron-adreno: %u:   each with one dword of version in front of the code (adreno_a5xx.c:2547).\n"
-		    "chiron-adreno: %u:   The micro engine is NOT started; everything below still runs, because\n"
-		    "chiron-adreno: %u:   the rest of RBBM can be set and read back without it.\n", step, step, step, step, step);
+	announce("the command processor's microcode: a530_pm4.fw and a530_pfp.fw for this a540");
+
+	microcode_pm4 = microcode_in_memory(A540_PM4_FW, &pm4_version);
+	microcode_pfp = microcode_in_memory(A540_PFP_FW, &pfp_version);
+
+	if (microcode_pm4 == 0 || microcode_pfp == 0) {
+		say("chiron-adreno: %u: the microcode is not there: the micro engine is NOT started.\n"
+		    "chiron-adreno: %u:   Everything else in this step still runs -- RBBM is set and read back,\n"
+		    "chiron-adreno: %u:   which is most of what can be verified without an engine -- and the\n"
+		    "chiron-adreno: %u:   report below says plainly that the engine was not started.\n", step, step, step, step);
 		return false;
 	}
-	pm4 = named_pm4;
-	pfp = named_pfp;
-	say("chiron-adreno: %u: microcode as the loader left it: pm4 at %#llx, pfp at %#llx\n",
-	    step, (unsigned long long)pm4, (unsigned long long)pfp);
-	microcode_pm4 = pm4;
-	microcode_pfp = pfp;
 	return true;
 }
 
@@ -1035,7 +1108,7 @@ step_core_start(void)
 void
 chiron_adreno_init(void)
 {
-	uint32_t asked = 0, mc_pm4 = 0, mc_pfp = 0;
+	uint32_t asked = 0;
 
 	say("chiron-adreno: Adreno 540 (a5xx) driver present, built %s %s, steps up to %u\n",
 	    __DATE__, __TIME__, CHIRON_ADRENO_STEP);
@@ -1045,9 +1118,6 @@ chiron_adreno_init(void)
 		say("chiron-adreno: nothing done (boot-arg chiron_gpu=1 asks for it)\n");
 		return;
 	}
-	/* Where the microcode lies, if the loader put it there: two 32-bit physical addresses. */
-	PE_parse_boot_argn("chiron_pm4", &mc_pm4, sizeof(mc_pm4));
-	PE_parse_boot_argn("chiron_pfp", &mc_pfp, sizeof(mc_pfp));
 
 	for (step = 1; step <= CHIRON_ADRENO_STEP; step++) {
 		bool ok;
@@ -1072,7 +1142,7 @@ chiron_adreno_init(void)
 			 * what can be verified without one -- so "no microcode" is not a failure of the
 			 * step, it is a smaller step.
 			 */
-			ok = step_microcode(mc_pm4, mc_pfp);
+			ok = step_microcode();
 			step_rbbm();
 			if (ok) {
 				ok = step_core_start();

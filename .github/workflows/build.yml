@@ -216,25 +216,37 @@ jobs:
 
       - name: Build the kernel
         run: |
+          # BUILD_DSYM=0: the dSYM is debug symbols only, and the target that makes
+          # it calls theos' dsymutil with Apple's --minimize, which LLVM's dsymutil
+          # does not implement ("--minimize: command not found", after the kernel
+          # had already linked). MakeInc.kernel makes the dSYM a plain mkdir when
+          # BUILD_DSYM is not 1, so the kernel builds without it.
+          #
+          # xnu/README.md: make exits 2 even on success, because the export check
+          # and three symbolsets fail after linking. So judge by the artifact.
           set +e
-          ./xnu-build.sh -j"${{ github.event.inputs.jobs || 4 }}" -k > kernel-build.log 2>&1
+          BUILD_DSYM=0 ./xnu-build.sh -j"${{ github.event.inputs.jobs || 4 }}" -k > kernel-build.log 2>&1
           rc=$?
           set -e
-          echo "make exit: $rc"
-          K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
-          if [ -f "$K" ]; then
-            echo "kernel: $K ($(stat -c %s "$K") bytes)"
-            echo '--- the errors are expected after linking (xnu/README.md) ---'
-            grep -c 'error:' kernel-build.log || true
-          else
+          echo "make exit: $rc (2 with a kernel is normal, see xnu/README.md)"
+
+          D=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837
+          K=""
+          for c in "$D/mach.development.bcm2837" "$D/mach.development.bcm2837.unstripped"; do
+            [ -f "$c" ] && K="$c" && break
+          done
+          if [ -z "$K" ]; then
             echo 'no kernel produced'
             tail -60 kernel-build.log
             exit 1
           fi
+          echo "kernel: $K ($(stat -c %s "$K") bytes)"
+          cp "$K" mach.development.bcm2837
+          echo "--- expected post-link errors: $(grep -c 'error:' kernel-build.log || true) ---"
 
       - name: The kernel must contain our platform code
         run: |
-          K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          K=mach.development.bcm2837
           python3 - "$K" <<'PY'
           import sys
           d = open(sys.argv[1], 'rb').read()
@@ -248,7 +260,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: mach.development.bcm2837
-          path: xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          path: mach.development.bcm2837
           if-no-files-found: error
 
       - uses: actions/upload-artifact@v4

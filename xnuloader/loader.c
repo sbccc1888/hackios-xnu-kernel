@@ -558,8 +558,33 @@ static const struct platform platform_redwood = {
  * device adds its description here (common/new-device.sh writes a starting point, docs/PORTING.md says
  * where each value comes from); a display that matches none is QEMU's ramfb.
  */
+/*
+ * chiron (Xiaomi Mi MIX 2, MSM8998). From the phone's own device tree
+ * (Android-chiron.dtb):
+ *   arm,gic-v3 reg = <0x17a00000 0x10000 0x17b00000 0x100000>
+ *   cpu@0..3   reg 0x0..0x3,   efficiency 0x400   (the little cluster)
+ *   cpu@100..  reg 0x100..,    efficiency 0x600   (MPIDR aff1 -> core_shift 8)
+ */
+static const struct platform platform_chiron = {
+	.name = "chiron",
+	/* msm8998's peripherals sit in 0x00000000-0x1FFFFFFF; a non-zero base keeps
+	 * XNU from concluding there is no clock hardware. */
+	.io_base = 0x00400000, .io_size = 0x1FC00000,
+	.gic_dist = 0x17a00000,
+	.gic_redist = 0x17b00000,
+	.uart = 0,
+	.psci_hvc = 0,                  /* phones call PSCI with SMC */
+	.log_other_cpu = 0,
+	.cores = 8,
+	.core_shift = 8,
+	.timeout_scale = 0,
+	.small_cores = 0x0F,            /* cpu@0..3 */
+	.fb_base = 0x9D400000,          /* 1080 x 2160 continuous splash */
+};
+
 static const struct platform *const platforms[] = {
 	&platform_redwood,
+	&platform_chiron,
 };
 
 /* ------------------------------------------------------------------------ */

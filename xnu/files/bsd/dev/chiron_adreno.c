@@ -62,9 +62,10 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  */
 extern void loader_log_putc(char c);
 
-#define CHIRON_ADRENO_STEP 3            /* the last step this file performs */
+#define CHIRON_ADRENO_STEP 4            /* the last step this file performs */
 
 static uint32_t step;                   /* the one being performed */
+static bool core_started;               /* step 3 got the micro engine going: step 4 needs it */
 
 static int say(const char *format, ...) __printflike(1, 2);
 
@@ -1101,6 +1102,245 @@ step_core_start(void)
 	return true;
 }
 
+/* ====================================================================================================
+ * step 4: a ring buffer, CP_ME_INIT, and the proof step 3 could not give -- the CP reads what it
+ * is given
+ * ==================================================================================================== */
+
+/*
+ * Step 3 could say that the micro engine was let out of halt and did not fault. That is not the
+ * same as "it runs", and the difference matters: a stalled engine with an empty ring also does
+ * not fault. What settles it is giving the engine a command and watching the ring buffer's read
+ * pointer move -- the pointer is advanced by the command processor as it consumes, so if it
+ * moves the engine really is fetching and executing.
+ *
+ * The registers this needs, all from a5xx_reg.h:
+ *
+ *   0x800  CP_RB_BASE              :60     the ring's base address (its low bits: the size)
+ *   0x801  CP_RB_BASE_HI           :61
+ *   0x802  CP_RB_CNTL              :62     also holds the size in its low six bits
+ *   0x804  CP_RB_RPTR_ADDR_LO      :63     where the CP writes the read pointer into memory
+ *   0x805  CP_RB_RPTR_ADDR_HI      :64
+ *   0x806  CP_RB_RPTR              :65     the read pointer, as the CP has left it
+ *   0x807  CP_RB_WPTR              :66     the write pointer: what the host has published
+ *
+ * The order is a5xx_rb_start()'s (adreno_a5xx.c:2483-2529): RPTR_ADDR, RB_CNTL, RB_BASE,
+ * microcode (already done in step 3), then ME_HALT cleared, then CP_ME_INIT.
+ *
+ * CP_ME_INIT is a type-7 packet whose payload is the "ordinals" the microcode expects. The
+ * vendor's _set_ordinals() (adreno_a5xx.c:2356-2400) sends, with CP_INIT_MASK = BIT(0..5)
+ * (:2349-2353):
+ *
+ *   [0] CP_INIT_MASK itself                         = 0x3F
+ *   [1] CP_INIT_MAX_CONTEXT: 0x00000003 for a540    (:2363-2374; only a530v1 differs)
+ *   [2] CP_INIT_ERROR_DETECTION_CONTROL             = 0x20000000  (:2376-2377)
+ *   [3] CP_INIT_HEADER_DUMP address                 = 0         (:2379-2384)
+ *   [4] CP_INIT_HEADER_DUMP enable and size         = 0
+ *   [5] CP_INIT_DRAWCALL_FILTER_RANGE start         = 0         (:2386-2390)
+ *   [6] CP_INIT_DRAWCALL_FILTER_RANGE end           = 0
+ *   [7] CP_INIT_UCODE_WORKAROUND_MASK               = 0 for anything but a530 (:2393)
+ *
+ * so CP_ME_INIT(8) with the eight dwords below -- which is exactly what the upstream driver
+ * sends too (a5xx_gpu.c:402-437, where the non-a530 branch leaves the workarounds at 0).
+ *
+ * How a type-7 packet word is built (adreno_pm4types.h:188-194):
+ *   type 7 | count<<0 | odd_parity(count)<<15 | (opcode & 0x7f)<<16 | odd_parity(opcode)<<23
+ * and the parity is a real constraint: the CP drops a packet whose parity is wrong, so it is
+ * computed here rather than tabulated.
+ */
+#define CP_RB_RPTR_ADDR_LO          0x804
+#define CP_RB_RPTR_ADDR_HI          0x805
+#define CP_RB_RPTR                  0x806
+#define CP_RB_WPTR                  0x807
+
+#define CP_TYPE7_PKT                0x70000000u
+#define CP_ME_INIT                  0x48
+#define CP_INTERRUPT                0x40
+
+/* adreno_pm4types.h: pm4_calc_odd_parity_bit() -- the bit is set when the input's population
+ * count is even, so that the whole field including it has an odd count. */
+static uint32_t
+odd_parity(uint32_t value)
+{
+	uint32_t bits = value & 0x7fu;
+	uint32_t ones = 0;
+
+	for (unsigned i = 0; i < 7; i++) {
+		ones += (bits >> i) & 1u;
+	}
+	return ones & 1u ? 0u : 1u;
+}
+
+static uint32_t
+cp_type7(uint32_t opcode, uint32_t count)
+{
+	return CP_TYPE7_PKT | (count & 0x3fffu) | (odd_parity(count) << 15) |
+	    ((opcode & 0x7fu) << 16) | (odd_parity(opcode) << 23);
+}
+
+/* The ring, and where the CP writes the read pointer it keeps. */
+static vm_offset_t ring_memory, ring_rptr_memory;
+static uint64_t ring_phys, ring_rptr_phys;
+static uint32_t ring_words;
+
+static bool
+ring_allocate(void)
+{
+	if (kmem_alloc(kernel_map, &ring_memory, round_page(RING_SIZE),
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || ring_memory == 0) {
+		say("chiron-adreno: %u: cannot allocate the ring (%u bytes)\n", step, (unsigned)RING_SIZE);
+		return false;
+	}
+	if (kmem_alloc(kernel_map, &ring_rptr_memory, PAGE_SIZE,
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || ring_rptr_memory == 0) {
+		say("chiron-adreno: %u: cannot allocate the ring's read-pointer word\n", step);
+		return false;
+	}
+	ring_phys = kvtophys(ring_memory);
+	ring_rptr_phys = kvtophys(ring_rptr_memory);
+	if (ring_phys == 0 || ring_rptr_phys == 0) {
+		say("chiron-adreno: %u: the ring has no physical address\n", step);
+		return false;
+	}
+	say("chiron-adreno: %u: ring: %u dwords at %#llx (physical); read pointer word at %#llx\n",
+	    step, (unsigned)RING_DWORDS, (unsigned long long)ring_phys, (unsigned long long)ring_rptr_phys);
+	return true;
+}
+
+/* Put words into the ring and publish them: this is the host's side of the contract. */
+static bool
+ring_send(const char *what, const uint32_t *words, uint32_t count)
+{
+	uint32_t *ring = (uint32_t *)ring_memory;
+
+	if (count > RING_DWORDS - ring_words) {
+		say("chiron-adreno: %u: %s needs %u words, %u left\n", step, what, count,
+		    (unsigned)(RING_DWORDS - ring_words));
+		return false;
+	}
+	for (uint32_t i = 0; i < count; i++) {
+		ring[ring_words + i] = words[i];
+	}
+	ring_words += count;
+	to_memory(ring_memory, RING_SIZE);
+
+	/* "Make sure everything is posted before making a decision" (a5xx_gpu.c:39-40) */
+	__asm__ volatile ("dsb sy" : : : "memory");
+	put(&kgsl, "cp_rb_wptr", CP_RB_WPTR, ring_words);
+	say("chiron-adreno: %u: %s: %u words given, wptr now %u\n", step, what, count, ring_words);
+	return true;
+}
+
+/* How many commands the CP says it has consumed. */
+static uint32_t
+ring_rptr(bool refresh)
+{
+	uint32_t rptr;
+
+	if (refresh) {
+		/* The CP writes the pointer into memory; read it from the memory it wrote. */
+		__asm__ volatile ("dc ivac, %0" : : "r" (ring_rptr_memory) : "memory");
+		__asm__ volatile ("dsb sy" : : : "memory");
+	}
+	rptr = rd(kgsl.base + CP_RB_RPTR);
+	return rptr;
+}
+
+static bool
+step_ring(void)
+{
+	uint32_t me_init[9];
+	uint32_t rptr_before, rptr_after = 0;
+	unsigned moved = 0;
+
+	announce("a ring buffer for the command processor, and CP_ME_INIT in it");
+
+	if (!ring_allocate()) {
+		return false;
+	}
+
+	/* a5xx_rb_start()'s order (adreno_a5xx.c:2493-2506): RPTR_ADDR, then CNTL, then BASE. */
+	put(&kgsl, "cp_rb_rptr_addr_lo", CP_RB_RPTR_ADDR_LO, (uint32_t)(ring_rptr_phys & 0xffffffffu));
+	put(&kgsl, "cp_rb_rptr_addr_hi", CP_RB_RPTR_ADDR_HI, (uint32_t)(ring_rptr_phys >> 32));
+	put(&kgsl, "cp_rb_cntl", CP_RB_CNTL, CP_RB_CNTL_DEFAULT);
+	put(&kgsl, "cp_rb_base", CP_RB_BASE, (uint32_t)(ring_phys & 0xffffffffu));
+	put(&kgsl, "cp_rb_base_hi", CP_RB_BASE + 1, (uint32_t)(ring_phys >> 32));
+
+	rptr_before = ring_rptr(true);
+	say("chiron-adreno: %u: cp_rb_rptr before anything is sent: %u\n", step, rptr_before);
+
+	/*
+	 * CP_ME_INIT and, behind it, an interrupt packet: the interrupt makes the CP touch an
+	 * address it would otherwise skip when idle, and it is a second, differently-shaped packet
+	 * -- so a pointer that moves past both is a pointer the engine really walked.
+	 */
+	me_init[0] = cp_type7(CP_ME_INIT, 8);
+	me_init[1] = 0x3f;              /* CP_INIT_MASK: every ordinal below is present */
+	me_init[2] = 0x00000003;        /* CP_INIT_MAX_CONTEXT: 3D and 2D, as a540 gets (:2370) */
+	me_init[3] = 0x20000000;        /* CP_INIT_ERROR_DETECTION_CONTROL (:2376) */
+	me_init[4] = 0x0;               /* CP_INIT_HEADER_DUMP address */
+	me_init[5] = 0x0;               /* CP_INIT_HEADER_DUMP enable and size */
+	me_init[6] = 0x0;               /* CP_INIT_DRAWCALL_FILTER_RANGE start */
+	me_init[7] = 0x0;               /* CP_INIT_DRAWCALL_FILTER_RANGE end */
+	me_init[8] = 0x0;               /* CP_INIT_UCODE_WORKAROUND_MASK: 0 for anything but a530 */
+
+	say("chiron-adreno: %u: CP_ME_INIT as a type-7 word: %#010x (opcode %#x, count 8, parity "
+	    "%u/%u)\n", step, me_init[0], CP_ME_INIT, odd_parity(CP_ME_INIT), odd_parity(8));
+
+	if (!ring_send("CP_ME_INIT", me_init, 9)) {
+		return false;
+	}
+
+	/* Then one more packet, so the pointer has two boundaries to cross. */
+	{
+		uint32_t interrupt = cp_type7(CP_INTERRUPT, 1);
+		uint32_t words[2];
+
+		words[0] = interrupt;
+		words[1] = 0;           /* the interrupt's own word */
+		if (!ring_send("CP_INTERRUPT", words, 2)) {
+			return false;
+		}
+	}
+
+	announce("the read pointer, polled: if it moves, the engine is fetching and executing");
+	for (unsigned i = 0; i < 200; i++) {
+		uint32_t now = ring_rptr(i == 0);
+
+		if (now != rptr_after) {
+			say("chiron-adreno: %u: cp_rb_rptr = %u (wptr %u) at %u ms\n", step, now, ring_words, i);
+			rptr_after = now;
+		}
+		if (now == ring_words) {
+			moved = 1;
+			break;
+		}
+		sleep_us(1000);
+	}
+
+	say("chiron-adreno: %u: cp_rb_rptr began at %u, is %u, and wptr is %u\n",
+	    step, rptr_before, ring_rptr(true), ring_words);
+	if (moved) {
+		say("chiron-adreno: %u: THE COMMAND PROCESSOR READ EVERYTHING IT WAS GIVEN. It is running\n"
+		    "chiron-adreno: %u:   and executing: this is the proof step 3 could not give.\n", step, step);
+		return true;
+	}
+
+	/* It did not get all the way. Say how far and what the CP's own fault word says. */
+	say("chiron-adreno: %u: the read pointer did not reach the write pointer in 200 ms\n", step);
+	say("chiron-adreno: %u:   cp_hw_fault = %#010x, rbbm_status = %#010x\n", step,
+	    rd(kgsl.base + CP_HW_FAULT), rd(kgsl.base + RBBM_STATUS));
+	if (rptr_after != rptr_before) {
+		say("chiron-adreno: %u:   it did move (%u -> %u), so the engine is fetching; it stopped part\n"
+		    "chiron-adreno: %u:   way, which points at the packet it stopped on rather than the ring\n",
+		    step, rptr_before, rptr_after, step);
+	} else {
+		say("chiron-adreno: %u:   it never moved at all. The engine is not fetching: either it is not\n"
+		    "chiron-adreno: %u:   running, or the ring's address is not one it can read\n", step, step);
+	}
+	return false;
+}
+
 /*
  * Say that this driver is here, and which build of it: a string only this file has, made at
  * compile time, so a kernel that prints it has this code in it and not a stale copy.
@@ -1149,6 +1389,22 @@ chiron_adreno_init(void)
 			} else {
 				say("chiron-adreno: %u: RBBM was set and read back; the micro engine was not started\n", step);
 			}
+			/*
+			 * Remembered for step 4: what it needs is not "step 3 passed" but "the engine is
+			 * running", which is a narrower thing and the one it should act on.
+			 */
+			core_started = ok;
+			break;
+		case 4:
+			/* A ring with no running engine would only write into memory nothing reads. */
+			if (!core_started) {
+				say("chiron-adreno: %u: the micro engine is not running, so a ring would not be read:\n"
+				    "chiron-adreno: %u:   this step is not attempted. That is the finding, not a skip.\n",
+				    step, step);
+				ok = false;
+				break;
+			}
+			ok = step_ring();
 			break;
 		default:
 			ok = false;

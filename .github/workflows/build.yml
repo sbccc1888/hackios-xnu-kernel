@@ -174,8 +174,41 @@ jobs:
       - name: Apply the XNU sources and our changes
         run: ./xnu/apply.sh
 
+      - name: Toolchain inventory before the build
+        run: |
+          # exporthdrs needs mig, unifdef, the SDK and cctools to agree. Print what
+          # is actually on PATH so a version problem is visible in the log rather
+          # than inferred from a generic failure.
+          echo '--- cc / clang ---'; cc --version | head -1; clang --version | head -1
+          echo '--- as/ld on PATH (cctools should win) ---'
+          for t in ld as nm strip otool ar; do printf '  %-6s %s\n' "$t" "$(command -v $t)"; done
+          echo '--- theos ---'; ls "$THEOS" 2>/dev/null
+          echo '  sdk:   '; ls "$THEOS/sdks" 2>/dev/null
+          echo '  cctools:'; ls "$THEOS/toolchain/linux/iphone/bin" 2>/dev/null | wc -l
+          echo '--- perl / bison / flex / m4 ---'
+          for t in perl bison flex m4 python3; do printf '  %-8s %s\n' "$t" "$($t --version 2>&1 | head -1)"; done
+
       - name: Kernel dependencies (SDK overlay, host tools, libraries)
-        run: ./xnu-deps/setup.sh
+        run: |
+          # setup.sh reports "the kernel headers were not exported" and points at
+          # xnu-deps/exporthdrs.log, but it fails before anything prints that log.
+          # Capture it here so a red job says why rather than where.
+          set +e
+          ./xnu-deps/setup.sh
+          rc=$?
+          set -e
+          if [ $rc -ne 0 ]; then
+            echo "::group::xnu-deps/setup.sh failed (exit $rc)"
+            for f in xnu-deps/exporthdrs.log xnu-deps/setup.log; do
+              [ -f "$f" ] || continue
+              echo "=== $f (last 120 lines) ==="
+              tail -120 "$f"
+            done
+            echo "=== any other logs under xnu-deps ==="
+            find xnu-deps -maxdepth 1 -name '*.log' -printf '  %p (%s bytes)\n'
+            echo "::endgroup::"
+            exit $rc
+          fi
 
       - name: Build the kernel
         run: |

@@ -62,7 +62,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  */
 extern void loader_log_putc(char c);
 
-#define CHIRON_ADRENO_STEP 2            /* the last step this file performs */
+#define CHIRON_ADRENO_STEP 3            /* the last step this file performs */
 
 static uint32_t step;                   /* the one being performed */
 
@@ -708,6 +708,326 @@ step_counter_after_power(void)
 	}
 }
 
+/* ====================================================================================================
+ * step 3: RBBM as a540 wants it, the CP's microcode in place, the micro engine out of halt
+ * ==================================================================================================== */
+
+/*
+ * The register block of the 3D core, and the addresses this step uses, all out of
+ * drivers/gpu/msm/a5xx_reg.h (the vendor's own list for this part):
+ *
+ *   0x4F5  RBBM_STATUS                 :495   its bits, a5xx.xml.h:1263+:
+ *                                                CP_ME_BUSY   BIT(1)   CP_PFP_BUSY   BIT(2)
+ *                                                CP_BUSY      BIT(6)   GPMU_MASTER_BUSY BIT(5)
+ *                                                CP_CRASH_BUSY BIT(4)  GPU_BUSY_IGN_AHB BIT(31)
+ *   0xB1A  CP_HW_FAULT                 :108   the command processor's own fault word
+ *   0x800  CP_RB_BASE                  :60
+ *   0x802  CP_RB_CNTL                  :62
+ *   0x832  CP_ME_CNTL                  :91    clearing ME_HALT starts the micro engine
+ *   0x835  CP_PFP_INSTR_BASE_LO        :93
+ *   0x838  CP_PM4_INSTR_BASE_LO        :95
+ *   0x46F  RBBM_PERFCTR_GPU_BUSY_MASKED :512
+ *   0x464  RBBM_PERFCTR_CNTL           :501
+ *   0x38   RBBM_INT_0_MASK             :176
+ *   0x93   RBBM_AHB_CNTL0              :254
+ *   0x94   RBBM_AHB_CNTL1              :255
+ *   0x95   RBBM_AHB_CNTL2              :256
+ *   0xE96  UCHE_CACHE_WAYS             :656
+ *   0xE81  UCHE_MODE_CNTL              :645
+ *   0xE87  UCHE_WRITE_THRU_BASE_LO     :646
+ *   0xE89  UCHE_TRAP_BASE_LO           :648
+ *   0xE8B  UCHE_GMEM_RANGE_MIN_LO      :650
+ *   0xE8D  UCHE_GMEM_RANGE_MAX_LO      :652
+ *   0xE8F  UCHE_DBG_ECO_CNTL_2         :654
+ *   0x81F  CP_ROQ_THRESHOLDS_1         :75
+ *   0x820  CP_ROQ_THRESHOLDS_2         :76
+ *   0x825  CP_MEQ_THRESHOLDS           :81
+ *   0x826  CP_MERCIU_SIZE              :82
+ *   0x833  CP_CHICKEN_DBG              :92
+ *   0xD00  PC_DBG_ECO_CNTL             :599
+ *   0xCC6  RB_MODE_CNTL                :566
+ *   0xE60  VPC_DBG_ECO_CNTL            :636
+ *   0xF02  TPL1_MODE_CNTL              :696
+ *   0x43   RBBM_SW_RESET_CMD           :179
+ *   0x4D2  RBBM_ALWAYSON_COUNTER_LO    :493
+ */
+#define RBBM_STATUS                 0x4f5
+#define CP_HW_FAULT                 0xb1a
+#define CP_RB_BASE                  0x800
+#define CP_RB_CNTL                  0x802
+#define CP_ME_CNTL                  0x832
+#define CP_PFP_INSTR_BASE_LO        0x835
+#define CP_PFP_INSTR_BASE_HI        0x836
+#define CP_PM4_INSTR_BASE_LO        0x838
+#define CP_PM4_INSTR_BASE_HI        0x839
+#define RBBM_PERFCTR_GPU_BUSY_MASKED 0x46f
+#define RBBM_PERFCTR_CNTL           0x464
+#define RBBM_INT_0_MASK             0x38
+#define RBBM_AHB_CNTL0              0x93
+#define RBBM_AHB_CNTL1              0x94
+#define RBBM_AHB_CNTL2              0x95
+#define UCHE_CACHE_WAYS             0xe96
+#define UCHE_MODE_CNTL              0xe81
+#define UCHE_WRITE_THRU_BASE_LO     0xe87
+#define UCHE_WRITE_THRU_BASE_HI     0xe88
+#define UCHE_TRAP_BASE_LO           0xe89
+#define UCHE_TRAP_BASE_HI           0xe8a
+#define UCHE_GMEM_RANGE_MIN_LO      0xe8b
+#define UCHE_GMEM_RANGE_MIN_HI      0xe8c
+#define UCHE_GMEM_RANGE_MAX_LO      0xe8d
+#define UCHE_GMEM_RANGE_MAX_HI      0xe8e
+#define UCHE_DBG_ECO_CNTL_2         0xe8f
+#define CP_ROQ_THRESHOLDS_1         0x81f
+#define CP_ROQ_THRESHOLDS_2         0x820
+#define CP_MEQ_THRESHOLDS           0x825
+#define CP_MERCIU_SIZE              0x826
+#define CP_CHICKEN_DBG              0x833
+#define PC_DBG_ECO_CNTL             0xd00
+#define RB_MODE_CNTL                0xcc6
+#define VPC_DBG_ECO_CNTL            0xe60
+#define TPL1_MODE_CNTL              0xf02
+#define RBBM_SW_RESET_CMD           0x43
+
+/* RBBM_STATUS bits (a5xx.xml.h:1263-1295). */
+#define RBBM_STATUS_CP_ME_BUSY          (1u << 1)
+#define RBBM_STATUS_CP_PFP_BUSY         (1u << 2)
+#define RBBM_STATUS_CP_CRASH_BUSY       (1u << 4)
+#define RBBM_STATUS_CP_BUSY             (1u << 6)
+#define RBBM_STATUS_GPU_BUSY_IGN_AHB    (1u << 31)
+
+/* ADRENO_UCHE_GMEM_BASE, the UCHE's view of GMEM (adreno.h:154). */
+#define UCHE_GMEM_BASE              0x100000
+/* GMEM size for a540: SZ_1M (adreno-gpulist.h, the a540 entry's .gmem_size). */
+#define A540_GMEM_SIZE              0x100000
+/*
+ * qcom,highest-bank-bit = <0x0f> (chiron.dts:10134). adreno_a5xx.c:2054-2073 turns it into
+ * a two-bit field: "if (bit >= 13 && bit <= 16) { bit = (bit - 13) & 0x03; }" -- 15 - 13 = 2.
+ */
+#define A540_HIGHEST_BANK_BIT       2
+/*
+ * CP_RB_CNTL_DEFAULT (adreno_a5xx.h:115-116):
+ *   (((ilog2(4) << 8) & 0x1F00) | (ilog2(KGSL_RB_DWORDS >> 1) & 0x3F))
+ * with KGSL_RB_SIZE 32 KiB (adreno_ringbuffer.h:29) so KGSL_RB_DWORDS = 8192
+ * (adreno_ringbuffer.h:35), and ilog2(4096) = 12, ilog2(4) = 2:
+ *   ((2 << 8) & 0x1F00) | (12 & 0x3F) = 0x200 | 0x0C = 0x20C
+ */
+#define CP_RB_CNTL_DEFAULT          0x20c
+/* The ring buffer's size this driver would use; step 4 needs it, step 3 only sets the fields. */
+#define RING_SIZE                   0x8000
+#define RING_DWORDS                 (RING_SIZE / 4)
+
+/*
+ * The command processor's microcode, from the phone's own /vendor/firmware. a540 uses a530's
+ * ("a530_pm4.fw", "a530_pfp.fw" -- adreno-gpulist.h:251-252, the a540 entry), which is the
+ * kind of detail that is easy to get wrong: there is no "a540_pm4.fw".
+ *
+ * Each file is the microcode with one dword of version in front of it:
+ *   adreno_a5xx.c:2547  memcpy(ucode->hostptr, &fw->data[4], fw->size - 4);
+ *   adreno_a5xx.c:2549  *ucode_version = *(unsigned int *)&fw->data[4];
+ * The bytes after that dword are copied unchanged into memory the GPU reads.
+ */
+#define UCODE_HEADER_DWORDS         1
+
+/*
+ * The ring buffer and the microcode have to be memory the GPU can read, so the kernel must
+ * hand over physical pages the GPU's own address space maps. This driver has no SMMU context
+ * yet (that is step 4's business), so for now it uses the physical addresses directly, which
+ * works only because on this port the kernel's memory is identity-mapped at the addresses the
+ * GPU's micro-MMU passes through by default while no context is programmed. If that assumption
+ * is wrong the micro engine will fault and CP_HW_FAULT will say so -- which is why that
+ * register is read before and after, and printed raw either way.
+ *
+ * (The allocation helpers arrive with step 4, which is the first step that needs memory of its
+ * own; step 3 takes the microcode's address from the loader instead.)
+ */
+
+/*
+ * The microcode itself. The files travel with the kernel in the small image, as redwood's do
+ * (fw/ of the RAM disk, redwood_image.c) -- but this step has no reader for them yet, so what
+ * it does instead is worth stating plainly rather than hiding:
+ *
+ *   the file is not in the repository and cannot be shipped in it, so this step loads the
+ *   microcode only if the boot-arg chiron_microcode names a physical address where the loader
+ *   has already put the bytes. Without it, this step runs everything up to the point where
+ *   microcode is needed, and says exactly what is missing.
+ *
+ * That keeps the step useful when the firmware is not available (all of RBBM is still set and
+ * read back, which is most of what can be verified without a micro engine) and honest when it
+ * is: with the address given, the whole path is exercised.
+ */
+static uint64_t microcode_pm4, microcode_pfp;
+
+static bool
+step_microcode(uint32_t named_pm4, uint32_t named_pfp)
+{
+	uint64_t pm4 = 0, pfp = 0;
+
+	announce("the command processor's microcode");
+	if (named_pm4 == 0 || named_pfp == 0) {
+		say("chiron-adreno: %u: no microcode: chiron_microcode=<pm4 phys>,<pfp phys> was not given.\n"
+		    "chiron-adreno: %u:   a540 uses \"a530_pm4.fw\" and \"a530_pfp.fw\" (adreno-gpulist.h:251),\n"
+		    "chiron-adreno: %u:   each with one dword of version in front of the code (adreno_a5xx.c:2547).\n"
+		    "chiron-adreno: %u:   The micro engine is NOT started; everything below still runs, because\n"
+		    "chiron-adreno: %u:   the rest of RBBM can be set and read back without it.\n", step, step, step, step, step);
+		return false;
+	}
+	pm4 = named_pm4;
+	pfp = named_pfp;
+	say("chiron-adreno: %u: microcode as the loader left it: pm4 at %#llx, pfp at %#llx\n",
+	    step, (unsigned long long)pm4, (unsigned long long)pfp);
+	microcode_pm4 = pm4;
+	microcode_pfp = pfp;
+	return true;
+}
+
+/*
+ * Everything a5xx_start() does to RBBM and the CP before the micro engine runs, in its order
+ * (adreno_a5xx.c:1871-2098), with the a540 branch of each choice. Every value here is the
+ * vendor's, and the branch it comes from is named beside it.
+ */
+static void
+step_rbbm(void)
+{
+	announce("RBBM: the 3D core's register block, set as a540 wants it (adreno_a5xx.c:1871-2098)");
+
+	/* "Make all blocks contribute to the GPU BUSY perf counter" (adreno_a5xx.c:1875) */
+	put(&kgsl, "perfctr_busy_mask", RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffff);
+	/* "Enable the RBBM error reporting bits ... useful information on failure" (:1881) */
+	put(&kgsl, "ahb_cntl0", RBBM_AHB_CNTL0, 0x00000001);
+	/* "Turn on performance counters" (:1926) */
+	put(&kgsl, "perfctr_cntl", RBBM_PERFCTR_CNTL, 0x01);
+	/* "restricting VFD's cache access, so that LRZ and other data get evicted less" (:1932) */
+	put(&kgsl, "uche_cache_ways", UCHE_CACHE_WAYS, 0x02);
+	/* "Set UCHE_WRITE_THRU_BASE to the UCHE_TRAP_BASE effectively disabling L2 bypass" (:1938-1941) */
+	put(&kgsl, "uche_trap_lo", UCHE_TRAP_BASE_LO, 0xffff0000);
+	put(&kgsl, "uche_trap_hi", UCHE_TRAP_BASE_HI, 0x0001ffff);
+	put(&kgsl, "uche_wt_lo", UCHE_WRITE_THRU_BASE_LO, 0xffff0000);
+	put(&kgsl, "uche_wt_hi", UCHE_WRITE_THRU_BASE_HI, 0x0001ffff);
+	/* "Program the GMEM VA range for the UCHE path" (:1944-1950) */
+	put(&kgsl, "uche_gmem_min_lo", UCHE_GMEM_RANGE_MIN_LO, UCHE_GMEM_BASE);
+	put(&kgsl, "uche_gmem_min_hi", UCHE_GMEM_RANGE_MIN_HI, 0x0);
+	put(&kgsl, "uche_gmem_max_lo", UCHE_GMEM_RANGE_MAX_LO, UCHE_GMEM_BASE + A540_GMEM_SIZE - 1);
+	put(&kgsl, "uche_gmem_max_hi", UCHE_GMEM_RANGE_MAX_HI, 0x0);
+
+	/* a540 branch of the CP thresholds (adreno_a5xx.c:1968-1971) */
+	put(&kgsl, "cp_meq_thresholds", CP_MEQ_THRESHOLDS, 0x40);
+	put(&kgsl, "cp_merciu_size", CP_MERCIU_SIZE, 0x400);
+	put(&kgsl, "cp_roq_thresholds_2", CP_ROQ_THRESHOLDS_2, 0x80000060);
+	put(&kgsl, "cp_roq_thresholds_1", CP_ROQ_THRESHOLDS_1, 0x40201b16);
+
+	/* the "else" branch a540 falls into (:1991): 0x400 << 11 | 0x300 << 22 */
+	put(&kgsl, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL, (0x400u << 11) | (0x300u << 22));
+	/* "Disable UCHE global filter as SP can invalidate/flush independently" (:2027) */
+	put(&kgsl, "uche_mode_cntl", UCHE_MODE_CNTL, 1u << 29);
+	/* "Set the USE_RETENTION_FLOPS chicken bit" (:2029) */
+	put(&kgsl, "cp_chicken_dbg", CP_CHICKEN_DBG, 0x02000000);
+	/* not in ISDB mode: "enable ME/PFP split notification" (:2059) */
+	put(&kgsl, "ahb_cntl1", RBBM_AHB_CNTL1, 0xa6ffffff);
+	put(&kgsl, "ahb_cntl2", RBBM_AHB_CNTL2, 0x0000003f);
+
+	/* highest-bank-bit, from the device tree (:2054-2082), a540 only for the UCHE register */
+	put(&kgsl, "tpl1_mode_cntl", TPL1_MODE_CNTL, A540_HIGHEST_BANK_BIT << 7);
+	put(&kgsl, "rb_mode_cntl", RB_MODE_CNTL, A540_HIGHEST_BANK_BIT << 1);
+	put(&kgsl, "uche_dbg_eco_cntl_2", UCHE_DBG_ECO_CNTL_2, A540_HIGHEST_BANK_BIT);
+
+	/* "Disable All flat shading optimization" (:2089) */
+	put(&kgsl, "vpc_dbg_eco_cntl", VPC_DBG_ECO_CNTL, rd(kgsl.base + VPC_DBG_ECO_CNTL) | (1u << 10));
+
+	announce("RBBM read back: the values above, as the hardware holds them");
+	get(&kgsl, "ahb_cntl1", RBBM_AHB_CNTL1);
+	get(&kgsl, "ahb_cntl2", RBBM_AHB_CNTL2);
+	get(&kgsl, "cp_meq_thresholds", CP_MEQ_THRESHOLDS);
+	get(&kgsl, "pc_dbg_eco_cntl", PC_DBG_ECO_CNTL);
+	get(&kgsl, "uche_gmem_min_lo", UCHE_GMEM_RANGE_MIN_LO);
+	get(&kgsl, "uche_gmem_max_lo", UCHE_GMEM_RANGE_MAX_LO);
+	get(&kgsl, "tpl1_mode_cntl", TPL1_MODE_CNTL);
+}
+
+/*
+ * Start the micro engine, and then look at it. This is the first place where the answer can be
+ * "the 3D core is running", so the evidence is laid out rather than summarised:
+ *
+ *   CP_HW_FAULT      must be 0. Anything else is the command processor saying what it did not
+ *                    like, and it is printed in full.
+ *   RBBM_STATUS      its CP bits are what a running micro engine looks like -- but "busy" bits
+ *                    that never change are as suspicious as ones that never set, so the register
+ *                    is read several times and every value is printed, not just the last.
+ *
+ * What this does NOT prove: that the microcode is the right one, or that the core can render.
+ * It proves the command processor was let out of halt and did not fault.
+ */
+static bool
+step_core_start(void)
+{
+	uint32_t fault_before, fault_after, status;
+	unsigned busy_seen = 0, idle_seen = 0;
+
+	announce("the micro engine: its microcode's address in the CP, then ME_HALT cleared");
+
+	fault_before = get(&kgsl, "cp_hw_fault", CP_HW_FAULT);
+
+	put(&kgsl, "cp_pm4_base_lo", CP_PM4_INSTR_BASE_LO, (uint32_t)(microcode_pm4 & 0xffffffffu));
+	put(&kgsl, "cp_pm4_base_hi", CP_PM4_INSTR_BASE_HI, (uint32_t)(microcode_pm4 >> 32));
+	put(&kgsl, "cp_pfp_base_lo", CP_PFP_INSTR_BASE_LO, (uint32_t)(microcode_pfp & 0xffffffffu));
+	put(&kgsl, "cp_pfp_base_hi", CP_PFP_INSTR_BASE_HI, (uint32_t)(microcode_pfp >> 32));
+
+	/* The ring buffer's control register, so the CP has somewhere to fetch commands from. */
+	put(&kgsl, "cp_rb_cntl", CP_RB_CNTL, CP_RB_CNTL_DEFAULT);
+
+	/* "clear ME_HALT to start micro engine" (adreno_a5xx.c:2514) */
+	put(&kgsl, "cp_me_cntl", CP_ME_CNTL, 0);
+
+	/* Let it run, then look. Ten reads a millisecond apart: a value that never changes and a
+	 * value that changes every time mean different things, and both are worth seeing. */
+	announce("RBBM_STATUS ten times, a millisecond apart, to see whether the CP moves");
+	for (unsigned i = 0; i < 10; i++) {
+		status = rd(kgsl.base + RBBM_STATUS);
+		say("chiron-adreno: %u: rbbm_status [%#x] = %#010x%s%s%s\n", step, kgsl.phys + RBBM_STATUS, status,
+		    (status & RBBM_STATUS_CP_BUSY) ? " CP_BUSY" : "",
+		    (status & RBBM_STATUS_CP_ME_BUSY) ? " ME_BUSY" : "",
+		    (status & RBBM_STATUS_CP_PFP_BUSY) ? " PFP_BUSY" : "");
+		if (status & (RBBM_STATUS_CP_BUSY | RBBM_STATUS_CP_ME_BUSY | RBBM_STATUS_CP_PFP_BUSY)) {
+			busy_seen++;
+		} else {
+			idle_seen++;
+		}
+		sleep_us(1000);
+	}
+
+	fault_after = get(&kgsl, "cp_hw_fault", CP_HW_FAULT);
+	status = get(&kgsl, "rbbm_status_final", RBBM_STATUS);
+
+	say("chiron-adreno: %u: cp_hw_fault was %#010x and is %#010x\n", step, fault_before, fault_after);
+	say("chiron-adreno: %u: of ten reads, %u had a CP busy bit set and %u had none\n", step, busy_seen, idle_seen);
+
+	if (fault_after != 0) {
+		say("chiron-adreno: %u: THE COMMAND PROCESSOR FAULTED: cp_hw_fault = %#010x\n"
+		    "chiron-adreno: %u:   (rbbm_status %#010x, crash bit %s). A fault here means the micro\n"
+		    "chiron-adreno: %u:   engine started and refused something -- most often an instruction\n"
+		    "chiron-adreno: %u:   base address it cannot read. Raw values above.\n",
+		    step, fault_after, step, status, (status & RBBM_STATUS_CP_CRASH_BUSY) ? "set" : "clear", step, step);
+		return false;
+	}
+
+	/*
+	 * A micro engine with an empty ring and no work parks itself: CP_ME_BUSY will be clear most
+	 * of the time. What must not happen is the crash bit setting, or a fault. So the verdict is
+	 * drawn from those, and the busy counts are reported beside it as what they are -- a hint,
+	 * not the proof.
+	 */
+	if (status & RBBM_STATUS_CP_CRASH_BUSY) {
+		say("chiron-adreno: %u: the CP's crash bit is set (rbbm_status %#010x)\n", step, status);
+		return false;
+	}
+	say("chiron-adreno: %u: the micro engine was started, cp_hw_fault stayed 0, and the crash bit is clear\n", step);
+	if (busy_seen == 0) {
+		say("chiron-adreno: %u: NOTE: no busy bit was ever seen. With an empty ring that is not proof of\n"
+		    "chiron-adreno: %u:   failure, but it is not proof the engine runs either. Step 4 sends it a\n"
+		    "chiron-adreno: %u:   command and waits for the ring's read pointer to move, which is.\n", step, step, step);
+	}
+	return true;
+}
+
 /*
  * Say that this driver is here, and which build of it: a string only this file has, made at
  * compile time, so a kernel that prints it has this code in it and not a stale copy.
@@ -715,16 +1035,19 @@ step_counter_after_power(void)
 void
 chiron_adreno_init(void)
 {
+	uint32_t asked = 0, mc_pm4 = 0, mc_pfp = 0;
+
 	say("chiron-adreno: Adreno 540 (a5xx) driver present, built %s %s, steps up to %u\n",
 	    __DATE__, __TIME__, CHIRON_ADRENO_STEP);
 
 	/* Nothing happens unless a boot-arg asks for it, as in redwood_adreno.c. */
-	uint32_t asked = 0;
-
 	if (!PE_parse_boot_argn("chiron_gpu", &asked, sizeof(asked)) || asked == 0) {
 		say("chiron-adreno: nothing done (boot-arg chiron_gpu=1 asks for it)\n");
 		return;
 	}
+	/* Where the microcode lies, if the loader put it there: two 32-bit physical addresses. */
+	PE_parse_boot_argn("chiron_pm4", &mc_pm4, sizeof(mc_pm4));
+	PE_parse_boot_argn("chiron_pfp", &mc_pfp, sizeof(mc_pfp));
 
 	for (step = 1; step <= CHIRON_ADRENO_STEP; step++) {
 		bool ok;
@@ -740,6 +1063,21 @@ chiron_adreno_init(void)
 			ok = step_power() && step_gfx3d_clock();
 			if (ok) {
 				step_counter_after_power();
+			}
+			break;
+		case 3:
+			/*
+			 * RBBM is set either way; only the micro engine needs microcode. A step that
+			 * cannot start the engine still reports what RBBM holds, because that is most of
+			 * what can be verified without one -- so "no microcode" is not a failure of the
+			 * step, it is a smaller step.
+			 */
+			ok = step_microcode(mc_pm4, mc_pfp);
+			step_rbbm();
+			if (ok) {
+				ok = step_core_start();
+			} else {
+				say("chiron-adreno: %u: RBBM was set and read back; the micro engine was not started\n", step);
 			}
 			break;
 		default:

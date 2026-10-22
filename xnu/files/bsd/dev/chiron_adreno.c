@@ -89,7 +89,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  */
 extern void loader_log_putc(char c);
 
-#define CHIRON_ADRENO_STEP 6            /* the last step this file performs */
+#define CHIRON_ADRENO_STEP 7            /* the last step this file performs */
 
 static uint32_t step;                   /* the one being performed */
 static bool core_started;               /* step 3 got the micro engine going: step 4 needs it */
@@ -1859,8 +1859,14 @@ step_gpmu(void)
  *   0x0800 + 4*n  ARM_SMMU_GR0_SMR(n)    stream mapping register n  (arm-smmu.c:162)
  *   0x0c00 + 4*n  ARM_SMMU_GR0_S2CR(n)   stream-to-context register n (:169)
  *
- * S2CR's TYPE field says what a stream gets: 0 is "translation fault", 1 is "bypass" -- which
- * is exactly the distinction that decides whether this driver's physical addresses are right.
+ * S2CR's TYPE field says what a stream gets, and its values are stated once, at the constants
+ * below, where the source is quoted -- they are not what the names suggest.
+ *
+ * (Note that five SMMUs in this phone's device tree carry qcom,skip-init -- arm,smmu-anoc1
+ * @1680000 (:6060), arm,smmu-anoc2@16c0000 (:6079), arm,smmu-lpass_q6@5100000 (:6099),
+ * arm,smmu-mmss@cd00000 (:6118) and arm,smmu-kgsl@5040000 (:6143) -- so a search for that
+ * property finds one of the first four first. The GPU's is the last, and it is the only one
+ * this driver touches.)
  */
 static struct block smmu = { .name = "smmu", .phys = 0x05040000, .size = 0x10000 };
 
@@ -1984,6 +1990,258 @@ step_smmu_state(void)
 	return true;
 }
 
+/* ====================================================================================================
+ * step 7: the zap shader -- TrustZone authenticates it, and it is what lets the 3D core leave
+ * secure mode
+ * ==================================================================================================== */
+
+/*
+ * A GPU comes up in secure mode. Whether a kernel may take it out of secure mode is decided by
+ * TrustZone, and what TrustZone wants first is a signed "zap shader" for this GPU started
+ * through it: dt: qcom,kgsl-hyp (chiron.dts:10097-10100),
+ *
+ *   qcom,pas-id = <0x0d>;                -- 13, the same number redwood's driver uses for the GPU
+ *   qcom,firmware-name = "a540_zap";
+ *
+ * Note the name: a540_zap, not a530_zap. The CP microcode may be a530's, but the zap shader is
+ * not -- it is the image that unlocks this particular 3D core.
+ *
+ * This is the PIL "auth and reset" sequence, and redwood's driver already does the whole of it
+ * through a bare SMC (bsd/dev/redwood_adreno.c:1503-1550 for the call, :2639-2697 for the
+ * sequence). Nothing of that is a6xx-specific -- it is TrustZone's interface -- so the same
+ * calls apply here with a different image, which is the cheapest kind of reuse: the mechanism
+ * carries over, only the file name changes.
+ *
+ *   1. PAS_SHUTDOWN          give up any zap shader a previous kernel left behind
+ *   2. PAS_INIT_IMAGE        hand TrustZone the image's header (the ELF header and the block of
+ *                            hashes and certificates); it checks the signature
+ *   3. PAS_MEM_SETUP         tell it where the image will be in memory
+ *   4. (write the image there)
+ *   5. PAS_AUTH_AND_RESET    authenticate it and start it
+ *
+ * The values of the call numbers are Qualcomm's (qcom_scm-smc.c is the convention):
+ *   SCM_SIP (2 << 24) is "a call of the SoC maker's, not one of Arm's standard ones"
+ *   service 2, command 1 = PAS_INIT_IMAGE; 2 = MEM_SETUP; 5 = AUTH_AND_RESET; 6 = SHUTDOWN
+ *   the argument descriptor: 1 = one plain number, 3 = three, (2 | 2 << 6) = a number and a
+ *   buffer address
+ * These are redwood_adreno.c:1503-1514 and :2625-2626, unchanged.
+ */
+#define SCM_FAST                (1ull << 31)
+#define SCM_64                  (1ull << 30)
+#define SCM_SIP                 (2ull << 24)
+#define SCM_CALL(service, command) ((uint64_t)(service) << 8 | (command))
+#define SCM_PAS_INIT_IMAGE      SCM_CALL(2, 1)
+#define SCM_PAS_MEM_SETUP       SCM_CALL(2, 2)
+#define SCM_PAS_AUTH_AND_RESET  SCM_CALL(2, 5)
+#define SCM_PAS_SHUTDOWN        SCM_CALL(2, 6)
+#define SCM_IS_CALL_AVAILABLE   SCM_CALL(6, 1)
+#define SCM_ONE_VALUE           1
+#define SCM_THREE_VALUES        3
+#define SCM_VALUE_AND_BUFFER    (2 | 2 << 6)
+#define SCM_INTERRUPTED         1
+#define PAS_GPU                 13      /* chiron.dts:10099, and redwood_adreno.c:1515 */
+
+/*
+ * The image goes into memory TrustZone is pointed at. redwood's driver reserves
+ * 0x8b71a000 (redwood_adreno.c:2623) -- that is a redwood address and means nothing here.
+ * chiron needs one of its own, and this driver does not know the phone's memory map well enough
+ * to invent one, so it takes it from the loader: boot-arg chiron_zap_mem=<physical address>.
+ * Without it the step says so and stops, which is the honest outcome -- writing a signed image
+ * to an address chosen by guesswork is how a machine gets wedged.
+ */
+static uint64_t zap_memory;             /* physical, from chiron_zap_mem= */
+#define ZAP_MEMORY_SIZE         0x2000u /* what redwood reserves; the segment must fit */
+
+/*
+ * The zap shader's header: a 32-bit ELF, of which TrustZone checks the signature. Redwood reads
+ * fw/a660_zap.mdt for it (redwood_adreno.c:1644-1680) and describes the layout it validates:
+ * the segment count at offset 44, the table at 52, 32 bytes each. Same reader shape here, with
+ * this phone's file: fw/a540_zap.mdt.
+ */
+extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
+
+/* One secure-monitor call. What TrustZone returns: 0 or an error of its own, and a word of answer. */
+static int32_t
+scm(const char *what, uint64_t function, uint64_t arguments, uint64_t first, uint64_t second,
+    uint64_t third, uint64_t *answer)
+{
+	uint64_t session = 0;
+
+	say("chiron-adreno: %u: about to ask TrustZone %s: smc %#llx, arguments %#llx, %#llx, %#llx\n",
+	    step, what, (unsigned long long)function, (unsigned long long)first,
+	    (unsigned long long)second, (unsigned long long)third);
+	for (int i = 0; i < 100; i++) {
+		register uint64_t x0 __asm__("x0") = i == 0 ? function : SCM_INTERRUPTED;
+		register uint64_t x1 __asm__("x1") = arguments;
+		register uint64_t x2 __asm__("x2") = first;
+		register uint64_t x3 __asm__("x3") = second;
+		register uint64_t x4 __asm__("x4") = third;
+		register uint64_t x5 __asm__("x5") = 0;
+		register uint64_t x6 __asm__("x6") = session;
+		register uint64_t x7 __asm__("x7") = 0;
+
+		__asm__ volatile ("smc #0" : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4),
+		    "+r" (x5), "+r" (x6), "+r" (x7)
+		    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "memory");
+		session = x6;
+		if (x0 != SCM_INTERRUPTED) {
+			say("chiron-adreno: %u: TrustZone returns %d, (unsigned long long)answer %#llx\n", step, (int32_t)x0,
+		    (unsigned long long)x1);
+			*answer = x1;
+			return (int32_t)x0;
+		}
+	}
+	say("chiron-adreno: %u: TrustZone keeps saying the call was interrupted\n", step);
+	return -1;
+}
+
+/*
+ * Read the first lines of the zap image and say what they look like, before anything is handed
+ * to TrustZone. The image that is here should be a 32-bit ELF; if it is not, saying so costs one
+ * line and saves wondering why the signature call failed.
+ */
+static bool
+zap_image(const uint8_t **image, uint64_t *size)
+{
+	const uint8_t *data = firmware_file("a540_zap.mdt", size);
+	uint32_t segments;
+
+	if (data == NULL) {
+		return false;
+	}
+	if (*size < 52) {
+		say("chiron-adreno: %u: fw/a540_zap.mdt is %llu bytes: too short to hold an ELF header\n",
+		    step, (unsigned long long)*size);
+		return false;
+	}
+	segments = *size >= 52 + 2 * 32 ? (uint32_t)(data[44] | data[45] << 8) : 0;
+	say("chiron-adreno: %u: fw/a540_zap.mdt: %llu bytes, %02x %02x %02x %02x, %u segments\n", step,
+	    (unsigned long long)*size, data[0], data[1], data[2], data[3], segments);
+	if (data[0] != 0x7f || data[1] != 'E' || data[2] != 'L' || data[3] != 'F') {
+		say("chiron-adreno: %u: that does not begin with \\177ELF, so it is not the image expected here\n", step);
+		return false;
+	}
+	if (segments < 2) {
+		say("chiron-adreno: %u: it says %u segments, fewer than the two this image has\n", step, segments);
+		return false;
+	}
+	*image = data;
+	return true;
+}
+
+static bool
+step_zap(void)
+{
+	const uint8_t *image = NULL;
+	uint64_t size = 0, answer = ~0ull;
+
+	announce("the zap shader (a540_zap): asked of TrustZone through the same calls redwood uses");
+
+	if (zap_memory == 0) {
+		say("chiron-adreno: %u: no memory to put the image in: boot-arg chiron_zap_mem=<physical\n"
+		    "chiron-adreno: %u:   address> was not given. This driver does not know chiron's memory map\n"
+		    "chiron-adreno: %u:   well enough to pick an address, and writing a signed image to a guess is\n"
+		    "chiron-adreno: %u:   how a machine gets wedged. Not attempted.\n", step, step, step, step);
+		return false;
+	}
+	if (!zap_image(&image, &size)) {
+		return false;
+	}
+	if (size > ZAP_MEMORY_SIZE) {
+		say("chiron-adreno: %u: the image is %llu bytes, larger than the %u reserved for it\n",
+		    step, (unsigned long long)size, ZAP_MEMORY_SIZE);
+		return false;
+	}
+
+	/* 0. Whether TrustZone takes calls from this kernel at all -- the cheapest question first. */
+	if (scm("whether it takes secure-monitor calls from this kernel",
+	    SCM_FAST | SCM_64 | SCM_SIP | SCM_IS_CALL_AVAILABLE, SCM_ONE_VALUE,
+	    SCM_SIP | SCM_IS_CALL_AVAILABLE, 0, 0, &answer) != 0 || answer != 1) {
+		say("chiron-adreno: %u: TrustZone does not answer \"is this call available\" the way it answers\n"
+		    "chiron-adreno: %u:   Linux, so nothing further is asked of it here\n", step, step);
+		return false;
+	}
+
+	/* 1. Give up any zap shader a kernel before this one left. None is a success too. */
+	answer = ~0ull;
+	if (scm("to give up a zap shader a kernel before this one may have left",
+	    SCM_64 | SCM_SIP | SCM_PAS_SHUTDOWN, SCM_ONE_VALUE, PAS_GPU, 0, 0, &answer) != 0 || answer != 0) {
+		say("chiron-adreno: %u: TrustZone does not give it up (%#llx); the next answers say whether it\n"
+		    "chiron-adreno: %u:   keeps one\n", step, (unsigned long long)answer, step);
+	}
+
+	/*
+	 * 2. The signature. The header is handed over from the image itself, as redwood does: in
+	 * this image the ELF header and its hash/certificate block are the first page, and that is
+	 * what the call takes. It is passed by physical address, in one piece.
+	 *
+	 * If TrustZone refuses the signature or the place, redwood's driver reads that as "it already
+	 * has a zap shader from before and keeps it" and carries on (redwood_adreno.c:2683-2694) --
+	 * and says so rather than failing, because whether that is true is answered later, by
+	 * whether the 3D core leaves secure mode.
+	 */
+	{
+		vm_offset_t header_memory = 0;
+		uint64_t header_phys;
+
+		if (kmem_alloc(kernel_map, &header_memory, PAGE_SIZE,
+		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || header_memory == 0) {
+			say("chiron-adreno: %u: cannot allocate a page for the header\n", step);
+			return false;
+		}
+		memcpy((void *)header_memory, image, size < PAGE_SIZE ? size : PAGE_SIZE);
+		to_memory(header_memory, PAGE_SIZE);
+		header_phys = kvtophys(header_memory);
+		say("chiron-adreno: %u: the header: %llu bytes at %#llx (physical)\n", step,
+		    (unsigned long long)(size < PAGE_SIZE ? size : PAGE_SIZE), (unsigned long long)header_phys);
+
+		answer = ~0ull;
+		if (scm("to take the zap shader's signature", SCM_64 | SCM_SIP | SCM_PAS_INIT_IMAGE,
+		    SCM_VALUE_AND_BUFFER, PAS_GPU, header_phys, 0, &answer) != 0 || answer != 0) {
+			say("chiron-adreno: %u: TrustZone does not take the signature (%#llx). Taken to mean it\n"
+			    "chiron-adreno: %u:   keeps a zap shader from before, which is used as it is -- the 3D\n"
+			    "chiron-adreno: %u:   core's own start is what will show whether that is so.\n", step, (unsigned long long)answer, step, step);
+			return true;
+		}
+
+		/* 3. Where the image will be. */
+		answer = ~0ull;
+		if (scm("where the image will be", SCM_64 | SCM_SIP | SCM_PAS_MEM_SETUP, SCM_THREE_VALUES,
+		    PAS_GPU, zap_memory, 0x1000, &answer) != 0 || answer != 0) {
+			say("chiron-adreno: %u: TrustZone does not take the place (%#llx), same reading as above\n",
+			    step, (unsigned long long)answer);
+			return true;
+		}
+
+		/* 4. Put the image there. Only now: TrustZone has just said the memory is not its own. */
+		{
+			volatile uint8_t *memory =
+			    (volatile uint8_t *)ml_io_map_wcomb(zap_memory, ZAP_MEMORY_SIZE);
+
+			say("chiron-adreno: %u: reserved memory at %#llx begins %02x %02x %02x %02x\n", step,
+			    (unsigned long long)zap_memory, memory[0], memory[1], memory[2], memory[3]);
+			say("chiron-adreno: %u: about to write %llu bytes there\n", step, (unsigned long long)size);
+			for (uint64_t i = 0; i < ZAP_MEMORY_SIZE; i++) {
+				memory[i] = i < size ? image[i] : 0;
+			}
+			__asm__ volatile ("dsb sy" : : : "memory");
+		}
+	}
+
+	/* 5. Authenticate and run it. */
+	answer = ~0ull;
+	if (scm("to authenticate the zap shader and run it", SCM_64 | SCM_SIP | SCM_PAS_AUTH_AND_RESET,
+	    SCM_ONE_VALUE, PAS_GPU, 0, 0, &answer) != 0 || answer != 0) {
+		say("chiron-adreno: %u: TrustZone does not authenticate the zap shader (%#llx). Without it the\n"
+		    "chiron-adreno: %u:   3D core stays in secure mode: a start is still worth trying, because\n"
+		    "chiron-adreno: %u:   whether a kernel may leave secure mode is TrustZone's to decide, not this\n"
+		    "chiron-adreno: %u:   driver's -- but expect it to be refused.\n", step, (unsigned long long)answer, step, step, step);
+		return false;
+	}
+	say("chiron-adreno: %u: TRUSTZONE HAS AUTHENTICATED AND STARTED THE ZAP SHADER\n", step);
+	return true;
+}
+
 /*
  * Say that this driver is here, and which build of it: a string only this file has, made at
  * compile time, so a kernel that prints it has this code in it and not a stale copy.
@@ -2010,6 +2268,13 @@ chiron_adreno_init(void)
 		say("chiron-adreno: nothing done (boot-arg chiron_gpu=1 asks for it)\n");
 		return;
 	}
+	/*
+	 * Where the zap shader's image goes. This driver does not know chiron's memory map well
+	 * enough to reserve an address itself, so it comes from the loader; step 7 refuses without
+	 * it rather than writing a signed image to a guess.
+	 */
+	PE_parse_boot_argn("chiron_zap_mem", &asked, sizeof(asked));
+	zap_memory = asked;
 
 	for (step = 1; step <= CHIRON_ADRENO_STEP; step++) {
 		bool ok;
@@ -2071,6 +2336,15 @@ chiron_adreno_init(void)
 		case 6:
 			/* Read-only, and useful even when everything before it failed: it says why. */
 			ok = step_smmu_state();
+			break;
+		case 7:
+			/*
+			 * The zap shader. Written from redwood's sequence, and NOT VERIFIED: the image
+			 * (a540_zap.mdt) and the memory it goes into both have to come from the phone, and
+			 * neither is available here. The step refuses rather than guessing when either is
+			 * missing, which is the only honest thing an unverified step can do.
+			 */
+			ok = step_zap();
 			break;
 		default:
 			ok = false;

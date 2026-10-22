@@ -153,10 +153,14 @@ jobs:
       - name: Dependencies
         run: |
           sudo apt-get update -qq
-          # xnu-deps/setup.sh stage1 checks for exactly these
+          # xnu-deps/setup.sh stage1 checks for exactly these. uuid-dev is not on
+          # that list but xnu-deps/hostinc/hostcompat.h includes <uuid/uuid.h>, so
+          # exporthdrs fails without it -- the list checks for the tools, not the
+          # headers they then need.
           sudo apt-get install -y -qq build-essential git curl tar xz-utils \
             clang lld flex bison m4 perl python3 autoconf automake \
-            libssl-dev zlib1g-dev rsync
+            libssl-dev zlib1g-dev rsync uuid-dev libbz2-dev libreadline-dev \
+            libedit-dev libncurses-dev
 
       - name: theos + the iOS 16.5 SDK
         run: |

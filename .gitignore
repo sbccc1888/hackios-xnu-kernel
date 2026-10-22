@@ -5,6 +5,11 @@
 !/.gitignore
 !/README.md
 !/LICENSE
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/build.yml
 !/common/
 !/docs/
 !/xl

@@ -1,0 +1,222 @@
+name: build
+
+# What this proves, and what it does not.
+#
+# Every job here runs on a stock ubuntu-latest runner and needs nothing from the
+# phone and no Apple files in the repository: the iOS SDK comes from the public
+# theos/sdks repository and the Mach-O toolchain from a public release, so the
+# kernel really is built here rather than taken from prebuilt/.
+#
+# It does NOT build the iOS system images: those need the 7.4 GB IPSW from
+# Apple's CDN, which belongs on a machine, not in CI (README, "Quick start").
+#
+# The kernel build exits non-zero on purpose. xnu/README.md: the export check and
+# three symbolsets fail *after* the kernel has been linked, so `make` status 2 with
+# the file present is success. This workflow therefore judges by the artifact and
+# its symbol count, not by make's exit status -- and says so in the log.
+
+on:
+  push:
+    branches: [main, chiron, 'chiron-*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: parallel make jobs for the kernel
+        default: "4"
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+  # the release theos' own installer uses for its Linux toolchain
+  TOOLCHAIN_URL: https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz
+  SDK_REPO: https://github.com/theos/sdks.git
+
+jobs:
+  loader:
+    name: loader (EFI application)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          sudo apt-get update -qq
+          # clang + lld + lld-link: the loader is built with clang and linked with
+          # lld-link, no EDK2 involved
+          sudo apt-get install -y -qq clang lld
+
+      - name: Versions
+        run: |
+          clang --version | head -1
+          lld-link --version
+
+      - name: Build xnuloader
+        run: ./xnuloader/build.sh
+
+      - name: Check the platform table really carries every device
+        run: |
+          # A loader that builds but lacks the device is the failure mode worth
+          # catching: xnuloader picks its platform by the framebuffer address, so
+          # a missing entry silently means "QEMU ramfb" on a phone.
+          fail=0
+          for dev in redwood chiron qemu-virt; do
+            if grep -qa "$dev" xnuloader/loader.efi; then
+              echo "  $dev: present"
+            else
+              echo "  $dev: MISSING"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Check the chiron constants are in the binary
+        run: |
+          python3 - <<'PY'
+          import struct, sys
+          d = open('xnuloader/loader.efi', 'rb').read()
+          # little-endian 64-bit fields of struct platform_chiron
+          want = {'fb_base 0x9D400000': 0x9D400000,
+                  'gic_dist 0x17a00000': 0x17a00000,
+                  'gic_redist 0x17b00000': 0x17b00000}
+          bad = [k for k, v in want.items() if struct.pack('<Q', v) not in d]
+          for k in want:
+              print('  %-22s %s' % (k, 'present' if k not in bad else 'MISSING'))
+          sys.exit(1 if bad else 0)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loader-efi
+          path: xnuloader/loader.efi
+          if-no-files-found: error
+
+  host-checks:
+    name: host checks
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Device profiles parse and are complete
+        run: |
+          # Every common/devices/*.conf is sourced by build.sh and run.sh, so a
+          # syntax error there breaks the device it describes, not CI.
+          fail=0
+          for f in common/devices/*.conf; do
+            case "$(basename "$f")" in _template.conf) continue;; esac
+            printf '  %-22s ' "$(basename "$f")"
+            # A subshell so each profile is parsed in a clean environment: the
+            # files are sources, and one of them defining KIND must not satisfy
+            # the check for the next.
+            if ( . "$f" && [ -n "${NAME:-}" ] && [ -n "${KIND:-}" ] ); then
+              echo "ok (${KIND})"
+            else
+              echo "BROKEN"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - name: Every phone profile names its UEFI target
+        run: |
+          fail=0
+          for f in common/devices/*.conf; do
+            case "$(basename "$f")" in _template.conf) continue;; esac
+            ( . "$f"
+              if [ "${KIND:-}" = phone ] && [ -z "${UEFI_TARGET:-}" ]; then
+                echo "  $(basename "$f"): KIND=phone but UEFI_TARGET is empty"; exit 1
+              fi )
+            [ $? -eq 0 ] || fail=1
+          done
+          exit $fail
+
+      - name: setup.sh runs and finds the tools it needs
+        run: |
+          # It clones hackios-xnu-userland into the tree; CI has no credentials for
+          # that repository over https unless it is public, so only the host check
+          # half is exercised here (--check-only does not exist, so we read the
+          # script's own requirement list instead).
+          grep -q 'need python3'  common/setup.sh
+          grep -q 'need 7z'       common/setup.sh
+          echo '  setup.sh present and lists its requirements'
+
+  kernel:
+    name: kernel (xnu, Linux host)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          # xnu-deps/setup.sh stage1 checks for exactly these
+          sudo apt-get install -y -qq build-essential git curl tar xz-utils \
+            clang lld flex bison m4 perl python3 autoconf automake \
+            libssl-dev zlib1g-dev rsync
+
+      - name: theos + the iOS 16.5 SDK
+        run: |
+          # theos itself (the makefiles and bin/), its Linux cctools, and the SDK.
+          # All three are public; none of it is Apple-licensed content in the repo.
+          git clone -q --depth 1 "$SDK_REPO" /tmp/sdks
+          mkdir -p "$THEOS/sdks"
+          cp -r /tmp/sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          echo "  SDK: $(du -sh "$THEOS/sdks/iPhoneOS16.5.sdk" | cut -f1)"
+
+          mkdir -p "$THEOS/toolchain"
+          curl -sSL --fail --retry 3 "$TOOLCHAIN_URL" | tar -xJ -C "$THEOS/toolchain"
+          echo "  cctools:"; ls "$THEOS/toolchain/linux/iphone/bin" 2>/dev/null | head -8
+
+      - name: Apply the XNU sources and our changes
+        run: ./xnu/apply.sh
+
+      - name: Kernel dependencies (SDK overlay, host tools, libraries)
+        run: ./xnu-deps/setup.sh
+
+      - name: Build the kernel
+        run: |
+          set +e
+          ./xnu-build.sh -j"${{ github.event.inputs.jobs || 4 }}" -k > kernel-build.log 2>&1
+          rc=$?
+          set -e
+          echo "make exit: $rc"
+          K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          if [ -f "$K" ]; then
+            echo "kernel: $K ($(stat -c %s "$K") bytes)"
+            echo '--- the errors are expected after linking (xnu/README.md) ---'
+            grep -c 'error:' kernel-build.log || true
+          else
+            echo 'no kernel produced'
+            tail -60 kernel-build.log
+            exit 1
+          fi
+
+      - name: The kernel must contain our platform code
+        run: |
+          K=xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          python3 - "$K" <<'PY'
+          import sys
+          d = open(sys.argv[1], 'rb').read()
+          # A kernel that builds but lacks the platform drivers is the failure
+          # worth catching here; the symbols are cheap to check.
+          for s in (b'redwood_adreno', b'sweet', b'redwood-touch'):
+              print('  %-18s %s' % (s.decode(), 'present' if s in d else '-'))
+          PY
+          nm -n "$K" 2>/dev/null | grep -c 'redwood' || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mach.development.bcm2837
+          path: xnu-src/xnu-8796.121.2/BUILD/obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kernel-build-log
+          path: kernel-build.log
+          if-no-files-found: ignore

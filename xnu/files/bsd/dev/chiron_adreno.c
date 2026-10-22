@@ -62,7 +62,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  */
 extern void loader_log_putc(char c);
 
-#define CHIRON_ADRENO_STEP 5            /* the last step this file performs */
+#define CHIRON_ADRENO_STEP 6            /* the last step this file performs */
 
 static uint32_t step;                   /* the one being performed */
 static bool core_started;               /* step 3 got the micro engine going: step 4 needs it */
@@ -1746,6 +1746,176 @@ step_gpmu(void)
 	return true;
 }
 
+/* ====================================================================================================
+ * step 6: the SMMU in front of the GPU -- read it, and say what this driver is relying on
+ * ==================================================================================================== */
+
+/*
+ * THE ASSUMPTION THIS STEP EXISTS TO MAKE VISIBLE.
+ *
+ * Steps 3, 4 and 5 hand the GPU physical addresses: the microcode's and the ring's, from
+ * kvtophys(). That only works if nothing translates them in between. There is an SMMU in front
+ * of the GPU -- dt: arm,smmu-kgsl@5040000, 0x10000 long (chiron.dts:6135) -- so whether those
+ * addresses arrive intact depends on how the boot loader left that SMMU, and on whether this
+ * kernel has programmed a translation context for it (it has not).
+ *
+ * Two device-tree properties bear on it directly:
+ *   qcom,skip-init   (chiron.dts:6139)  -- Linux does not reset or reinitialise this SMMU at
+ *                                          probe; it uses it in whatever state it finds. Which
+ *                                          means the state the boot loader left is the state
+ *                                          this kernel inherits.
+ *   qcom,dynamic     (:6137)           -- its attachment is set up on demand.
+ * and the two contexts it declares are gfx3d_user (:10287, iommus = <0x1a7 0x00>) and
+ * gfx3d_secure (:10294, stream 2).
+ *
+ * So this step reads the SMMU's identity and configuration and prints it, and then says in one
+ * line which of two worlds this kernel is in. It does not program the SMMU: that needs a page
+ * table and the secure-side cooperation, and doing it half way would be worse than not doing it.
+ *
+ * The registers, all byte offsets in the SMMU's own block (drivers/iommu/arm-smmu.c:100-120,
+ * where they are written with no shift because the IOMMU driver uses readl/writel on bytes):
+ *
+ *   0x0000  ARM_SMMU_GR0_sCR0     the global configuration: CLIENTPD (bit 0, "client port
+ *                                 disabled": translation off), GFRE, etc. (arm-smmu.c:95-108)
+ *   0x0004  ARM_SMMU_GR0_sCR2     VMID / stream-global controls
+ *   0x0020  ARM_SMMU_GR0_ID0      architecture and the count of stream mapping registers
+ *   0x0024  ARM_SMMU_GR0_ID1      the number of context banks
+ *   0x003c  ARM_SMMU_GR0_ID7      the ARM IHI number this SMMU implements
+ *   0x0048  ARM_SMMU_GR0_sGFSR    the global fault status, and the reason for the last fault
+ *   0x0050  ARM_SMMU_GR0_sGFSYNR0
+ *   0x0054  ARM_SMMU_GR0_sGFSYNR1
+ *
+ * and the stream-to-context mapping for the GPU's own stream id, which the device tree gives as
+ * 0 (iommus = <0x1a7 0x00>, chiron.dts:10289):
+ *
+ *   0x0800 + 4*n  ARM_SMMU_GR0_SMR(n)    stream mapping register n  (arm-smmu.c:162)
+ *   0x0c00 + 4*n  ARM_SMMU_GR0_S2CR(n)   stream-to-context register n (:169)
+ *
+ * S2CR's TYPE field says what a stream gets: 0 is "translation fault", 1 is "bypass" -- which
+ * is exactly the distinction that decides whether this driver's physical addresses are right.
+ */
+static struct block smmu = { .name = "smmu", .phys = 0x05040000, .size = 0x10000 };
+
+#define SMMU_sCR0       0x0000
+#define SMMU_sCR2       0x0004
+#define SMMU_ID0        0x0020
+#define SMMU_ID1        0x0024
+#define SMMU_ID7        0x003c
+#define SMMU_sGFSR      0x0048
+#define SMMU_sGFSYNR0   0x0050
+#define SMMU_sGFSYNR1   0x0054
+#define SMMU_SMR(n)     (0x0800 + ((n) << 2))
+#define SMMU_S2CR(n)    (0x0c00 + ((n) << 2))
+
+/* s2cr TYPE field. THE VALUES ARE NOT WHAT THE NAMES SUGGEST -- read them from the source:
+ *   arm-smmu.c:172-176
+ *     #define S2CR_TYPE_SHIFT   16
+ *     #define S2CR_TYPE_MASK    0x3
+ *     #define S2CR_TYPE_TRANS   (0 << S2CR_TYPE_SHIFT)     <- 0, not 2
+ *     #define S2CR_TYPE_BYPASS  (1 << S2CR_TYPE_SHIFT)     <- 1
+ *     #define S2CR_TYPE_FAULT   (2 << S2CR_TYPE_SHIFT)     <- 2, not 0
+ * and the driver uses them the same way when it programs one: a translating stream is
+ * `S2CR_TYPE_TRANS | (cbndx << S2CR_CBNDX_SHIFT)` (:2152-2153), while an unattached group is
+ * given S2CR_TYPE_BYPASS (:2180, :3559). A first version of this file assumed FAULT = 0,
+ * which would have called an unattached stream a fault when it is in fact the one thing this
+ * driver's physical addresses need. */
+#define SMMU_S2CR_CBNDX_SHIFT   0
+#define SMMU_S2CR_CBNDX_MASK    0xffu
+#define SMMU_S2CR_TYPE_SHIFT    16
+#define SMMU_S2CR_TYPE_MASK     (3u << SMMU_S2CR_TYPE_SHIFT)
+#define SMMU_S2CR_TYPE_TRANS    (0u << SMMU_S2CR_TYPE_SHIFT)
+#define SMMU_S2CR_TYPE_BYPASS   (1u << SMMU_S2CR_TYPE_SHIFT)
+#define SMMU_S2CR_TYPE_FAULT    (2u << SMMU_S2CR_TYPE_SHIFT)
+
+/* sCR0's bits, with the names arm-smmu.c:95-101 gives them (no ARM_SMMU_ prefix there). */
+#define SMMU_sCR0_CLIENTPD      (1u << 0)       /* 1: the client port is disabled, no translation */
+#define SMMU_sCR0_GFRE          (1u << 1)
+
+/* What a stream's S2CR says, in words, so the log does not need the shift. */
+static const char *
+s2cr_type(const uint32_t value)
+{
+	switch (value & SMMU_S2CR_TYPE_MASK) {
+	case SMMU_S2CR_TYPE_TRANS:
+		return "TRANSLATE (addresses go through the context bank below)";
+	case SMMU_S2CR_TYPE_BYPASS:
+		return "BYPASS (addresses pass through untranslated)";
+	case SMMU_S2CR_TYPE_FAULT:
+		return "FAULT (unmapped: any access through this stream faults)";
+	default:
+		return "reserved";
+	}
+}
+
+static bool
+step_smmu_state(void)
+{
+	uint32_t scr0, id0, id1, gfsr;
+	uint32_t smr0, s2cr0;
+	bool bypass;
+
+	announce("the SMMU in front of the GPU (arm,smmu-kgsl@5040000): what it is, and what it does to the GPU's stream");
+
+	scr0 = get(&smmu, "sCR0", SMMU_sCR0);
+	get(&smmu, "sCR2", SMMU_sCR2);
+	id0 = get(&smmu, "ID0", SMMU_ID0);
+	id1 = get(&smmu, "ID1", SMMU_ID1);
+	get(&smmu, "ID7", SMMU_ID7);
+	gfsr = get(&smmu, "sGFSR", SMMU_sGFSR);
+	get(&smmu, "sGFSYNR0", SMMU_sGFSYNR0);
+	get(&smmu, "sGFSYNR1", SMMU_sGFSYNR1);
+
+	/*
+	 * ID0's low byte is how many stream mapping registers there are (arm-smmu.c:131-132), and
+	 * ID1's top three bits how many 4 KiB pages of context banks minus one (:135-136). Printed
+	 * because they are the two numbers that say whether a stream *can* be mapped at all.
+	 */
+	say("chiron-adreno: %u: SMMU: %u stream mapping registers, %u context-bank pages, sCR0 %#010x%s\n",
+	    step, id0 & 0xffu, ((id1 >> 28) & 0x7u) + 1, scr0,
+	    (scr0 & SMMU_sCR0_CLIENTPD) ? " (client port DISABLED)" : "");
+
+	/* The GPU's stream id is 0 (chiron.dts:10289 iommus = <0x1a7 0x00>). */
+	smr0 = get(&smmu, "SMR(0)", SMMU_SMR(0));
+	s2cr0 = get(&smmu, "S2CR(0)", SMMU_S2CR(0));
+	say("chiron-adreno: %u: stream 0: SMR %#010x%s, S2CR %#010x -> %s\n", step, smr0,
+	    (smr0 & 1u) ? " (valid)" : " (not valid)", s2cr0, s2cr_type(s2cr0));
+
+	bypass = (s2cr0 & SMMU_S2CR_TYPE_MASK) == SMMU_S2CR_TYPE_BYPASS;
+	if (gfsr != 0) {
+		say("chiron-adreno: %u: NOTE: the SMMU's global fault status is not zero (%#010x):\n"
+		    "chiron-adreno: %u:   something faulted through it already, before this kernel.\n", step, gfsr, step);
+	}
+
+	/*
+	 * Say which world this is, in one line, because everything in steps 3-5 rests on it.
+	 */
+	if (bypass) {
+		say("chiron-adreno: %u: GPU STREAM 0 IS BYPASSED: physical addresses reach the GPU unchanged.\n"
+		    "chiron-adreno: %u:   Steps 3-5 hand the GPU kvtophys() addresses, so this is the state\n"
+		    "chiron-adreno: %u:   they need -- but nothing in this driver put it there: qcom,skip-init\n"
+		    "chiron-adreno: %u:   (chiron.dts:6139) means Linux does not touch it either, so it is the\n"
+		    "chiron-adreno: %u:   boot loader's doing and could be something else on another boot.\n",
+		    step, step, step, step, step);
+	} else {
+		say("chiron-adreno: %u: GPU STREAM 0 IS NOT BYPASSED (S2CR %#010x: %s).\n"
+		    "chiron-adreno: %u:   THE ADDRESSES STEPS 3-5 USE WILL NOT MEAN WHAT THIS DRIVER THINKS.\n"
+		    "chiron-adreno: %u:   Those steps hand the GPU physical addresses and rely on them arriving\n"
+		    "chiron-adreno: %u:   unchanged. With a translating stream they are interpreted as addresses\n"
+		    "chiron-adreno: %u:   in whatever page table context bank %u holds -- or fault. If steps 3-5\n"
+		    "chiron-adreno: %u:   reported failure while this line says NOT BYPASSED, the failure is here,\n"
+		    "chiron-adreno: %u:   not in the microcode or the ring. A context has to be built first.\n",
+		    step, s2cr0, s2cr_type(s2cr0), step, step, step, step, s2cr0 & SMMU_S2CR_CBNDX_MASK, step, step);
+	}
+
+	if (scr0 & SMMU_sCR0_CLIENTPD) {
+		say("chiron-adreno: %u: NOTE: CLIENTPD is set, so the SMMU's client port is disabled and nothing\n"
+		    "chiron-adreno: %u:   is translated no matter what the S2CR says -- which also means the\n"
+		    "chiron-adreno: %u:   stream state above is what the next kernel to enable it will inherit.\n",
+		    step, step, step);
+	}
+	return true;
+}
+
 /*
  * Say that this driver is here, and which build of it: a string only this file has, made at
  * compile time, so a kernel that prints it has this code in it and not a stale copy.
@@ -1829,6 +1999,10 @@ chiron_adreno_init(void)
 				break;
 			}
 			ok = step_gpmu();
+			break;
+		case 6:
+			/* Read-only, and useful even when everything before it failed: it says why. */
+			ok = step_smmu_state();
 			break;
 		default:
 			ok = false;

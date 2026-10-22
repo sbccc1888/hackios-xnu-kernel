@@ -62,7 +62,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  */
 extern void loader_log_putc(char c);
 
-#define CHIRON_ADRENO_STEP 4            /* the last step this file performs */
+#define CHIRON_ADRENO_STEP 5            /* the last step this file performs */
 
 static uint32_t step;                   /* the one being performed */
 static bool core_started;               /* step 3 got the micro engine going: step 4 needs it */
@@ -1153,22 +1153,36 @@ step_core_start(void)
 #define CP_RB_RPTR                  0x806
 #define CP_RB_WPTR                  0x807
 
-#define CP_TYPE7_PKT                0x70000000u
+#define CP_TYPE7_PKT                0x70000000u     /* adreno_pm4types.h:21  CP_TYPE7_PKT = 7 << 28 */
+#define CP_TYPE4_PKT                0x40000000u     /* adreno_pm4types.h:20  CP_TYPE4_PKT = 4 << 28 */
 #define CP_ME_INIT                  0x48
 #define CP_INTERRUPT                0x40
 
-/* adreno_pm4types.h: pm4_calc_odd_parity_bit() -- the bit is set when the input's population
- * count is even, so that the whole field including it has an odd count. */
+/*
+ * adreno_pm4types.h: pm4_calc_odd_parity_bit() -- the bit is set when the value's population
+ * count is even, so that the whole field including it has an odd count.
+ *
+ * This is the vendor's own function, transcribed rather than re-derived:
+ *
+ *   return (0x9669 >> (0xf & (val ^ (val>>4) ^ (val>>8) ^ (val>>12) ^
+ *                              (val>>16) ^ (val>>20) ^ (val>>24) ^ (val>>28)))) & 1;
+ *
+ * The folding is not an optimisation to be simplified away: 0x9669 is a table indexed by the
+ * XOR of all eight nibbles, and folding preserves the total parity because popcount(a^b) has the
+ * same parity as popcount(a)+popcount(b). An earlier version of this function counted only the
+ * low seven bits, which agrees for small values and differs for a register address such as
+ * 0x8000 (one bit set: odd, parity 0 -- but its low seven bits are zero, which the short form
+ * called even). A wrong parity bit makes the CP drop the whole packet, and a dropped CP_ME_INIT
+ * looks exactly like an engine that does not run, so this had to be their function, not an
+ * equivalent-looking one.
+ */
 static uint32_t
 odd_parity(uint32_t value)
 {
-	uint32_t bits = value & 0x7fu;
-	uint32_t ones = 0;
+	uint32_t folded = value ^ (value >> 4) ^ (value >> 8) ^ (value >> 12) ^
+	    (value >> 16) ^ (value >> 20) ^ (value >> 24) ^ (value >> 28);
 
-	for (unsigned i = 0; i < 7; i++) {
-		ones += (bits >> i) & 1u;
-	}
-	return ones & 1u ? 0u : 1u;
+	return (0x9669u >> (folded & 0xfu)) & 1u;
 }
 
 static uint32_t
@@ -1341,6 +1355,309 @@ step_ring(void)
 	return false;
 }
 
+/* ====================================================================================================
+ * step 5: the GPMU -- its firmware into its own instruction RAM, then the handshake
+ * ==================================================================================================== */
+
+/*
+ * a5xx's power management processor. It is not a6xx's GMU: different firmware format (.fw2),
+ * different registers, no message queues -- but the idea is the same, and it is what the vendor
+ * driver calls GPMU. This step loads its firmware and waits for it to say it started.
+ *
+ * The firmware goes into the GPMU's instruction RAM through the command processor, as type-4
+ * packets, not by writing the registers directly -- the only place GPMU_INST_RAM_BASE appears in
+ * the vendor's driver is inside cp_type4_packet() (adreno_a5xx.c:658-659), and there is no
+ * kgsl_regwrite to it anywhere. So this step needs step 4's ring working, which is why it comes
+ * last.
+ *
+ * Registers (a5xx_reg.h):
+ *   0x8800  GPMU_INST_RAM_BASE     :768   where the firmware goes
+ *   0xA8D8  GPMU_CM3_SYSRESET      :782   written 0 to let the processor out of reset
+ *   0xA8E0  GPMU_GENERAL_0         :783   becomes 0xBABEFACE when the firmware has started
+ *   0xA8E1  GPMU_GENERAL_1         :784   0 on success, an error code otherwise
+ *   0xA8D6  GPMU_RBBM_INTR_INFO    :781   pending interrupts, cleared after the handshake
+ *   0x37    RBBM_INT_CLEAR_CMD     :175   to clear them
+ *
+ * The firmware file is a ".fw2": a sequence of blocks, each with its own length and version
+ * header, then the code. The vendor's _load_gpmu_firmware() (adreno_a5xx.c:683-742) reads it as
+ *
+ *   data[0]  the file's length in dwords
+ *   data[1]  GPMU_FIRMWARE_ID, which must be 2                       (:714, adreno_a5xx.h:216)
+ *   data[2]  the first block header's length in dwords
+ *   code     at data + data[2] + 3                                   (:728)
+ *   length   data[0] - data[2] - 2                                   (:729)
+ *   and that length must be <= GPMU_INST_RAM_SIZE, 0xFFF             (:731, adreno_a5xx.h:218)
+ *
+ * The version in that header must not be older than what the device tree asks for, which for
+ * this phone is 3.0 (chiron.dts:10144 `qcom,gpmu-version = <0x03 0x00>`; adreno-gpulist.h has
+ * .gpmu_major = 3, .gpmu_minor = 0 for a540). The vendor logs a mismatch and carries on, and so
+ * does this: the hardware is the authority, and the log says what it saw.
+ */
+#define GPMU_INST_RAM_BASE          0x8800
+#define GPMU_DATA_RAM_BASE          0x9800
+#define GPMU_WFI_CONFIG             0xa8c1
+#define GPMU_RBBM_INTR_INFO         0xa8d6
+#define GPMU_CM3_SYSRESET           0xa8d8
+#define GPMU_GENERAL_0              0xa8e0
+#define GPMU_GENERAL_1              0xa8e1
+#define RBBM_INT_CLEAR_CMD          0x37
+
+#define GPMU_FIRMWARE_ID            2       /* adreno_a5xx.h:216 */
+#define GPMU_INST_RAM_SIZE          0xfff   /* adreno_a5xx.h:218 */
+#define GPMU_STARTED                0xbabefaceu
+#define GPMU_FW_INIT_RETRY          5000    /* adreno_a5xx.c:85 GPMU_FW_INIT_RETRY */
+#define GPMU_INT_FIRMWARE           29      /* a5xx_reg.h:47 A5XX_INT_GPMU_FIRMWARE */
+/*
+ * What this phone's device tree asks the firmware's version to be at least:
+ *   chiron.dts:10144  qcom,gpmu-version = <0x03 0x00>
+ *   adreno-gpulist.h  (the a540 entry) .gpmu_major = 3, .gpmu_minor = 0
+ * Two sources, the same numbers.
+ *
+ * Worth knowing before the first run: the a530v3_gpmu.fw2 that ships in a Linux distribution's
+ * firmware package is version 2.4, which is OLDER than this and is refused below by the same
+ * rule the vendor's reader applies. That is not a bug in this driver -- it is the wrong file
+ * for this phone, and the log will say so with both numbers. a540_gpmu.fw2 from the phone's own
+ * /vendor/firmware is the one that will be there.
+ */
+#define GPMU_ASKED_MAJOR            3
+#define GPMU_ASKED_MINOR            0
+
+/* "The maximum payload of a type4 packet is the max size minus one for the opcode"
+ * (adreno_a5xx.c:617-619, with PM4_TYPE4_PKT_SIZE_MAX = 128 from adreno_pm4types.h:23). */
+#define TYPE4_MAX_PAYLOAD           (128 - 1)
+
+/* A type-4 packet: type 4 | count | odd_parity(count)<<7 | (reg & 0x3ffff)<<8 | parity<<27
+ * (adreno_pm4types.h:196-202, with CP_TYPE4_PKT = 4 << 28 at :20). It carries register
+ * writes, which is how the GPMU's RAM is written through the CP. */
+static uint32_t
+cp_type4(uint32_t reg, uint32_t count)
+{
+	return CP_TYPE4_PKT | (count & 0xfffu) | (odd_parity(count) << 7) |
+	    ((reg & 0x3ffffu) << 8) | (odd_parity(reg) << 27);
+}
+
+/* The fw2 firmware, split into the pieces the vendor's reader takes. */
+static bool
+gpmu_firmware(const char *name, uint32_t **code, uint32_t *count)
+{
+	const uint8_t *data;
+	uint64_t size = 0;
+	const uint32_t *words;
+	uint32_t total, block_header, code_count, major = 0, minor = 0;
+
+	data = firmware_file(name, &size);
+	if (data == NULL) {
+		return false;
+	}
+	if (size < 12 || (size % 4) != 0) {
+		say("chiron-adreno: %u: fw/%s is %llu bytes: not a dword-aligned fw2\n", step, name,
+		    (unsigned long long)size);
+		return false;
+	}
+	words = (const uint32_t *)data;
+
+	/*
+	 * "The first dword is the size of the remaining data in dwords" (a5xx_power.c, the
+	 * upstream reader says it plainly), so it is one less than the file's own word count --
+	 * which is how the vendor checks it: data[0] < fw->size / 4 (:712).
+	 */
+	total = words[0];
+	if (total < 2 || total >= (uint32_t)(size / 4)) {
+		say("chiron-adreno: %u: fw/%s: its first dword says %u words, the file holds %u\n",
+		    step, name, total, (unsigned)(size / 4));
+		return false;
+	}
+	if (words[1] != GPMU_FIRMWARE_ID) {
+		say("chiron-adreno: %u: fw/%s: second dword is %#x, not GPMU_FIRMWARE_ID (%u)\n",
+		    step, name, words[1], GPMU_FIRMWARE_ID);
+		return false;
+	}
+	block_header = words[2];
+	if (block_header == 0 || block_header > (total - 2)) {
+		say("chiron-adreno: %u: fw/%s: block header length %u does not fit in %u words\n",
+		    step, name, block_header, total - 2);
+		return false;
+	}
+	code_count = total - block_header - 2;
+	if (code_count > GPMU_INST_RAM_SIZE) {
+		say("chiron-adreno: %u: fw/%s: %u words of code, more than the %u its RAM holds\n",
+		    step, name, code_count, GPMU_INST_RAM_SIZE);
+		return false;
+	}
+
+	/*
+	 * The block header is pairs of (tag, value), read from data[3] on -- the vendor passes
+	 * &data[2] and starts its loop at index 1, which is the same word (adreno_a5xx.c:1244-1290,
+	 * tags at adreno_a5xx.h:220-224: MAJOR 1, MINOR 2, DATE 3, TIME 4, SEQUENCE 5). The
+	 * sequence check there is skipped for this block, because that block's id is
+	 * GPMU_FIRMWARE_ID (2) and the sequence id is 3 -- so index 1 is the first tag.
+	 */
+	for (uint32_t i = 0; i + 1 < block_header; i += 2) {
+		uint32_t tag = words[3 + i];
+
+		if (tag == 0x1) {                       /* HEADER_MAJOR */
+			major = words[3 + i + 1];
+		} else if (tag == 0x2) {                /* HEADER_MINOR */
+			minor = words[3 + i + 1];
+		}
+	}
+	say("chiron-adreno: %u: fw/%s: %u words total, block header %u, %u words of code\n",
+	    step, name, total, block_header, code_count);
+	say("chiron-adreno: %u: fw/%s: version %u.%u; this phone's device tree asks for 3.0\n"
+	    "chiron-adreno: %u:   (chiron.dts:10144 qcom,gpmu-version, adreno-gpulist.h .gpmu_major 3)\n",
+	    step, name, major, minor, step);
+
+	/*
+	 * The vendor refuses firmware older than the tree asks for, and only for the major:
+	 *   approx. adreno_a5xx.c:1265-1273
+	 *     if ((major > header[i + 1]) && header[i + 1]) return -EINVAL;
+	 * A minor that is older is logged and accepted. Refusing matters more here than it looks:
+	 * a wrong-major image is for a different microarchitecture, and loading it into a processor
+	 * nobody can reset again from here would wedge it. So the same rule, with the same words.
+	 */
+	if (major != 0 && GPMU_ASKED_MAJOR > major) {
+		say("chiron-adreno: %u: fw/%s is major %u, older than the %u this phone asks for: NOT loaded\n"
+		    "chiron-adreno: %u:   (the vendor's reader refuses this too; a mismatched image would be\n"
+		    "chiron-adreno: %u:   for another microarchitecture and could leave the GPMU wedged)\n",
+		    step, name, major, GPMU_ASKED_MAJOR, step, step);
+		return false;
+	}
+	if (major != 0 && minor != 0 && GPMU_ASKED_MINOR > minor) {
+		say("chiron-adreno: %u: fw/%s is minor %u, older than %u: loaded anyway, as the vendor does,\n"
+		    "chiron-adreno: %u:   but the handshake below is what decides\n", step, name, minor,
+		    GPMU_ASKED_MINOR, step);
+	}
+
+	*code = (uint32_t *)(data + (block_header + 3) * 4);
+	*count = code_count;
+	return true;
+}
+
+static bool
+step_gpmu(void)
+{
+	uint32_t *code = NULL, *ring = NULL;
+	uint32_t count = 0, offset = 0, words = 0, general = 0;
+	uint32_t general1 = 0, intr = 0;
+
+	announce("the GPMU: its firmware (a540_gpmu.fw2) into its instruction RAM through the CP");
+
+	if (!gpmu_firmware("a540_gpmu.fw2", &code, &count)) {
+		say("chiron-adreno: %u: without its firmware the GPMU is not started. It is not needed for\n"
+		    "chiron-adreno: %u:   the 3D core to run -- it does power management, not the GPU's\n"
+		    "chiron-adreno: %u:   gate -- so the steps before this one stand on their own.\n", step, step, step);
+		return false;
+	}
+
+	/*
+	 * Build the packet stream that writes the code into the GPMU's instruction RAM: as many
+	 * type-4 packets as it takes, each carrying at most TYPE4_MAX_PAYLOAD words, each aimed at
+	 * the next stretch of RAM (adreno_a5xx.c:653-661 does exactly this).
+	 */
+	{
+		uint32_t packets = (count + TYPE4_MAX_PAYLOAD - 1) / TYPE4_MAX_PAYLOAD;
+		uint32_t total = count + packets;
+		uint32_t at = 0;
+
+		if (kmem_alloc(kernel_map, (vm_offset_t *)&ring, round_page(total * 4),
+		    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || ring == NULL) {
+			say("chiron-adreno: %u: cannot allocate %u words for the GPMU's load\n", step, total);
+			return false;
+		}
+		while (offset < count) {
+			uint32_t take = count - offset;
+
+			if (take > TYPE4_MAX_PAYLOAD) {
+				take = TYPE4_MAX_PAYLOAD;
+			}
+			ring[words++] = cp_type4(GPMU_INST_RAM_BASE + offset, take);
+			for (uint32_t i = 0; i < take; i++) {
+				ring[words++] = code[offset + i];
+			}
+			offset += take;
+			at++;
+		}
+		say("chiron-adreno: %u: %u words of firmware as %u type-4 packets, %u words in all\n",
+		    step, count, at, words);
+	}
+
+	if (!ring_send("GPMU firmware", ring, words)) {
+		return false;
+	}
+
+	/*
+	 * Wait for the CP to have consumed all of it -- the same test as step 4, and the reason this
+	 * step is only worth doing once that one works.
+	 */
+	announce("wait for the CP to have written all of it into the GPMU's RAM");
+	{
+		unsigned consumed = 0;
+
+		for (unsigned i = 0; i < 2000; i++) {
+			if (ring_rptr(i == 0) == ring_words) {
+				consumed = 1;
+				break;
+			}
+			sleep_us(1000);
+		}
+		say("chiron-adreno: %u: cp_rb_rptr %u, wptr %u: %s\n", step, ring_rptr(true), ring_words,
+		    consumed ? "all consumed" : "NOT all consumed");
+		if (!consumed) {
+			say("chiron-adreno: %u: the CP has not finished the load, so resetting the GPMU now\n"
+			    "chiron-adreno: %u:   would start it on half its firmware. Not done.\n", step, step);
+			return false;
+		}
+	}
+
+	/*
+	 * Let it out of reset and wait for the word it writes when its firmware has started.
+	 * "The hardware team's estimation of GPMU firmware initialization latency is about 3000
+	 * cycles, that's about 5 to 24 usec" (adreno_a5xx.c:801-804) -- the poll is far longer than
+	 * that, because the price of being wrong once is a falsely failed step.
+	 */
+	announce("GPMU_CM3_SYSRESET cleared, then GPMU_GENERAL_0 polled for 0xBABEFACE");
+	put(&kgsl, "gpmu_cm3_sysreset", GPMU_CM3_SYSRESET, 0);
+
+	for (uint32_t i = 0; i < GPMU_FW_INIT_RETRY; i++) {
+		general = rd(kgsl.base + GPMU_GENERAL_0);
+		if (general == GPMU_STARTED) {
+			break;
+		}
+		sleep_us(1);
+	}
+	say("chiron-adreno: %u: gpmu_general_0 [%#x] = %#010x (want %#010x)\n",
+	    step, kgsl.phys + GPMU_GENERAL_0, general, GPMU_STARTED);
+
+	if (general != GPMU_STARTED) {
+		say("chiron-adreno: %u: the GPMU did not report itself started. Its own words:\n", step);
+		say("chiron-adreno: %u:   gpmu_general_1 [%#x] = %#010x\n", step, kgsl.phys + GPMU_GENERAL_1,
+		    rd(kgsl.base + GPMU_GENERAL_1));
+		say("chiron-adreno: %u:   gpmu_rbbm_intr_info [%#x] = %#010x\n", step, kgsl.phys + GPMU_RBBM_INTR_INFO,
+		    rd(kgsl.base + GPMU_RBBM_INTR_INFO));
+		say("chiron-adreno: %u:   cp_hw_fault = %#010x, rbbm_status = %#010x\n", step,
+		    rd(kgsl.base + CP_HW_FAULT), rd(kgsl.base + RBBM_STATUS));
+		return false;
+	}
+
+	/* "0 on success, an error code otherwise" -- read and reported, never assumed. */
+	general1 = get(&kgsl, "gpmu_general_1", GPMU_GENERAL_1);
+	if (general1 != 0) {
+		say("chiron-adreno: %u: the GPMU says it started but reports error %#010x\n", step, general1);
+		return false;
+	}
+
+	/* Pending interrupts, cleared so they do not sit there looking like a fault later. */
+	intr = get(&kgsl, "gpmu_rbbm_intr_info", GPMU_RBBM_INTR_INFO);
+	if (intr != 0) {
+		put(&kgsl, "rbbm_int_clear_cmd", RBBM_INT_CLEAR_CMD, 1u << GPMU_INT_FIRMWARE);
+	}
+
+	say("chiron-adreno: %u: THE GPMU IS RUNNING: general_0 read 0xBABEFACE and general_1 read 0\n", step);
+	say("chiron-adreno: %u:   (a5xx.c:805-820 waits for exactly this; it is the GPMU's own word,\n"
+	    "chiron-adreno: %u:    not a conclusion drawn from a register this driver wrote)\n", step, step);
+	return true;
+}
+
 /*
  * Say that this driver is here, and which build of it: a string only this file has, made at
  * compile time, so a kernel that prints it has this code in it and not a stale copy.
@@ -1405,6 +1722,16 @@ chiron_adreno_init(void)
 				break;
 			}
 			ok = step_ring();
+			break;
+		case 5:
+			/* The GPMU's firmware goes in through the CP, so a working ring is required. */
+			if (!core_started) {
+				say("chiron-adreno: %u: the command processor is not running, so the GPMU's\n"
+				    "chiron-adreno: %u:   firmware cannot be written into it. Not attempted.\n", step, step);
+				ok = false;
+				break;
+			}
+			ok = step_gpmu();
 			break;
 		default:
 			ok = false;

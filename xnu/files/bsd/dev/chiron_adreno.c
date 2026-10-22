@@ -22,6 +22,33 @@
  *           reset and its memory unclamped), the 3D clock source's root enabled and set to
  *           the lowest rate the phone is rated for, and the block's always-on counter seen
  *           to move -- with an explicit note about what that counter does and does not prove.
+ *   step 3  RBBM set as a540 wants it (a5xx_start's own ~40 registers, the a540 branch of
+ *           each choice), the CP's microcode loaded from the small image and put in place, and
+ *           the micro engine let out of halt.
+ *   step 4  a ring buffer, CP_ME_INIT, and the proof step 3 cannot give: the CP's read pointer
+ *           moving to the write pointer, which means it fetched and executed what it was given.
+ *   step 5  the GPMU: its .fw2 firmware written into its instruction RAM through the CP, then
+ *           the handshake -- GENERAL_0 reading 0xBABEFACE and GENERAL_1 reading 0.
+ *   step 6  the SMMU read and reported, because steps 3-5 rely on physical addresses arriving
+ *           untranslated and that reliance has to be visible, not assumed.
+ *
+ * WHAT HAS BEEN PROVEN AND WHAT HAS NOT. Every step above is verified by compilation and by
+ * comparison against the vendor's own code, not by running on the phone: the UEFI port chiron
+ * needs is not done, so no address here has been touched on real hardware. In particular step 1
+ * is where "does the hypervisor allow this kernel to reach the GPU's registers?" gets answered,
+ * and it is NOT answered yet -- the driver asks the question properly and will report the raw
+ * values, which is all that can be done until there is a kernel on the phone to run it.
+ *
+ * TWO CONVENTIONS OF ADDRESSING, and both are load-bearing:
+ *   a5xx_reg.h offsets are DWORD indices (the vendor's accessor shifts them left 2); see GPU_REG.
+ *   the clock controller's, the device tree's and the SMMU's are BYTE offsets; used as they are.
+ * Two defects of exactly this shape were found and fixed during development -- a PM4 parity bit
+ * computed over seven bits instead of the whole word, and every GPU-block offset read as bytes.
+ * Both were silent-wrong rather than loud-wrong: they would have produced a driver that wrote
+ * plausible values to the wrong places and reported "the GPU did not start", with every number
+ * in the log looking reasonable. That is the failure mode this file is written to avoid, which
+ * is why every constant carries its source and why the address conventions are asserted in the
+ * log on the first line.
  *
  * Where the numbers come from. Each is cited where it is used, and where two independent
  * sources exist both are given, because a wrong address on this part is a silent reset
@@ -35,7 +62,7 @@
  *     include/dt-bindings/clock/msm-clocks-hwio-8998.h
  *   the upstream one, drivers/gpu/drm/msm/adreno/a5xx_gpu.c and a5xx_power.c
  *
- * The steps this grows into (read out of adreno_a5xx.c's a5xx_start, backwards):
+ * The steps this grew through (read out of adreno_a5xx.c's a5xx_start, backwards):
  *   1  the clock of the GPU's register buses, then the GPU's clock controller read as the
  *      boot loader left it
  *   2  CX and GX powered, the 3D clock source at its lowest rate, and the always-on counter

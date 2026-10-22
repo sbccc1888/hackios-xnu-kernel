@@ -18,6 +18,10 @@
  *   step 1  that the GPU's registers can be reached at all, and what they hold before this
  *           driver writes anything. Reads only, except for the one bus clock without which
  *           the GPU's clock controller does not answer.
+ *   step 2  the two power switches of the GPU block on (CX first, then GX with its block
+ *           reset and its memory unclamped), the 3D clock source's root enabled and set to
+ *           the lowest rate the phone is rated for, and the block's always-on counter seen
+ *           to move -- with an explicit note about what that counter does and does not prove.
  *
  * Where the numbers come from. Each is cited where it is used, and where two independent
  * sources exist both are given, because a wrong address on this part is a silent reset
@@ -58,7 +62,7 @@ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
  */
 extern void loader_log_putc(char c);
 
-#define CHIRON_ADRENO_STEP 1            /* the last step this file performs */
+#define CHIRON_ADRENO_STEP 2            /* the last step this file performs */
 
 static uint32_t step;                   /* the one being performed */
 
@@ -408,6 +412,302 @@ step_counter(void)
 	}
 }
 
+/* ====================================================================================================
+ * step 2: power the two halves of the GPU block, give the 3D core a clock, and see the counter move
+ * ==================================================================================================== */
+
+/*
+ * The GPU block has two power switches. From the device tree (chiron.dts:789, :801) and the
+ * clock driver (clock-gpu-8998.c:44-45) they are named
+ *
+ *   gdsc_gpu_cx  at GPUCC + 0x1004 ("CX": the GMU, the bus interface, the GPU's own SMMU)
+ *   gdsc_gpu_gx  at GPUCC + 0x1094 ("GX": the 3D core) -- and it has, beside its control
+ *                register, a domain address register and a block reset:
+ *                  domain_addr = 0x5065130 -> GPUCC + 0x130   (hwio-8998.h:242)
+ *                  sw_reset    = 0x5066090 -> GPUCC + 0x1090  (chiron.dts:801)
+ *
+ * How Linux turns one on is drivers/clk/qcom/gdsc.c's gdsc_enable(), and the vendor's own
+ * copy of that sequence for this block is clock-gpu-8998.c's enable_gfx_crc(), which does it
+ * by hand because it wants the graphics clock exercised. Both are the same order, and this
+ * follows them exactly:
+ *
+ *   1. if the switch has a block reset, assert it, wait 1 us, deassert it
+ *        gdsc.c:179-195   BCR_BLK_ARES_BIT = BIT(0), "should be kept asserted for 1us"
+ *   2. if it has a domain address, and this one resets its AON logic, pulse GMEM_RESET
+ *        gdsc.c:197-215   GMEM_RESET_MASK = BIT(4)
+ *   3. clear GMEM_CLAMP_IO in the domain address register, so the block's memory is not clamped
+ *        gdsc.c:217-224   GMEM_CLAMP_IO_MASK = BIT(0)
+ *   4. clear SW_COLLAPSE in the control register, and poll for PWR_ON
+ *        gdsc.c:226-247   SW_COLLAPSE_MASK = BIT(0), PWR_ON_MASK = BIT(31)
+ *   5. wait 1 us before polling: "Wait for 8 XO cycles before polling the status bit"
+ *
+ * The device tree says which of those apply to each switch:
+ *   gdsc_gpu_cx   (chiron.dts:789): reg-names "base", "hw_ctrl"; no domain, no reset
+ *   gdsc_gpu_gx   (chiron.dts:801): reg-names "base", "domain_addr", "sw_reset"; with
+ *                 qcom,retain-periph, qcom,reset-aon-logic, qcom,force-enable-root-clk
+ * So CX gets steps 4-5 only, and GX gets all of them -- which is what gdsc_enable() reads
+ * out of those same properties (sc->sw_reset, sc->domain_addr, sc->reset_aon).
+ *
+ * There is one thing Linux does that this cannot: between CX and GX it turns on the graphics
+ * voltage rail through its regulator framework ("Turn on the Graphics rail",
+ * clock-gpu-8998.c:414-416, via vdd_gpucc). On this phone that rail is a PM8998 regulator
+ * whose level the boot loader has already set for the GPU's power level -- and raising it
+ * needs RPMh, which this kernel has no client for. That is why the sequence below is CX, GX
+ * and nothing between, and why the counter read afterwards is the test of whether it worked:
+ * if the rail were too low the GDSCs would report on and the block would still not answer.
+ */
+#define GDSC_HW_CONTROL         (1u << 1)       /* gdsc.c:29: hardware, not software, operates it */
+#define GDSC_SW_OVERRIDE        (1u << 2)       /* gdsc.c:28 */
+#define GMEM_CLAMP_IO_MASK      (1u << 0)       /* gdsc-regulator.c:41 */
+#define GMEM_RESET_MASK         (1u << 4)       /* gdsc-regulator.c:42 */
+#define BCR_BLK_ARES_BIT        (1u << 0)       /* gdsc-regulator.c:45 */
+#define GDSC_TIMEOUT_US         100             /* gdsc-regulator.c:51 TIMEOUT_US; chiron.dts:790 gds-timeout=0x1f4=500 */
+
+/* Poll a power switch's status bit. Returns the last value read, whatever the outcome. */
+static uint32_t
+gdsc_wait(struct block *b, const char *name, uint32_t offset, bool on, uint32_t last)
+{
+	for (uint32_t i = 0; i < GDSC_TIMEOUT_US; i++) {
+		uint32_t now = rd(b->base + offset);
+
+		last = now;
+		if (on ? (now & GDSC_POWER_ON) : !(now & GDSC_POWER_ON)) {
+			return last;
+		}
+		sleep_us(1);
+	}
+	return last;
+}
+
+/*
+ * Turn one power switch on. Everything is read before it is written, and the register is
+ * written back with only the bits this sequence owns cleared -- the control register also
+ * holds the clock-disable delay and the retention bits, which are not ours to decide.
+ *
+ * Returns the last value read from the control register, which the caller prints: a switch
+ * that does not come on is the finding, and its raw value is what says why (still collapsed,
+ * or collapsed and reporting on, which would mean the hardware is not obeying).
+ */
+static uint32_t
+gdsc_on(struct block *b, const char *name, uint32_t gdsc, uint32_t sw_reset, uint32_t domain,
+    bool reset_aon)
+{
+	uint32_t value = get(b, name, gdsc);
+
+	if (value & GDSC_HW_CONTROL) {
+		say("chiron-adreno: %u: %s is under hardware control (%#010x): a software request\n"
+		    "chiron-adreno: %u:   is refused by the hardware, so it is left alone\n",
+		    step, name, value, step);
+		return value;
+	}
+
+	if (sw_reset != 0) {
+		uint32_t r = rd(b->base + sw_reset);
+
+		put(b, "gx_sw_reset", sw_reset, r | BCR_BLK_ARES_BIT);
+		sleep_us(1);                    /* "kept asserted for 1us" (gdsc.c:187) */
+		put(b, "gx_sw_reset", sw_reset, r & ~BCR_BLK_ARES_BIT);
+	}
+
+	if (domain != 0) {
+		uint32_t d = rd(b->base + domain);
+
+		if (reset_aon) {
+			put(b, "gx_domain_misc", domain, d | GMEM_RESET_MASK);
+			sleep_us(1);
+			d = rd(b->base + domain);
+			put(b, "gx_domain_misc", domain, d & ~GMEM_RESET_MASK);
+		}
+		d = rd(b->base + domain);
+		put(b, "gx_domain_misc", domain, d & ~GMEM_CLAMP_IO_MASK);
+	}
+
+	put(b, name, gdsc, value & ~GDSC_SW_COLLAPSE);
+	sleep_us(1);                            /* "Wait for 8 XO cycles before polling" (gdsc.c:232) */
+	value = gdsc_wait(b, name, gdsc, true, value);
+	say("chiron-adreno: %u: %-14s %-22s [%#x] = %#010x %s\n", step, b->name, name, b->phys + gdsc,
+	    value, (value & GDSC_POWER_ON) ? "POWER ON" : "STILL OFF");
+	return value;
+}
+
+static bool
+step_power(void)
+{
+	uint32_t cx, gx;
+
+	announce("the CX half of the GPU block: its power switch on (gpu_cx_gdsc)");
+	cx = gdsc_on(&gpucc, "cx_gdscr", GPUCC_CX_GDSCR, 0, 0, false);
+	if (!(cx & GDSC_POWER_ON)) {
+		say("chiron-adreno: %u: the CX half does not come on; nothing after this is attempted\n"
+		    "chiron-adreno: %u:   (its control register reads %#010x, its hardware status %#010x)\n",
+		    step, step, cx, get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL));
+		return false;
+	}
+	/* The second register is where the vendor's driver expects to see CX arrive too. */
+	get(&gpucc, "cx_hw_ctrl", GPUCC_CX_HW_CTRL);
+
+	announce("the GX half -- the 3D core: block reset, its memory unclamped, its power switch on");
+	gx = gdsc_on(&gpucc, "gx_gdscr", GPUCC_GX_GDSCR, GPUCC_GX_SW_RESET, GPUCC_GX_DOMAIN_MISC, true);
+	if (!(gx & GDSC_POWER_ON)) {
+		say("chiron-adreno: %u: the GX half does not come on; its control register reads %#010x\n",
+		    step, gx);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * Give the 3D core a clock: the lowest rate the phone is rated for.
+ *
+ * A root clock generator ("RCG") is two registers: the command register, and the configuration
+ * register four bytes on (clock-local2.c:51-52). Setting a rate is
+ *
+ *   a. write the divider and the source select into CFG_RCGR
+ *   b. set UPDATE in CMD_RCGR and wait for the hardware to clear it
+ *        clock-local2.c:150-160 __set_rate_hid() writes CFG, then rcg_update_config()
+ *        clock-local2.c:118-128  sets CMD_RCGR_CONFIG_UPDATE_BIT and polls it away
+ *
+ * and the root must already be enabled, which is CMD_RCGR's bit 1:
+ *   clock-local2.c:67  CMD_RCGR_ROOT_ENABLE_BIT BIT(1)
+ *   clock-local2.c:208 the enable path sets it
+ *
+ * The bits inside CFG_RCGR (clock-local2.c:74-75):
+ *   CFG_RCGR_DIV_MASK       BM(4,0)    the half-integer divider, encoded as 2*div - 1
+ *   CFG_RCGR_SRC_SEL_MASK   BM(10,8)   which source
+ * and the encoding of the divider is in clock-gpu-8998.c's F() macro, line 56:
+ *   .div_src_val = BVAL(4, 0, (int)(2*(div) - 1)) | BVAL(10, 8, s##_source_val)
+ * For gfx3d_clk_src every entry in the table has div = 1 and source
+ * gpu_pll0_pll_out_even, whose value is 1 (clock-gpu-8998.c:40):
+ *   div_src_val = BVAL(4,0, 2*1-1) | BVAL(10,8, 1) = 0x1 | 0x100 = 0x101
+ *
+ * The rate itself comes from the PLL, which this does not touch: the boot loader leaves
+ * gpu_pll0 running (the vendor's driver reads it and expects it locked -- see step 1's
+ * pll0_mode), and the lowest entry of the v2 table is 180 MHz out of a 360 MHz PLL output
+ * divided by two (clock-gpu-8998.c:168-178, gfxcc-8998-v2 is what chiron.dts:2806 declares).
+ */
+
+/* BVAL(hi, lo, v): the field of bits hi..lo set to v (clock-local2.h's own macro, expanded). */
+#define RCGR_FIELD(hi, lo, v)   (((uint32_t)(v) << (lo)) & (((1u << ((hi) - (lo) + 1)) - 1) << (lo)))
+#define CFG_RCGR_DIV(v)         RCGR_FIELD(4, 0, v)
+#define CFG_RCGR_SRC(v)         RCGR_FIELD(10, 8, v)
+#define CFG_RCGR_DIV_SRC_MASK   (RCGR_FIELD(4, 0, 0x1f) | RCGR_FIELD(10, 8, 0x7))
+#define CMD_RCGR_ROOT_ENABLE    (1u << 1)
+#define CMD_RCGR_UPDATE         (1u << 0)
+
+static bool
+step_gfx3d_clock(void)
+{
+	uint32_t cmd, cfg, want;
+
+	announce("the 3D core's clock source: its root enabled, then set to the lowest rate it has");
+
+	cmd = get(&gpucc, "gfx3d_cmd", GPUCC_GFX3D_CMD_RCGR);
+	if (!(cmd & CMD_RCGR_ROOT_ENABLE)) {
+		put(&gpucc, "gfx3d_cmd", GPUCC_GFX3D_CMD_RCGR, cmd | CMD_RCGR_ROOT_ENABLE);
+	}
+
+	/*
+	 * div = 1, source = gpu_pll0_pll_out_even (1): the same field values every rate in
+	 * ftbl_gfx3d_clk_src_v2 carries, so this changes the divider to the smallest one and
+	 * leaves the rate to whatever the PLL is already producing. That is deliberate: the
+	 * PLL belongs to the boot loader until step 3 can watch the counter react.
+	 */
+	want = CFG_RCGR_DIV(2 * 1 - 1) | CFG_RCGR_SRC(1);
+
+	cfg = get(&gpucc, "gfx3d_cfg", GPUCC_GFX3D_CFG_RCGR);
+	put(&gpucc, "gfx3d_cfg", GPUCC_GFX3D_CFG_RCGR, (cfg & ~CFG_RCGR_DIV_SRC_MASK) | want);
+
+	cmd = rd(gpucc.base + GPUCC_GFX3D_CMD_RCGR);
+	put(&gpucc, "gfx3d_cmd", GPUCC_GFX3D_CMD_RCGR, cmd | CMD_RCGR_UPDATE);
+	for (uint32_t i = 0; i < 500; i++) {
+		if (!(rd(gpucc.base + GPUCC_GFX3D_CMD_RCGR) & CMD_RCGR_UPDATE)) {
+			break;
+		}
+		sleep_us(1);
+	}
+	cmd = get(&gpucc, "gfx3d_cmd", GPUCC_GFX3D_CMD_RCGR);
+	if (cmd & CMD_RCGR_UPDATE) {
+		say("chiron-adreno: %u: the clock source did not take the configuration (%#010x)\n", step, cmd);
+		return false;
+	}
+
+	announce("the 3D core's clock output enabled (gpu_cc_gfx3d_clk)");
+	cfg = get(&gpucc, "gfx3d_cbcr", GPUCC_GFX3D_CBCR);
+	if (cfg & CBCR_OFF) {
+		put(&gpucc, "gfx3d_cbcr", GPUCC_GFX3D_CBCR, (cfg & ~CBCR_OFF) | CBCR_ENABLE);
+		for (uint32_t i = 0; i < 1000; i++) {
+			if (!(rd(gpucc.base + GPUCC_GFX3D_CBCR) & CBCR_OFF)) {
+				break;
+			}
+			sleep_us(10);
+		}
+	}
+	cfg = get(&gpucc, "gfx3d_cbcr", GPUCC_GFX3D_CBCR);
+	if (cfg & CBCR_OFF) {
+		say("chiron-adreno: %u: gpu_cc_gfx3d_clk stays off (%#010x)\n", step, cfg);
+		return false;
+	}
+	return true;
+}
+
+/*
+ * The test of whether any of the above reached the hardware: the GPU block's always-on counter,
+ * read before and after, twice over, with the elapsed time measured so the rate can be
+ * compared with what the counter is supposed to count at.
+ *
+ * What this proves and what it does not, in the words of the source that names the counter:
+ * upstream calls it "the 19.2 Mhz always on counter" (a5xx_gpu.c:104). So a counter that moves
+ * shows that the block is powered and that the crystal's 19.2 MHz reaches it -- which is
+ * exactly what step 2 set out to do. It does NOT show that gfx3d_clk runs at the rate step 2
+ * programmed: the counter is not on that clock. Proving the 3D core's own clock is step 3's
+ * business, where the command processor is started and its busy bits can be watched.
+ */
+static void
+step_counter_after_power(void)
+{
+	uint32_t lo1, hi1, lo2, hi2;
+	uint64_t c1, c2;
+	uint32_t elapsed_us = 2000;
+
+	announce("the always-on counter again, now that the block is powered");
+
+	lo1 = rd(kgsl.base + RBBM_ALWAYSON_COUNTER_LO);
+	hi1 = rd(kgsl.base + RBBM_ALWAYSON_COUNTER_HI);
+	sleep_us(elapsed_us);
+	lo2 = rd(kgsl.base + RBBM_ALWAYSON_COUNTER_LO);
+	hi2 = rd(kgsl.base + RBBM_ALWAYSON_COUNTER_HI);
+
+	c1 = ((uint64_t)hi1 << 32) | lo1;
+	c2 = ((uint64_t)hi2 << 32) | lo2;
+
+	say("chiron-adreno: %u: alwayson_lo [%#x] = %#010x then %#010x\n", step,
+	    kgsl.phys + RBBM_ALWAYSON_COUNTER_LO, lo1, lo2);
+	say("chiron-adreno: %u: alwayson_hi [%#x] = %#010x then %#010x\n", step,
+	    kgsl.phys + RBBM_ALWAYSON_COUNTER_HI, hi1, hi2);
+
+	if (c2 > c1) {
+		uint64_t ticks = c2 - c1;
+		/* 19.2 MHz over elapsed_us: expected ticks = 19.2e6 * us / 1e6 = 19.2 * us */
+		uint64_t expected = (19200ull * elapsed_us) / 1000ull;
+		uint64_t ratio_milli = expected ? (ticks * 1000ull / expected) : 0;
+
+		say("chiron-adreno: %u: counter moved by %llu ticks in %u us\n",
+		    step, (unsigned long long)ticks, elapsed_us);
+		say("chiron-adreno: %u:   at 19.2 MHz that interval would be %llu ticks, so the ratio is %llu/1000\n",
+		    step, (unsigned long long)expected, (unsigned long long)ratio_milli);
+		say("chiron-adreno: %u:   (the loop's own overhead makes the elapsed time longer than %u us,\n"
+		    "chiron-adreno: %u:    never shorter, so a ratio at or above 1000 is the expected result)\n",
+		    step, elapsed_us, step);
+		say("chiron-adreno: %u: the GPU block is powered and answering: the crystal reaches it\n", step);
+	} else {
+		say("chiron-adreno: %u: the counter did NOT move (%#llx both times). The block is powered\n"
+		    "chiron-adreno: %u:   as far as its switches report, but does not answer. That is the\n"
+		    "chiron-adreno: %u:   finding: a switch that reports on while the block stays silent\n"
+		    "chiron-adreno: %u:   usually means the rail it needs is not up.\n",
+		    step, (unsigned long long)c1, step, step, step);
+	}
+}
+
 /*
  * Say that this driver is here, and which build of it: a string only this file has, made at
  * compile time, so a kernel that prints it has this code in it and not a stale copy.
@@ -434,6 +734,12 @@ chiron_adreno_init(void)
 			ok = step_buses() && step_gpucc();
 			if (ok) {
 				step_counter();
+			}
+			break;
+		case 2:
+			ok = step_power() && step_gfx3d_clock();
+			if (ok) {
+				step_counter_after_power();
 			}
 			break;
 		default:

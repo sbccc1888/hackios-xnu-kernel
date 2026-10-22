@@ -317,6 +317,13 @@ static struct block gpucc = { .name = "gpucc", .phys = 0x05065000, .size = 0x900
 #define GPUCC_CX_HW_CTRL            0x01008
 
 /*
+ * gpu_pll0's PLL_MODE bits, from the vendor's own masks (clock-gpu-8998.c:72-78):
+ * lock BIT(31), active BIT(30), update BIT(22), output 0xf.
+ */
+#define PLL_MODE_LOCK               (1u << 31)
+#define PLL_MODE_ACTIVE             (1u << 30)
+
+/*
  * A power switch's control register (drivers/clk/qcom/gdsc.c:26,32):
  *   PWR_ON_MASK       BIT(31)   status: the domain is powered
  *   SW_COLLAPSE_MASK  BIT(0)    the software request to collapse it (1 = off)
@@ -474,6 +481,40 @@ step_gpucc(void)
 	}
 	say("chiron-adreno: %u: %u registers read, %u read all ones, %u did not repeat\n",
 	    step, (unsigned)(sizeof(reads) / sizeof(reads[0])), refused, unstable);
+
+	/*
+	 * A third, independent test, and the strongest one available before step 2 writes anything.
+	 *
+	 * "All ones" and "repeats itself" can both be produced by a bus that answers with garbage
+	 * consistently -- a missing register that reads 0 nearly always reads 0 twice. What cannot
+	 * be faked is a status bit that the hardware sets on its own because of something real:
+	 * gpu_pll0 is running, and its PLL_MODE register says so in bit 31 (LOCK) and bit 30
+	 * (ACTIVE) -- the vendor's own masks, clock-gpu-8998.c:72-78:
+	 *
+	 *     static struct alpha_pll_masks pll_masks_p = {
+	 *             .lock_mask   = BIT(31),
+	 *             .active_mask = BIT(30),
+	 *             .update_mask = BIT(22),
+	 *             .output_mask = 0xf,
+	 *             .post_div_mask = BM(15, 8),
+	 *     };
+	 *
+	 * The boot loader leaves that PLL locked (the GPU's clock source comes out of it, and the
+	 * clock driver's table hangs off gpu_pll0_pll_out_even). So: a LOCK bit that is set is
+	 * evidence that this kernel is reading the real clock controller and not a hole in the
+	 * address space. A LOCK bit that is clear is NOT evidence of the opposite -- the PLL may
+	 * simply have been left idle -- and the message says which of the two it is.
+	 */
+	{
+		uint32_t pll_mode = first[5];           /* "pll0_mode" in the table above */
+		bool locked = (pll_mode & PLL_MODE_LOCK) != 0;
+		bool active = (pll_mode & PLL_MODE_ACTIVE) != 0;
+
+		say("chiron-adreno: %u: gpu_pll0 mode %#010x: %s, %s%s\n", step, pll_mode,
+		    locked ? "LOCKED" : "not locked", active ? "ACTIVE" : "not active",
+		    locked ? " -- the clock controller is answering real status, so this kernel can reach it" :
+		    " -- not evidence either way (an idle PLL reads like this)");
+	}
 
 	if (refused == sizeof(reads) / sizeof(reads[0])) {
 		say("chiron-adreno: %u: every one of them reads all ones: the GPU's clock controller\n"

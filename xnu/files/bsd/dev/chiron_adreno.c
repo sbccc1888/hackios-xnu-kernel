@@ -126,6 +126,51 @@ struct block {
 	vm_offset_t base;
 };
 
+/*
+ * TWO ADDRESS CONVENTIONS LIVE IN THIS FILE, AND THEY ARE NOT THE SAME. Getting this wrong is
+ * invisible until the hardware silently does nothing, so it is spelled out here once.
+ *
+ * 1. The GPU's own register block (0x5000000): offsets taken from drivers/gpu/msm/a5xx_reg.h
+ *    are DWORD indices, not byte offsets. The vendor's accessor says so in three places:
+ *
+ *      adreno.c:2424-2436
+ *        static void adreno_regwrite(struct kgsl_device *device,
+ *                                    unsigned int offsetwords, ...)
+ *        {
+ *                BUG_ON(offsetwords*sizeof(uint32_t) >= device->reg_len);
+ *                reg = (device->reg_virt + (offsetwords << 2));
+ *                __raw_writel(value, reg);
+ *        }
+ *
+ *    -- the parameter is named offsetwords, the bound check multiplies by sizeof(uint32_t),
+ *    and the address is (offsetwords << 2). The upstream driver agrees independently: its
+ *    register table entries are (a5xx.xml.h value + 1) (adreno_gpu.h:34 REG_ADRENO_DEFINE),
+ *    and gpu_write() writes at msm_writel(mmio + (reg << 2)) (msm_gpu.h:204-207). So
+ *    A5XX_RBBM_STATUS 0x4F5 is byte 0x13D4, not byte 0x4F5.
+ *
+ *    A first version of this file treated them as byte offsets. Every register of steps 1, 3,
+ *    4 and 5 would then have been read and written four registers to the left of where it
+ *    belongs -- mostly still inside the block, so nothing would have faulted; the driver would
+ *    simply have reported nonsense and "failed to start the GPU". Hence GPU_REG():
+ *
+ * 2. The clock controller (0x5065000) and the descriptor the device tree states in bytes:
+ *    offsets from msm-clocks-hwio-8998.h are BYTE offsets. clock-local2.c addresses them
+ *    directly -- `#define CMD_RCGR_REG(x) (*(x)->base + (x)->cmd_rcgr_reg)` then
+ *    `readl_relaxed(CMD_RCGR_REG(rcg))` (:51, :117) -- with no shift. And the device tree's
+ *    own absolute addresses confirm it: gpu_cx_gdsc at 0x5066004 is 0x1004 past 0x5065000,
+ *    which is exactly GPU_CX_GDSCR_OFFSET 0x1004. So those are used as they are.
+ *
+ *    The device tree also carries both forms of one register, which is the cleanest proof that
+ *    the two conventions coexist: qcom,micro-mmu-control = <0x6000> is a byte offset, and
+ *    adreno_iommu.c:86 puts `micro_mmu_ctrl >> 2` (0x1800) into a CP packet, because a PM4
+ *    packet's register address is a dword index.
+ *
+ * CP type-4 packet addresses (the GPMU's instruction RAM) need no conversion for the same
+ * reason: a PM4 packet carries a dword index already, so GPMU_INST_RAM_BASE 0x8800 goes into
+ * the packet as 0x8800 and means byte 0x22000.
+ */
+#define GPU_REG(dword_offset)   ((uint32_t)(dword_offset) << 2)
+
 static void
 need(struct block *b)
 {
@@ -141,24 +186,31 @@ announce(const char *what)
 	say("chiron-adreno: step %u: %s\n", step, what);
 }
 
-/* Read one register and say its address and value: the value is the evidence, not a verdict. */
+/*
+ * Read one register and say its address and value: the value is the evidence, not a verdict.
+ * `offset` is in the block's own convention: a dword index for the GPU block (converted here),
+ * bytes for the clock controller.
+ */
 static uint32_t
-get(struct block *b, const char *name, uint32_t offset)
+get_at(struct block *b, const char *name, uint32_t offset, bool words)
 {
 	uint32_t value;
+	uint32_t byte = words ? GPU_REG(offset) : offset;
 
 	need(b);
-	value = rd(b->base + offset);
-	say("chiron-adreno: %u: %-14s %-22s [%#x] = %#010x\n", step, b->name, name, b->phys + offset, value);
+	value = rd(b->base + byte);
+	say("chiron-adreno: %u: %-14s %-22s [%#x] = %#010x\n", step, b->name, name, b->phys + byte, value);
 	return value;
 }
 
 static void
-put(struct block *b, const char *name, uint32_t offset, uint32_t value)
+put_at(struct block *b, const char *name, uint32_t offset, uint32_t value, bool words)
 {
+	uint32_t byte = words ? GPU_REG(offset) : offset;
+
 	need(b);
-	say("chiron-adreno: %u: write %-14s %-22s [%#x] = %#010x\n", step, b->name, name, b->phys + offset, value);
-	wr(b->base + offset, value);
+	say("chiron-adreno: %u: write %-14s %-22s [%#x] = %#010x\n", step, b->name, name, b->phys + byte, value);
+	wr(b->base + byte, value);
 }
 
 /* ====================================================================================================
@@ -248,6 +300,34 @@ static struct block gpucc = { .name = "gpucc", .phys = 0x05065000, .size = 0x900
 
 /* The GPU itself. dt: qcom,kgsl-3d0@5000000, 0x40000 long (chiron.dts:10122). */
 static struct block kgsl = { .name = "kgsl", .phys = 0x05000000, .size = 0x40000 };
+
+/* The GPU's register block: every offset from a5xx_reg.h is a dword index (see GPU_REG). */
+static uint32_t
+get(struct block *b, const char *name, uint32_t offset)
+{
+	return get_at(b, name, offset, b == &kgsl);
+}
+
+static void
+put(struct block *b, const char *name, uint32_t offset, uint32_t value)
+{
+	put_at(b, name, offset, value, b == &kgsl);
+}
+
+/* Read a GPU-block register by its a5xx_reg.h dword index, without saying anything. */
+static uint32_t
+reg(uint32_t offset)
+{
+	need(&kgsl);
+	return rd(kgsl.base + GPU_REG(offset));
+}
+
+/* Where that register is in bytes, for the log. */
+static uint32_t
+gpureg_phys(uint32_t offset)
+{
+	return (uint32_t)(kgsl.phys + GPU_REG(offset));
+}
 
 /*
  * The always-on counter of the GPU block: it counts at the crystal's 19.2 MHz as long as that
@@ -672,19 +752,19 @@ step_counter_after_power(void)
 
 	announce("the always-on counter again, now that the block is powered");
 
-	lo1 = rd(kgsl.base + RBBM_ALWAYSON_COUNTER_LO);
-	hi1 = rd(kgsl.base + RBBM_ALWAYSON_COUNTER_HI);
+	lo1 = reg(RBBM_ALWAYSON_COUNTER_LO);
+	hi1 = reg(RBBM_ALWAYSON_COUNTER_HI);
 	sleep_us(elapsed_us);
-	lo2 = rd(kgsl.base + RBBM_ALWAYSON_COUNTER_LO);
-	hi2 = rd(kgsl.base + RBBM_ALWAYSON_COUNTER_HI);
+	lo2 = reg(RBBM_ALWAYSON_COUNTER_LO);
+	hi2 = reg(RBBM_ALWAYSON_COUNTER_HI);
 
 	c1 = ((uint64_t)hi1 << 32) | lo1;
 	c2 = ((uint64_t)hi2 << 32) | lo2;
 
 	say("chiron-adreno: %u: alwayson_lo [%#x] = %#010x then %#010x\n", step,
-	    kgsl.phys + RBBM_ALWAYSON_COUNTER_LO, lo1, lo2);
+	    gpureg_phys(RBBM_ALWAYSON_COUNTER_LO), lo1, lo2);
 	say("chiron-adreno: %u: alwayson_hi [%#x] = %#010x then %#010x\n", step,
-	    kgsl.phys + RBBM_ALWAYSON_COUNTER_HI, hi1, hi2);
+	    gpureg_phys(RBBM_ALWAYSON_COUNTER_HI), hi1, hi2);
 
 	if (c2 > c1) {
 		uint64_t ticks = c2 - c1;
@@ -714,8 +794,15 @@ step_counter_after_power(void)
  * ==================================================================================================== */
 
 /*
- * The register block of the 3D core, and the addresses this step uses, all out of
- * drivers/gpu/msm/a5xx_reg.h (the vendor's own list for this part):
+ * The register block of the 3D core, and the offsets this step uses, all out of
+ * drivers/gpu/msm/a5xx_reg.h (the vendor's own list for this part).
+ *
+ * EVERY ONE OF THESE IS A DWORD INDEX, NOT A BYTE OFFSET. See GPU_REG near the top of this
+ * file for the vendor's own lines that establish it: 0x4F5 means byte 0x13D4. They are written
+ * here exactly as a5xx_reg.h writes them, so they can be compared with it by eye, and `reg()`
+ * is what does the shift. Reading them as bytes would put every access four registers to the
+ * left of where it belongs -- still inside the block, so nothing faults, and the driver just
+ * reports nonsense.
  *
  *   0x4F5  RBBM_STATUS                 :495   its bits, a5xx.xml.h:1263+:
  *                                                CP_ME_BUSY   BIT(1)   CP_PFP_BUSY   BIT(2)
@@ -1005,7 +1092,7 @@ step_rbbm(void)
 	put(&kgsl, "uche_dbg_eco_cntl_2", UCHE_DBG_ECO_CNTL_2, A540_HIGHEST_BANK_BIT);
 
 	/* "Disable All flat shading optimization" (:2089) */
-	put(&kgsl, "vpc_dbg_eco_cntl", VPC_DBG_ECO_CNTL, rd(kgsl.base + VPC_DBG_ECO_CNTL) | (1u << 10));
+	put(&kgsl, "vpc_dbg_eco_cntl", VPC_DBG_ECO_CNTL, reg(VPC_DBG_ECO_CNTL) | (1u << 10));
 
 	announce("RBBM read back: the values above, as the hardware holds them");
 	get(&kgsl, "ahb_cntl1", RBBM_AHB_CNTL1);
@@ -1055,8 +1142,9 @@ step_core_start(void)
 	 * value that changes every time mean different things, and both are worth seeing. */
 	announce("RBBM_STATUS ten times, a millisecond apart, to see whether the CP moves");
 	for (unsigned i = 0; i < 10; i++) {
-		status = rd(kgsl.base + RBBM_STATUS);
-		say("chiron-adreno: %u: rbbm_status [%#x] = %#010x%s%s%s\n", step, kgsl.phys + RBBM_STATUS, status,
+		status = reg(RBBM_STATUS);
+		say("chiron-adreno: %u: rbbm_status [%#x] = %#010x%s%s%s\n", step,
+		    gpureg_phys(RBBM_STATUS), status,
 		    (status & RBBM_STATUS_CP_BUSY) ? " CP_BUSY" : "",
 		    (status & RBBM_STATUS_CP_ME_BUSY) ? " ME_BUSY" : "",
 		    (status & RBBM_STATUS_CP_PFP_BUSY) ? " PFP_BUSY" : "");
@@ -1256,7 +1344,7 @@ ring_rptr(bool refresh)
 		__asm__ volatile ("dc ivac, %0" : : "r" (ring_rptr_memory) : "memory");
 		__asm__ volatile ("dsb sy" : : : "memory");
 	}
-	rptr = rd(kgsl.base + CP_RB_RPTR);
+	rptr = reg(CP_RB_RPTR);
 	return rptr;
 }
 
@@ -1343,7 +1431,7 @@ step_ring(void)
 	/* It did not get all the way. Say how far and what the CP's own fault word says. */
 	say("chiron-adreno: %u: the read pointer did not reach the write pointer in 200 ms\n", step);
 	say("chiron-adreno: %u:   cp_hw_fault = %#010x, rbbm_status = %#010x\n", step,
-	    rd(kgsl.base + CP_HW_FAULT), rd(kgsl.base + RBBM_STATUS));
+	    reg(CP_HW_FAULT), reg(RBBM_STATUS));
 	if (rptr_after != rptr_before) {
 		say("chiron-adreno: %u:   it did move (%u -> %u), so the engine is fetching; it stopped part\n"
 		    "chiron-adreno: %u:   way, which points at the packet it stopped on rather than the ring\n",
@@ -1619,23 +1707,23 @@ step_gpmu(void)
 	put(&kgsl, "gpmu_cm3_sysreset", GPMU_CM3_SYSRESET, 0);
 
 	for (uint32_t i = 0; i < GPMU_FW_INIT_RETRY; i++) {
-		general = rd(kgsl.base + GPMU_GENERAL_0);
+		general = reg(GPMU_GENERAL_0);
 		if (general == GPMU_STARTED) {
 			break;
 		}
 		sleep_us(1);
 	}
 	say("chiron-adreno: %u: gpmu_general_0 [%#x] = %#010x (want %#010x)\n",
-	    step, kgsl.phys + GPMU_GENERAL_0, general, GPMU_STARTED);
+	    step, gpureg_phys(GPMU_GENERAL_0), general, GPMU_STARTED);
 
 	if (general != GPMU_STARTED) {
 		say("chiron-adreno: %u: the GPMU did not report itself started. Its own words:\n", step);
-		say("chiron-adreno: %u:   gpmu_general_1 [%#x] = %#010x\n", step, kgsl.phys + GPMU_GENERAL_1,
-		    rd(kgsl.base + GPMU_GENERAL_1));
-		say("chiron-adreno: %u:   gpmu_rbbm_intr_info [%#x] = %#010x\n", step, kgsl.phys + GPMU_RBBM_INTR_INFO,
-		    rd(kgsl.base + GPMU_RBBM_INTR_INFO));
+		say("chiron-adreno: %u:   gpmu_general_1 [%#x] = %#010x\n", step,
+		    gpureg_phys(GPMU_GENERAL_1), reg(GPMU_GENERAL_1));
+		say("chiron-adreno: %u:   gpmu_rbbm_intr_info [%#x] = %#010x\n", step,
+		    gpureg_phys(GPMU_RBBM_INTR_INFO), reg(GPMU_RBBM_INTR_INFO));
 		say("chiron-adreno: %u:   cp_hw_fault = %#010x, rbbm_status = %#010x\n", step,
-		    rd(kgsl.base + CP_HW_FAULT), rd(kgsl.base + RBBM_STATUS));
+		    reg(CP_HW_FAULT), reg(RBBM_STATUS));
 		return false;
 	}
 
@@ -1669,6 +1757,15 @@ chiron_adreno_init(void)
 
 	say("chiron-adreno: Adreno 540 (a5xx) driver present, built %s %s, steps up to %u\n",
 	    __DATE__, __TIME__, CHIRON_ADRENO_STEP);
+	/*
+	 * Two numbers that make the address conventions checkable from the log alone, because a
+	 * mistake there is silent rather than loud: a5xx_reg.h's RBBM_STATUS 0x4F5 is byte 0x13D4
+	 * in the GPU block (dword index), while the device tree's gpu_cx_gdsc 0x5066004 is 0x1004
+	 * past gpucc@5065000 (byte offset). Both are asserted here rather than trusted.
+	 */
+	say("chiron-adreno: addressing: kgsl 0x%x + RBBM_STATUS(%#x)*4 = 0x%x; gpucc 0x%x + 0x%x = 0x%x\n",
+	    kgsl.phys, RBBM_STATUS, gpureg_phys(RBBM_STATUS),
+	    gpucc.phys, GPUCC_CX_GDSCR, (uint32_t)(gpucc.phys + GPUCC_CX_GDSCR));
 
 	/* Nothing happens unless a boot-arg asks for it, as in redwood_adreno.c. */
 	if (!PE_parse_boot_argn("chiron_gpu", &asked, sizeof(asked)) || asked == 0) {

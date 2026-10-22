@@ -147,26 +147,81 @@ Three tests, in increasing strength. **None of them has been run on the phone ye
 
 ---
 
-## 5. What each step's failure means on real hardware
+## 5. On a real phone: a decision tree
 
-A table written for whoever runs this on a phone, so that a failure points somewhere.
+Written for the person holding the phone at 3 a.m., so that a symptom points somewhere instead of
+sending them back into 2000 lines of code.
 
-| Symptom | Most likely meaning | Where to look |
+### Read the log in this order — it is not the order of the steps
+
+The driver prints step 1's result before anything writes, so **always look at step 1 first**, even
+if a later step is what failed. Step 6 is read *before* interpreting any failure in 3, 4 or 5,
+because it can explain those failures outright.
+
+```
+                    ┌─────────────────────────┐
+                    │  step 0 printed a line? │
+                    └───────────┬─────────────┘
+                    no ─────────┴───────── yes
+                     │                     │
+        the file is not in the kernel      ▼
+        → tools/verify_patch.py        ┌──────────────────────────────┐
+        → the build log: "CC           │ step 1: 15 GPUCC registers   │
+          chiron_adreno.o"?            │        all 0xffffffff?       │
+                                       └───────────┬──────────────────┘
+                                       yes ────────┴──────── yes/no
+                                        │                    │
+              HYPERVISOR / XPU REFUSES  │                    ▼
+              everything after needs   │        ┌──────────────────────────┐
+              redesigning              │        │ step 1: gpu_cfg_ahb_clk  │
+              → compare with the       │        │  still has bit31 set?    │
+                vendor kernel's        │        └──────────┬───────────────┘
+                permissions on         │        yes ───────┴──── no
+                kgsl-3d0@5000000       │         │              │
+                                       │   GPUCC bus not        ▼
+                                       │   clocked: the      ┌──────────────────────┐
+                                       │   GCC node's        │ step 1: PLL0 LOCK?   │
+                                       │   protected-clocks  └──────────┬───────────┘
+                                       │                          set ─┴─ clear
+                                       │                           │        │
+                                       │              reads are REAL│        │ not evidence
+                                       │              keep going    │        │ either way
+                                       │                            ▼        ▼
+                                       └──────────────────────► step 2 …
+```
+
+### Then, by symptom
+
+| What you see | Read it as | Go to |
 |---|---|---|
-| Step 1: all 15 GPUCC registers read `0xffffffff` | the hypervisor or XPU refuses this kernel the GPU's clock controller | the `kgsl-hyp` node; compare against what the vendor kernel is allowed |
-| Step 1: `gcc_gpu_cfg_ahb_clk` never clears `bit31` | the GPUCC register bus is not being clocked, so nothing behind it can answer | the GCC node's protected clocks |
-| Step 1: registers do not repeat between two reads | no real bus there — wrong base address, or the mapping is not what it seems | the device tree's `reg` |
-| Step 1: PLL `LOCK` clear but everything else fine | **not necessarily a fault** — the boot loader may leave the PLL idle | step 2 programs the rate; watch step 2 |
-| Step 2: CX GDSC `bit31` never sets | the CX rail has no voltage — Linux raises it through RPMh and this kernel has no RPMh client | §6, "what XNU cannot do" |
-| Step 2: GDSCs report on but the always-on counter never moves | the switches obeyed and the block is still dead: **almost always the rail** | same |
-| Step 2: counter moves but slower than 19.2 MHz | the crystal is not reaching the block at full rate, or the interval measured is longer than intended (loop overhead only ever lengthens it) | the ratio is printed; a value *below* 1000 is the interesting one |
-| Step 3: `CP_HW_FAULT` ≠ 0 | the micro engine started and refused something — most often an instruction base address it cannot read | step 6: is the GPU's stream bypassed? |
-| Step 3: no CP busy bit ever seen | **not proof of failure** with an empty ring; a parked engine looks idle | step 4 is the real test |
-| Step 4: RPTR never moves at all | the engine is not fetching: either it is not running, or the ring's address is not one it can read | step 6 first, then step 3 |
-| Step 4: RPTR moved part way and stopped | the engine *is* fetching and choked on the packet it stopped at | the packet built there; check its parity word by hand |
-| Step 5: no `0xBABEFACE` | the GPMU did not start. `GENERAL_1`, `RBBM_INTR_INFO`, `CP_HW_FAULT` and `RBBM_STATUS` are all printed raw | firmware version (§6) |
-| Step 6: stream 0 is **not** `BYPASS` | **steps 3–5's addresses will not mean what the driver thinks** — this is the explanation for a step 3/4 failure, not a separate problem | a translation context has to be built |
-| Step 6: `sGFSR` ≠ 0 | something already faulted through this SMMU, possibly before this kernel ran | `sGFSYNR0/1` are printed |
+| **step 1**, all 15 read `0xffffffff` | this kernel may not touch the GPU's clock controller at all | the `kgsl-hyp` node (`chiron.dts:10097`); what the vendor kernel is allowed |
+| **step 1**, `gcc_gpu_cfg_ahb_clk` keeps `bit31` | the GPUCC register bus is unclocked; nothing behind it can answer | GCC's protected clocks |
+| **step 1**, values differ between the two reads | no real bus there | the device tree's `reg` for `gpucc@5065000` |
+| **step 1**, PLL `LOCK` clear, nothing else wrong | **not a fault** — an idle PLL reads that way | continue; step 2 sets the rate |
+| **step 2**, CX GDSC `bit31` never sets | the CX rail has no voltage — Linux raises it through RPMh and XNU has no RPMh client (§7) | nothing in this kernel can fix it; the boot loader's rail level is all there is |
+| **step 2**, GDSCs say `POWER ON` but the counter never moves | switches obeyed, block still silent — **almost always the rail** | same as above |
+| **step 2**, counter moves, ratio **below** 1000 | the crystal is not reaching the block at full rate (loop overhead only ever makes the ratio *higher*, so a low one is real) | the PLL's post-divider; step 1's PLL reading |
+| **step 3**, `CP_HW_FAULT` ≠ 0 | the engine started and refused something — most often an instruction base address it cannot read | **step 6 first** (is the stream bypassed?), then the microcode address |
+| **step 3**, no busy bit ever seen | **not proof of failure** — a parked engine with an empty ring looks idle | step 4 is the real test |
+| **step 4**, RPTR never moved at all | the engine is not fetching: not running, or the ring's address is unreadable | **step 6 first**, then step 3 |
+| **step 4**, RPTR moved and stopped part way | the engine *is* fetching and choked on the packet it stopped at | that packet; check its parity word by hand against `odd_parity()` in a compiled test |
+| **step 5**, no `0xBABEFACE` | the GPMU did not start | the four raw registers it prints; then the firmware's version (§6) |
+| **step 5**, the log says the firmware was refused for its version | it is the wrong file — e.g. `a530v3_gpmu.fw2` is 2.4 and this phone asks for 3.0 | get `a540_gpmu.fw2` from the phone |
+| **step 6**, stream 0 is **not** `BYPASS` | **steps 3–5's addresses do not mean what the driver thinks** — this is the *explanation* for a 3/4 failure, not a separate problem | a translation context must be built before 3–5 can work |
+| **step 6**, `sGFSR` ≠ 0 | something already faulted through this SMMU, possibly before this kernel | `sGFSYNR0/1` are printed raw |
+| **step 7**, refuses for want of `chiron_zap_mem` | by design — see §7 | give the loader a reserved address |
+| **step 7**, TrustZone refuses the signature | taken to mean it already keeps a zap shader from a previous kernel; the sequence continues | whether the 3D core leaves secure mode is the real answer |
+
+### The three readings that are traps
+
+1. **"All ones" on a single register is not proof of refusal.** The driver says `NOTE` and continues
+   unless *all fifteen* read that way. A register may legitimately hold `0xffffffff`.
+2. **A clear PLL `LOCK` bit is not proof of failure.** An idle PLL reads exactly like that.
+3. **No busy bit in `RBBM_STATUS` is not proof the engine is dead.** An empty ring parks it. Step 4's
+   read pointer is the test; step 3's is only "did not fault".
+
+Each of those is a place where a plausible-looking conclusion would be wrong, and the log says which
+case it is in rather than folding both into one verdict.
 
 ---
 
@@ -202,8 +257,28 @@ The consequence is specific and worth knowing before a run: **if the rail is too
 report on and the block will stay silent.** That is exactly what a dead always-on counter after step 2
 means, and the log says so.
 
-**Resetting the GPMU** after a bad start. There is no path back; a wrong firmware image wedges it until
-the phone reboots. This is why step 5 checks the version first.
+### The zap shader is a different risk class — it can brick the phone
+
+Steps 1–6 write to registers. A wrong value makes a step fail, and a reboot undoes it.
+
+**Step 7 hands a signed image to the secure processor and tells it to run it.** Two ways that differs:
+
+- **The address must be real reserved memory.** `PAS_MEM_SETUP` points TrustZone at a physical range.
+  If that range belongs to something else — the kernel, a modem, the display — TrustZone writes a
+  signed image over it, or refuses and leaves the GPU half-initialised. That is why the driver takes
+  the address from the loader (`chiron_zap_mem=`) and **refuses without it**: redwood's
+  `0x8b71a000` is a redwood address and would be meaningless here, and picking one by guesswork is
+  not a thing to do to somebody's phone.
+- **There is no undo.** `PAS_SHUTDOWN` asks TrustZone to give the image up, but a wedged secure
+  processor is not something this kernel can reset. The GPMU has the same property (below).
+
+So: **run steps 1–6 first, on their own, and only add step 7 when the phone has a spare boot path
+and `chiron_zap_mem` is a range the loader really reserved.** The step says in its own log line which
+of the two inputs is missing, so a refusal is never ambiguous.
+
+**Resetting the GPMU.** There is no path back; a wrong firmware image wedges it until the phone
+reboots. This is why step 5 checks the version before loading anything, and why it treats a
+major-version mismatch as a refusal rather than a warning.
 
 ---
 
@@ -273,3 +348,84 @@ The port's own history has two lessons that shaped this driver:
 
 Every hunk of the patch that registers this file is checked mechanically against the lines it carries
 (192 hunk headers), because a malformed hunk is exactly how a change goes missing quietly.
+
+---
+
+## Appendix A — what sits above this driver, and what it will ask for
+
+Read-only survey of `iokit/Kernel/RedwoodGPU.cpp` (1295 lines), done so that the next stage starts
+with information rather than from scratch. **No code was written from it.**
+
+### The shape
+
+```
+freedreno (Mesa)
+    ↓ Linux DRM ioctl
+userland/tools/mesa/redwood-drm/redwood_drm.c    the shim that stands in for libdrm   ← reuse
+    ↓ IOKit user client: selector = request number, structure in and out
+iokit/Kernel/RedwoodGPU.cpp                                                             ← reuse
+    ↓ the 15 extern "C" redwood_gpu_* functions
+bsd/dev/redwood_adreno.c  →  chiron needs its own equivalent                            ← rewrite
+```
+
+**The middle two layers do not know what GPU is underneath.** They speak Linux's `msm` DRM protocol.
+Only the bottom layer is hardware-bound, which is the whole of chiron's remaining work.
+
+### The 15 functions this layer calls (the M8 work order)
+
+```c
+bool     redwood_gpu_ready(void);
+bool     redwood_gpu_parameter(uint32_t which, uint64_t *value);
+uint64_t redwood_gpu_address(uint64_t size);
+void     redwood_gpu_address_free(uint64_t address, uint64_t size);
+void     redwood_gpu_space(...);
+bool     redwood_gpu_map(uint64_t address, uint64_t phys, bool read_only);   /* the core one */
+void     redwood_gpu_mapped(void);
+void     redwood_gpu_unmap(uint64_t address, uint64_t size);
+uint64_t redwood_gpu_to_memory(void *start, uint64_t size);
+void     redwood_gpu_done(uint32_t fence);
+uint32_t redwood_gpu_last(void);
+uint64_t redwood_gpu_submit(const uint64_t *addresses, const uint32_t *words, uint32_t count);
+bool     redwood_gpu_worked(uint64_t *us, uint32_t *n, uint32_t by[7]);
+void     redwood_gpu_report(const char *why);
+void     redwood_gpu_recover(void);
+```
+
+`redwood_gpu_map()` is the one that matters, and **it is the same question step 6 asks**. With the GPU's
+stream bypassed, it can be a table of physical↔GPU address pairs; with a translating stream it needs a
+real arm-smmu page table and the secure side's permission to build one. So step 6's one log line decides
+whether M8 is a moderate piece of work or a large one.
+
+`gpu_recover()` has no a5xx equivalent: redwood can reset its GMU and start again, and a5xx's GPMU
+cannot be reset from this kernel (§7). chiron's would have to report and stop, and say so.
+
+### Selectors
+
+Linux's, from `msm_drm.h`/`drm.h`: `0x09` GEM close, `0x40`–`0x48` parameters/GEM/submit/fence/madvise,
+`0x4a`–`0x4c` submit queues. Three of redwood's own: `0x7d` worked, `0x7e` surface, `0x7f` show. The
+three custom ones touch no hardware (MiniIOSurface and buffers), so chiron keeps them.
+
+### Compute needs no new kernel interface
+
+This is worth recording because it is easy to assume otherwise:
+
+| compute needs | what provides it | enough? |
+|---|---|---|
+| SSBO — a read/write buffer of any size | `kMsmGemNew` takes any `size`; `kMsmGemInfo` gives its GPU address | **yes** — an SSBO is the same kind of object as a vertex or texture buffer |
+| read/write permission | `redwood_gpu_map(..., read_only)` | **yes** — `read_only = false` |
+| threadgroup memory | a shader-internal concept | **no kernel involvement at all** |
+| a dispatch | one `kMsmGemSubmit` with the workgroup dimensions in the command stream | **yes** — indistinguishable from any other submit |
+
+### What chiron inherits, including the shortcomings
+
+`RedwoodGPU.cpp:25-30` lists what it deliberately does not do: no interrupts (waits poll five times a
+millisecond), no per-client isolation (every client's buffers share one address space), no fences or
+buffers as file descriptors. Those are design choices, not defects, and chiron would inherit them as
+they stand. The first becomes a performance problem only when several GPU programs run at once.
+
+### One thing to change when porting
+
+The selector numbers and the structures they carry are written twice — once in the shim
+(`userland/tools/mesa/redwood-drm/`) and once in the kernel — rather than shared through one header.
+That is how a `dma.control`-shaped bug happens: both sides compile, and a field is read at the wrong
+offset. When chiron's layer is written, the two should include the same header.

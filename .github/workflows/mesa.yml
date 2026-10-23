@@ -399,7 +399,13 @@ jobs:
           n=$(wc -l < out/exported-gl.txt)
           echo "gl* exports: $n"
           [ "$n" -gt 100 ] || { echo 'too few GL entry points'; exit 1; }
-          grep -qx 'GetError' out/exported-gl.txt || { echo 'no glGetError in the exports'; exit 1; }
+          # substr($3, 2) in the package step already removed the leading
+          # underscore, so these names carry the gl prefix: "glGetError", not
+          # "GetError". The check greps for the names the file actually holds.
+          for sym in glGetError glCreateShader glBindBuffer glDrawArrays; do
+            grep -qx "$sym" out/exported-gl.txt || { echo "missing export: $sym"; head -5 out/exported-gl.txt; exit 1; }
+          done
+          echo "  entry points present: glGetError glCreateShader glBindBuffer glDrawArrays"
           if [ -f out/libredwoodair.dylib ]; then
             r=$("$NM" -gU out/libredwoodair.dylib | grep -c ' _rwa_')
             echo "rwa_* in libredwoodair: $r"

@@ -118,8 +118,25 @@ jobs:
           VERSION=$(grep -m1 '^VERSION=' tools/mk-mesa.sh | cut -d= -f2)
           SHA256=$(grep -m1 '^SHA256=' tools/mk-mesa.sh | cut -d= -f2)
           echo "mesa $VERSION"
-          curl -sL --fail -o mesa.tar.xz "https://archive.mesa3d.org/mesa-$VERSION.tar.xz"
-          echo "$SHA256  mesa.tar.xz" | sha256sum -c --quiet
+
+          # archive.mesa3d.org serves this file but does not answer a GitHub
+          # runner (curl exit 22). The tarball is kept as a release asset in this
+          # repository instead, which the job token can always read, with the
+          # sha256 below as the thing that actually decides whether it is right.
+          URL="https://github.com/${{ github.repository }}/releases/download/mesa-sources/mesa-$VERSION.tar.xz"
+          echo "  from: $URL"
+          if ! curl -sSL --fail --retry 3 -o mesa.tar.xz "$URL"; then
+            echo "could not download $URL"
+            echo "the release asset is named mesa-$VERSION.tar.xz on the tag mesa-sources"
+            exit 1
+          fi
+          echo "  got $(stat -c %s mesa.tar.xz) bytes"
+          echo "$SHA256  mesa.tar.xz" | sha256sum -c --quiet || {
+            echo "the tarball does not match the sha256 pinned in tools/mk-mesa.sh"
+            echo "  expected $SHA256"
+            echo "  actual   $(sha256sum mesa.tar.xz | cut -d' ' -f1)"
+            exit 1
+          }
           tar xJf mesa.tar.xz
           for p in tools/mesa/*.patch; do
             echo "  $(basename "$p")"

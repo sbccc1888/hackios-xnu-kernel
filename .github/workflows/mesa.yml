@@ -144,24 +144,35 @@ jobs:
           file /tmp/t.bin | grep -q 'Mach-O' || { echo 'the linked output is not Mach-O'; exit 1; }
           echo "linked: $(file -b /tmp/t.bin)"
 
-          # A C++ program that uses exactly what mesa's objects use, linked the same
-          # way. If libc++ is not being found, this fails here with the same
-          # symbols the real build reported (logic_error, __cxa_guard_acquire).
+          # A C++ program that uses what mesa's objects use. Run with output kept:
+          # the previous version exited without printing either of its two messages,
+          # so the failure was inside something that swallowed its own stderr.
           cat > /tmp/t.cc <<'CPP'
           #include <stdexcept>
           #include <vector>
           #include <string>
           int main() {
+            static std::vector<std::string> v = {"a", "b"};
             try { throw std::length_error("x"); }
-            catch (const std::logic_error &) { return 0; }
+            catch (const std::logic_error &) { return (int)v.size() - 2; }
           }
           CPP
-          # a guard variable forces __cxa_guard_acquire, as libglsl's static
-          # initialisers do
-          static std::vector<std::string> v = {"a", "b"};
+          echo '--- C++ link probe ---'
+          set +e
           XNU_SDK_VERSION=16.5 xnu-deps/host/bin/xnu-clang++ \
             -arch arm64 -isysroot "$THEOS/sdks/iPhoneOS16.5.sdk" /tmp/t.cc -o /tmp/t.cc.bin \
-            || { echo 'C++ link failed: libc++ is not being found'; exit 1; }
+            > /tmp/cc.log 2>&1
+          rc=$?
+          set -e
+          echo "exit: $rc"
+          sed -n '1,25p' /tmp/cc.log
+          if [ $rc -ne 0 ]; then
+            echo '--- what the wrapper resolves libc++ to ---'
+            sed -n '1,20p' xnu-deps/host/bin/xnu-clang
+            echo '--- do the stubs exist? ---'
+            ls -l "$SDKROOT/usr/lib/libc++.tbd" "$SDKROOT/usr/lib/libz.tbd" 2>&1
+            exit 1
+          fi
           file /tmp/t.cc.bin | grep -q 'Mach-O' || { echo 'C++ output is not Mach-O'; exit 1; }
           echo "c++ linked: $(file -b /tmp/t.cc.bin)"
 

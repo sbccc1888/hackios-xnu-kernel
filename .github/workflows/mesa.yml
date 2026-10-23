@@ -81,9 +81,12 @@ jobs:
           # job does, so recreate just this piece -- and prove it produces a
           # Mach-O object before going further.
           mkdir -p xnu-deps/host/bin xnu-deps/hostinc
+          export SDKROOT="$THEOS/sdks/iPhoneOS16.5.sdk"
+          test -d "$SDKROOT" || { echo "no SDK at $SDKROOT"; exit 1; }
           cat > xnu-deps/host/bin/xnu-clang <<'WRAP'
           #!/bin/bash
           HB="$(cd "$(dirname "$0")" && pwd)"
+          SDKROOT="${SDKROOT:-$HB/../../../theos/sdks/iPhoneOS16.5.sdk}"
           case "$(basename "$0")" in *++) drv=clang++; extra=(-fno-use-cxa-atexit);; *) drv=clang; extra=();; esac
           args=()
           for a in "$@"; do
@@ -94,16 +97,23 @@ jobs:
               *) args+=("$a");;
             esac
           done
-          # Linking needs the SDK's stubs named: libc++ for the C++ objects mesa
-          # builds (libglsl, the compiler), libz because something still calls
-          # gz*. Without them ld64 reports 16 undefined symbols.
+          # Linking needs the SDK's stubs for libc++ and zlib. They are named by
+          # absolute path rather than -lc++/-lz: the .tbd files are text stubs that
+          # ld64 reads directly, and a path needs no search order to resolve.
+          LIBCXX="$SDKROOT/usr/lib/libc++.tbd"
+          LIBZ="$SDKROOT/usr/lib/libz.tbd"
+          for f in "$LIBCXX" "$LIBZ"; do
+            [ -f "$f" ] || { echo "missing stub: $f" >&2; exit 1; }
+          done
           exec clang -include "$HB/../../hostinc/xnu_clang_compat.h" \
             -target arm64-apple-ios${XNU_SDK_VERSION:-16.5} --ld-path="$HB/ld64" \
-            -Wl,-lc++ -Wl,-lz \
+            "$LIBCXX" "$LIBZ" \
             -w "${extra[@]}" "${args[@]}"
           WRAP
           chmod +x xnu-deps/host/bin/xnu-clang
           ln -sf xnu-clang xnu-deps/host/bin/xnu-clang++
+          echo '--- the wrapper as written ---'
+          sed -n '1,25p' xnu-deps/host/bin/xnu-clang
           # xnu-deps/setup.sh:123 does `link "$CCTOOLS/ld" host/bin/ld64`: the file
           # in cctools is named `ld`, and `ld64` is the name it is given here.
           # Pointing --ld-path at .../bin/ld64 in the toolchain was a dangling path,

@@ -45,7 +45,7 @@ So "read the GPU ID to prove it is alive" is not available here. Step 1 uses a b
 
 ---
 
-## 2. The seven steps
+## 2. The steps
 
 Each announces what it will touch before touching it, reads before writing, and **stops the sequence**
 rather than continuing blind. An access the hypervisor dislikes ends the run, sometimes a quarter of a
@@ -57,11 +57,13 @@ minute later and without a word (`redwood_adreno.c`, the note at the top).
 | 1 | enables `gcc_gpu_cfg_ahb_clk`; reads 15 GPUCC registers twice | **may this kernel reach the GPU's registers?** | yes — stops if all 15 read `0xffffffff` |
 | 2 | CX then GX power switches on; 3D clock source root enabled | power and clocks really came up | yes — GDSC `bit31` never sets |
 | **3a** | **12 `*_ADDR_MODE_CNTL` registers set to 1, each read back** | **the high halves of every GPU address mean something** | yes — a register that does not read back 1 |
+| **3a2** | the two power islands inside the block (RB/CCU, SP) | the CP can run a command to completion | reported; a dead island shows up as a stall in step 4 |
 | 3b | ~40 RBBM registers as a540 wants; CP microcode loaded; `ME_HALT` cleared | micro engine out of halt without faulting | yes — `CP_HW_FAULT` ≠ 0 |
-| 3c | `RBBM_SECVID_TRUST_CNTL = 0`, read back | whether TrustZone lets this kernel leave secure mode | reported, not judged — see below |
+| 3c | reads `RBBM_SECVID_TRUST_CNTL` (writes only with `chiron_try_unsecure=1`) | whether the 3D core is still in secure mode | reported — the write resets the phone, see §7 |
 | 4 | ring buffer, `CP_ME_INIT`, then a `CP_INTERRUPT` | **the CP fetches and executes what it is given** | yes — RPTR never reaches WPTR |
 | 5 | `a540_gpmu.fw2` → PM4 → its instruction RAM; handshake | the GPMU's firmware started | yes — no `0xBABEFACE` |
 | 6 | reads the SMMU (identity, `sCR0`, stream 0's `SMR`/`S2CR`) | **what steps 3–5 are assuming about addresses** | read-only; always reports |
+| 6b | builds an identity map in the GPU's SMMU (`chiron_smmu_identity=1`) | the CP can reach memory at all | yes — a context bank that does not take |
 | 7 | zap shader through TrustZone | the 3D core may leave secure mode | yes — and **unverified**, see §6 |
 
 **3a comes first in step 3, and that ordering is the vendor's.** `a5xx_enable_64bit`
@@ -69,6 +71,14 @@ minute later and without a word (`redwood_adreno.c`, the note at the top).
 runs. It is a precondition, not a setting: until those twelve registers say 64-bit, the high halves of
 the addresses this driver writes into `CP_PM4_INSTR_BASE_HI`, `CP_RB_BASE_HI` and the GMEM ranges are
 not what the driver meant. Nothing faults — the same silent class as the defects in §9.
+
+All twelve, not just the CP: the port set only `CP_ADDR_MODE_CNTL` at first and "the 0127a blit
+faulted at the source PA's low 32 bits" (patch 0128) — an address fault that reads like a memory-map
+problem.
+
+**3a2 is there because leaving it out does not look like a power problem.** Without the RB/CCU and SP
+islands the CP "hung on the first 2D blit (RBBM_STATUS c00001c3)" — the engine is out of halt, the ring
+is fine, and it stops in the middle of a command. Patch 0127.
 
 **3c is an attempt, not a success.** On a device with content protection — which a540 has — the vendor
 does not use this path at all; it switches through the CP with the zap shader (step 7). So the driver
@@ -215,19 +225,21 @@ because it can explain those failures outright.
 | **step 1**, `gcc_gpu_cfg_ahb_clk` keeps `bit31` | the GPUCC register bus is unclocked; nothing behind it can answer | GCC's protected clocks |
 | **step 1**, values differ between the two reads | no real bus there | the device tree's `reg` for `gpucc@5065000` |
 | **step 1**, PLL `LOCK` clear, nothing else wrong | **not a fault** — an idle PLL reads that way | continue; step 2 sets the rate |
-| **step 2**, CX GDSC `bit31` never sets | the CX rail has no voltage — Linux raises it through RPMh and XNU has no RPMh client (§7) | nothing in this kernel can fix it; the boot loader's rail level is all there is |
+| **step 2**, CX GDSC `bit31` never sets | the CX rail has no voltage — Linux raises it through RPMh and XNU has no client for it (§7) | nothing here yet; the port shows the rail is reachable over SPMI (§7) |
 | **step 2**, GDSCs say `POWER ON` but the counter never moves | switches obeyed, block still silent — **almost always the rail** | same as above |
 | **step 2**, counter moves, ratio **below** 1000 | the crystal is not reaching the block at full rate (loop overhead only ever makes the ratio *higher*, so a low one is real) | the PLL's post-divider; step 1's PLL reading |
 | **step 3a**, a block's address mode does not read back 1 | that block still treats addresses as 32-bit; the high halves of anything the driver gave it were dropped | the twelve are printed individually — whichever failed names the block |
-| **step 3b/4**, the addresses seem wrong (fault, RPTR dead, instruction base unreadable) | **check step 3a first**: if the 64-bit address mode did not take, the instruction bases and the ring base were written with their high halves ignored | step 3a's line: "N of 12 registers set" |
-| **step 3c**, `RBBM_SECVID_TRUST_CNTL` does not read back 0 | TrustZone refused the write — expected on a device with content protection | the 3D core stays in secure mode; that is step 7's job |
-| **step 3b**, `CP_HW_FAULT` ≠ 0 | the engine started and refused something — most often an instruction base address it cannot read | **step 3a, then step 6** (is the stream bypassed?), then the microcode address |
-| **step 3**, no busy bit ever seen | **not proof of failure** — a parked engine with an empty ring looks idle | step 4 is the real test |
-| **step 4**, RPTR never moved at all | the engine is not fetching: not running, or the ring's address is unreadable | **step 6 first**, then step 3 |
+| **step 3a2**, an island reads NOT ON | the CP will stall **in the middle of a command** and it will look like a CP fault | the two status registers; do not go hunting in the CP |
+| **step 3b/4**, the addresses seem wrong (fault, RPTR dead, instruction base unreadable) | **check step 3a first**, then step 6 — a 32-bit address mode and a FAULT SMMU stream both look exactly like this | step 3a's "N of 12", step 6's stream 0 |
+| **step 3c**, the log says the 3D core is IN SECURE MODE | ordinary work will be refused | step 7 (needs `a540_zap.mdt`); **do not** write `TRUST_CNTL = 0` — it resets the phone (§7) |
+| **step 3b**, `CP_HW_FAULT` ≠ 0 | the engine started and refused something — most often an instruction base address it cannot read | **step 3a, then step 6**, then the microcode address |
+| **step 3b**, no busy bit ever seen | **not proof of failure** — a parked engine with an empty ring looks idle | step 4 is the real test |
+| **step 4**, RPTR never moved at all | the engine is not fetching: not running, secure mode, a FAULT stream, or 32-bit addresses | **step 3a → 3c → 6**, in that order, before touching step 3b |
 | **step 4**, RPTR moved and stopped part way | the engine *is* fetching and choked on the packet it stopped at | that packet; check its parity word by hand against `odd_parity()` in a compiled test |
 | **step 5**, no `0xBABEFACE` | the GPMU did not start | the four raw registers it prints; then the firmware's version (§6) |
 | **step 5**, the log says the firmware was refused for its version | it is the wrong file — e.g. `a530v3_gpmu.fw2` is 2.4 and this phone asks for 3.0 | get `a540_gpmu.fw2` from the phone |
-| **step 6**, stream 0 is **not** `BYPASS` | **steps 3–5's addresses do not mean what the driver thinks** — this is the *explanation* for a 3/4 failure, not a separate problem | a translation context must be built before 3–5 can work |
+| **step 6**, stream 0 is `FAULT` (not `BYPASS`, not `TRANSLATE`) | **the worst case, and the one a real a5xx actually starts in**: the first CP fetch resets the phone | step 6b (`chiron_smmu_identity=1`) must run **before** step 4 |
+| **step 6b**, the context bank does not take | a half-built SMMU is worse than none — a FAULT stream resets the phone later | do not run steps 3b/4; compare the printed values with what was written |
 | **step 6**, `sGFSR` ≠ 0 | something already faulted through this SMMU, possibly before this kernel | `sGFSYNR0/1` are printed raw |
 | **step 7**, refuses for want of `chiron_zap_mem` | by design — see §7 | give the loader a reserved address |
 | **step 7**, TrustZone refuses the signature | taken to mean it already keeps a zap shader from a previous kernel; the sequence continues | whether the 3D core leaves secure mode is the real answer |
@@ -270,12 +282,30 @@ the one mistake that cannot be undone from this kernel.
 
 **Raising the graphics voltage rail.** Linux does it between CX and GX through its regulator framework
 (`clock-gpu-8998.c:414-416`, via `vdd_gpucc`), which reaches a PM8998 regulator through RPMh. This
-kernel has **no RPMh client**. So the sequence is CX, then GX, with nothing in between, and the boot
-loader's rail level is what the GPU gets.
+kernel has **no RPMh client** — but that is a missing driver, not a hard limit: the Adreno 530 port
+writes the S2 regulator over SPMI directly (ios-sailfish patch 0119: fixed 745 mV, "0.5 mV steps from
+0, FTS2.5 from 80 mV"). If a run turns out to need the rail raised, that is the model to follow.
 
-The consequence is specific and worth knowing before a run: **if the rail is too low, the GDSCs will
-report on and the block will stay silent.** That is exactly what a dead always-on counter after step 2
-means, and the log says so.
+The consequence while it does not exist: **if the rail is too low, the GDSCs will report on and the
+block will stay silent.** That is exactly what a dead always-on counter after step 2 means, and the
+log says so.
+
+### A write that resets the phone, which this driver therefore does not do
+
+`RBBM_SECVID_TRUST_CNTL = 0` is mainline's way of leaving secure mode on a device with no zap shader
+in its tree. The Adreno 530 port tried it and recorded what happened (ios-sailfish patch 0125):
+
+> "The GPU stays in secure mode (TRUST_CNTL 1): **writing RBBM_SECVID_TRUST_CNTL = 0 (mainline's
+> no-zap-shader path) reset the phone**; leaving it needs the zap shader loaded through TZ."
+
+MSM8996 is a5xx like this SoC, with the same generation of TrustZone arrangement. So this driver
+**reads** that register and reports whether the 3D core is still in secure mode — the first thing to
+suspect when step 4 fetches nothing — and performs the write only with `chiron_try_unsecure=1`.
+
+Note what this says about verification design: the earlier version of this step wrote the value and
+planned to read it back, reasoning that a read-back mismatch would prove refusal. **It would not — the
+reset happens before anything can be read.** A falsifiable-looking experiment is not a safe one if the
+failure mode is not known when it is designed.
 
 ### The zap shader is a different risk class — it can brick the phone
 
@@ -304,24 +334,38 @@ major-version mismatch as a refusal rather than a warning.
 
 ## 8. Unverified assumptions
 
-Things that are reasoned, not observed. Each is a place a run could surprise us.
+Things that are reasoned, not observed **on this phone**. Where the Adreno 530 port has an answer, it
+is given — that port runs a5xx on real hardware, which is closer to ground truth than anything else
+available here.
 
-1. **Kernel memory is identity-mapped where the GPU's micro-MMU passes through.** Steps 3–5 hand the GPU
-   `kvtophys()` addresses with no SMMU context programmed. Step 6 reports whether the GPU's stream is
-   bypassed; if it is not, this assumption is simply false and steps 3–5 will fail — visibly.
+1. ~~**Kernel memory is identity-mapped where the GPU's micro-MMU passes through.**~~
+   **WRONG, and now known to be wrong.** The port measured what a real a5xx does (patch 0121):
+
+   > "firmware ignores sCR0.CLIENTPD (bypass) and the stream starts as **FAULT**
+   > (S2CR0 0x000200ff), **the first CP fetch reset the phone**."
+
+   So the physical addresses from `kvtophys()` do **not** arrive unchanged, and CLIENTPD does not
+   save you. A context bank must exist first — step 6b builds one — and until it does, running
+   step 4 is expected to reset the phone. This is the single most consequential correction in this
+   document.
 2. **The boot loader leaves `gpu_pll0` locked.** Step 2 sets the divider and the source but does not
    program the PLL. If the PLL is not running, the clock exists but has nothing to divide. Step 1's
-   `LOCK` reading is the evidence for this, and it is printed either way.
+   `LOCK` reading is the evidence for this, and it is printed either way. *No answer from the port —
+   MSM8996's GPUCC is a different layout, so it could not be carried over.*
 3. **`CM3_SYSRESET = 0` is the right way to start the GPMU.** Taken from `adreno_a5xx.c:798`, not
-   observed.
+   observed. *The port never started the GPMU at all — patch 0127's comment says "GPMU firmware left
+   out" — which is consistent with the GPMU being optional, and means step 5 has no independent
+   confirmation.*
 4. **`0xBABEFACE` arrives within 5000 µs.** The vendor's own comment says 3000 cycles ≈ 5–24 µs; the
    poll is far longer on purpose, because a falsely failed step is worse than a slow one.
 5. **Whoever calls `chiron_adreno_init()` does so after enough of the kernel is up to allocate memory.**
    It is called from `redwood_input_init()` (`bsd/dev/redwood_input.c:225`), beside where redwood's GPU
    driver is started, so it inherits that timing.
-6. **The whole file's biggest assumption: that these are the right registers and values at all.** They
-   are the vendor's, cited line by line, and two independent sources are given where two exist — but
-   they have never been written to this phone by this kernel.
+6. **The register values, on a540 specifically.** They are the vendor's, cited line by line, and two
+   independent sources are given where two exist. The ones marked as measured above are from an Adreno
+   530 on MSM8996 — same architecture, same generation, **not the same chip**. A value that differs
+   between a530 and a540 (GMEM size, the highest-bank-bit field, the CP queue thresholds) is taken from
+   a540's own vendor code, not from the port.
 
 ---
 
@@ -349,9 +393,48 @@ Two working rules came out of it, and they are worth keeping:
   `micro_mmu_ctrl >> 2` looked wrong while doing something else. Continuing with the plan would have
   left it in place until the phone.
 
+### And a fourth, of a different kind — a *safe-looking* mistake
+
+For a while step 3 wrote `RBBM_SECVID_TRUST_CNTL = 0` and read it back, on the reasoning that a
+read-back mismatch would prove TrustZone had refused. That reasoning is sound for a register write and
+**worthless here**: on this generation the write resets the phone before anything can be read. The port
+had measured exactly that (patch 0125) and this driver had not looked.
+
+The lesson is narrower than "check the vendor's code": it is that **a falsifiable experiment is only
+safe if the failure mode is known when it is designed.** The read-back made the step *look* verified
+while the actual outcome — a reset — was invisible to it. Before running an experiment on someone's
+phone, ask what the worst outcome is, not just how to detect a benign one.
+
 ---
 
-## 10. A note on evidence
+## 10. What a working a5xx says
+
+`joranv1/ios-sailfish` runs XNU on the Google Pixel (MSM8996, **Adreno 530**) with the GPU drawing
+through Mesa's freedreno, and carries ~30 patches (`0119`–`0164`) of a5xx kernel driver work. MSM8996
+is the same architecture and generation as this SoC, so it is the closest thing to ground truth
+available without a chiron. What it settled, and what it did not:
+
+| Question | The port's answer | Effect here |
+|---|---|---|
+| Does the SMMU need a context bank? | **Yes** — stream starts as FAULT, CLIENTPD ignored, first CP fetch resets the phone | step 6b; assumption §8.1 was wrong |
+| Is one 64-bit address-mode register enough? | **No** — CP alone faulted at the source address's low 32 bits | all twelve, step 3a |
+| Are the internal RB/CCU and SP islands optional? | **No** — the CP hung mid-command without them | new step 3a2 |
+| Can XNU leave secure mode without a zap shader? | **No** — the write resets the phone | step 3c is read-only by default |
+| Is the GPMU needed? | **Not started at all** ("GPMU firmware left out") | consistent with step 5 being optional |
+| Can SMMU registers be written with a plain store? | **No** — a trapped `str wzr` stalled the CPU | `wr()` already takes the value in a register |
+| Does the graphics rail need RPMh? | **No** — the port drives the S2 regulator over SPMI directly | it is a missing driver, not a limit (§7) |
+
+**What the port could not answer**, because MSM8996's blocks are laid out differently: the GPUCC clock
+tree (§8.2), the specific a540 register values (§8.6), and anything about the GPMU's firmware (§8.3).
+Those still rest on this phone's own device tree and the vendor's a540 code.
+
+Its remaining GPU work — the zap shader (`0130`), the user client (`0138`), buffer submission (`0150`)
+and the blit/quad paths — is the natural next reference for chiron's steps 7 and 8, and is closer to
+this problem than the vendor's Linux driver, because it faces the same constraints: XNU, no GMU, a5xx.
+
+---
+
+## 11. A note on evidence
 
 The port's own history has two lessons that shaped this driver:
 

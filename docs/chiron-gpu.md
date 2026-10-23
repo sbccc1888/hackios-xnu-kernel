@@ -272,6 +272,25 @@ are put in `fw-gpu/`, and `userland/build.sh` puts them into the kernel's small 
 The microcode's version is printed before it is used: a file that is not what we think it is should say
 so before it goes into a micro engine.
 
+**Where the version is matters, and it is not the first dword.** The vendor copies the code and reads
+the version from the same offset (`adreno_a5xx.c:2555,2557`):
+
+```c
+memcpy(ucode->hostptr, &fw->data[4], fw->size - 4);
+*ucode_version = *(unsigned int *)&fw->data[4];
+```
+
+so one dword is skipped and the version is the first dword *of the code*. The files show it:
+
+```
+a530_pm4.fw    dword[0] = 0x00000000    dword[1] = 0x005ff063   <- the version
+a530_pfp.fw    dword[0] = 0x00000000    dword[1] = 0x005ff08a
+```
+
+Reading `dword[0]` gives 0 for both — and then the version check, the one thing that exists to keep a
+wrong image out of a processor this kernel cannot reset, compares 0 against 0 and passes. An earlier
+version of this driver did exactly that; it is the fourth entry in §9.
+
 The GPMU's refusal rule matches the vendor's (`adreno_a5xx.c:1265-1273`: refuse a major mismatch, warn
 on a minor one) — loading a wrong-major image into a processor nothing here can reset again would be
 the one mistake that cannot be undone from this kernel.
@@ -369,19 +388,24 @@ available here.
 
 ---
 
-## 9. Three defects worth remembering
+## 9. Four defects worth remembering
 
-All three were found **without a phone**, by reading Qualcomm's code against this one. All three would
-have looked like hardware failure.
+All four were found **without a phone**, by reading Qualcomm's code against this one. All four would
+have looked like hardware failure, or worse, like success.
 
 | # | Defect | What it would have looked like | How it was found |
 |---|---|---|---|
 | 1 | PM4 parity computed over the low 7 bits instead of the whole word | the CP silently **drops the packet** → "the engine does not run" | compared against `pm4_calc_odd_parity_bit`, then compiled both and ran them over 12 values: the short form was wrong on 2, including `0x8000` = `CP_RB_BASE` |
 | 2 | every GPU-block offset read as **bytes** instead of dword indices | writes go 4 registers left — still inside the block, so **nothing faults**; the driver reports "the GPU did not start" with every number in the log looking reasonable | followed `micro_mmu_ctrl >> 2` while starting the SMMU step, found `offsetwords << 2` in `adreno_regwrite` |
 | 3 | `S2CR_TYPE` assumed `FAULT = 0` | the one state this driver can survive (`BYPASS = 1`) reported as its opposite, sending the reader to the wrong subsystem | `arm-smmu.c:174-176` gives `TRANS = 0`, `BYPASS = 1`, `FAULT = 2` |
+| 4 | microcode **version read from `data[0]`** instead of `data[4]` | it prints `version 0x00000000` for a good file and loads it anyway — the check that exists to keep a wrong image out of a processor with no reset **compares 0 against 0 and passes** | re-read `adreno_a5xx.c:2555,2557` during a self-audit; the real files show `dword[0]=0`, `dword[1]=0x005ff063` |
 
 **The pattern**: each mistake was self-consistent, compiled cleanly, and produced plausible output. None
 crashed. The only thing that caught them was **comparison against the vendor's source, line by line**.
+
+Defect 4 is the worst of the four for a specific reason: defects 1–3 all produced a *failure* that
+looked wrong, whereas defect 4 produced a *pass* that looked right. A check that cannot fail is worse
+than no check, because it is counted as one.
 
 Two working rules came out of it, and they are worth keeping:
 

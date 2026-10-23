@@ -191,14 +191,31 @@ jobs:
           echo "meson: $(command -v meson || echo MISSING) $(meson --version 2>/dev/null)"
           echo "ninja: $(command -v ninja || echo MISSING) $(ninja --version 2>/dev/null)"
           command -v meson >/dev/null || { echo 'meson is still not on PATH'; exit 1; }
+          # meson wants to know the archiver by name, and `llvm-ar` is not what
+          # the runner installs: its LLVM tools are versioned (llvm-ar-18). Resolve
+          # each to an absolute path, which meson always accepts, and stop with the
+          # names it looked for rather than "Unknown linker(s)".
+          find_llvm() {
+            for c in "$@"; do
+              p=$(command -v "$c" 2>/dev/null) && { echo "$p"; return 0; }
+            done
+            return 1
+          }
+          LLVM_AR=$(find_llvm llvm-ar llvm-ar-18 llvm-ar-17 llvm-ar-19)     || { echo 'no llvm-ar; looked for llvm-ar(-18/-17/-19)'; exit 1; }
+          LLVM_RANLIB=$(find_llvm llvm-ranlib llvm-ranlib-18 llvm-ranlib-17 llvm-ranlib-19) || { echo 'no llvm-ranlib'; exit 1; }
+          LLVM_STRIP=$(find_llvm llvm-strip llvm-strip-18 llvm-strip-17 llvm-strip-19)  || { echo 'no llvm-strip'; exit 1; }
+          echo "ar:     $LLVM_AR"
+          echo "ranlib: $LLVM_RANLIB"
+          echo "strip:  $LLVM_STRIP"
+
           cat > cross.ini <<INI
           [binaries]
           c = ['$PWD/xnu-deps/host/bin/xnu-clang', '-arch', 'arm64', '-isysroot', '$THEOS/sdks/iPhoneOS16.5.sdk']
           cpp = ['$PWD/xnu-deps/host/bin/xnu-clang++', '-arch', 'arm64', '-isysroot', '$THEOS/sdks/iPhoneOS16.5.sdk', '-fuse-cxa-atexit']
           objc = ['$PWD/xnu-deps/host/bin/xnu-clang', '-arch', 'arm64', '-isysroot', '$THEOS/sdks/iPhoneOS16.5.sdk']
-          ar = 'llvm-ar'
-          ranlib = 'llvm-ranlib'
-          strip = 'llvm-strip'
+          ar = '$LLVM_AR'
+          ranlib = '$LLVM_RANLIB'
+          strip = '$LLVM_STRIP'
           pkg-config = 'false'
 
           [host_machine]

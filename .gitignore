@@ -120,3 +120,12 @@ __pycache__/
 !/tools/mesa/air/air_to_nir.c
 !/tools/mesa/air/meson.build
 !/tools/mesa/air/nir_air.h
+!/xnu-deps/build/mesa/
+/xnu-deps/build/mesa/*
+!/xnu-deps/build/mesa/out/
+/xnu-deps/build/mesa/out/*
+!/xnu-deps/build/mesa/out/libOSMesa.8.dylib
+!/xnu-deps/build/mesa/out/libredwoodair.dylib
+!/xnu-deps/build/mesa/out/exported-gl.txt
+!/xnu-deps/build/mesa/out/built-from
+!/xnu-deps/build/mesa/out/built-from-air

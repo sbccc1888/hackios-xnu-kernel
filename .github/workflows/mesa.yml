@@ -164,9 +164,17 @@ jobs:
 
       - name: Configure
         run: |
+          # meson comes from pip: there is no apt package by that name, which is
+          # why the first Configure failed with "meson: command not found" after
+          # everything before it had worked.
           python3 -m venv venv
-          ./venv/bin/pip -q install mako pyyaml packaging
+          ./venv/bin/pip -q install --upgrade pip
+          ./venv/bin/pip -q install meson ninja mako pyyaml packaging
           export PATH="$PWD/venv/bin:$PATH"
+          hash -r
+          echo "meson: $(command -v meson || echo MISSING) $(meson --version 2>/dev/null)"
+          echo "ninja: $(command -v ninja || echo MISSING) $(ninja --version 2>/dev/null)"
+          command -v meson >/dev/null || { echo 'meson is still not on PATH'; exit 1; }
           cat > cross.ini <<INI
           [binaries]
           c = ['$PWD/xnu-deps/host/bin/xnu-clang', '-arch', 'arm64', '-isysroot', '$THEOS/sdks/iPhoneOS16.5.sdk']
@@ -201,6 +209,7 @@ jobs:
       - name: Build the GL library
         run: |
           export PATH="$PWD/venv/bin:$PATH"
+          hash -r
           set +e
           ninja -C build > ninja.log 2>&1
           rc=$?
@@ -218,6 +227,7 @@ jobs:
       - name: Build the compute library
         run: |
           export PATH="$PWD/venv/bin:$PATH"
+          hash -r
           set +e
           ninja -C build src/gallium/drivers/freedreno/libredwoodair.dylib > air.log 2>&1
           rc=$?

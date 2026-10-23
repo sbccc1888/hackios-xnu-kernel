@@ -143,32 +143,68 @@ if (src_w == 0 || src_w > 16384 || src_pitch % 64 || src_pitch < src_w * 4 ||
 #define GPU_PAS_ID  13
 ```
 - 用 **`a530_zap`**（不是 a540 —— 但 chiron 是 a540，要用 `a540_zap`）
-- 用手机的 **`gpu_mem` carveout**（1 MB，在 iOS DRAM 之外）—— 这就是我一直缺的"地址从哪来"
+- 用手机的 **`gpu_mem` carveout**（1 MB，在 iOS DRAM 之外）
 - **流程**：TZ PAS 13 加载 → ring 命令退 secure
 
-### ⚠️ 但 chiron 没有这个 carveout —— 我核实过
+### chiron 的 zap 地址：查清了两件事，结论和最初的猜测不同
+
+**第一件：chiron 没有 `gpu_mem` carveout。**
 
 ```
-$ grep gpu_mem /root/chiron.dts                    → 无
-$ dtc -I dtb -O dts Android-chiron.dtb | grep gpu_mem → 无（只有 qcom,gpu-mempools，那是别的东西）
-$ grep gpu_mem .../msm8996*.dtsi                    → 无（本机没有 8996 树可比）
+$ grep gpu_mem /root/chiron.dts                       → 无
+$ dtc -I dtb -O dts Android-chiron.dtb | grep gpu_mem  → 无（qcom,gpu-mempools 是内存池，不是 carveout）
 ```
 
-**结论：MSM8996 的 `gpu_mem` 不是所有 a5xx 平台共有的。** chiron 的 vendor DT 里没有它。
+**所以 MSM8996 的 `gpu_mem` 不是 a5xx 通用的**，chiron 上不存在。
 
-厂商 kernel 在 8998 上用另一种办法（`kgsl_iommu.h:34-37`）：
+**第二件：8998 的 secure 区是 GPU 全局地址空间顶端 256 MB**（`kgsl_iommu.h:34-37`），
+而 a540 有 `ADRENO_64BIT`（`adreno-gpulist.h:247-249` 的 features 里有），所以用 64 位基址：
+
+```
+KGSL_IOMMU_GLOBAL_MEM_BASE64 = 0xfc000000
+KGSL_IOMMU_SECURE_SIZE       = 0x10000000   (256 MiB)
+KGSL_IOMMU_SECURE_BASE       = 0xec000000
+```
+
+**第三件（关键，推翻了我一度想改的方案）：`0xec000000` 是 GPU 虚拟地址，不能给 TrustZone 用。**
+
+`kgsl_iommu.c:249-253`：
+```c
+void kgsl_add_global_secure_entry(struct kgsl_device *device, struct kgsl_memdesc *memdesc)
+{
+	memdesc->gpuaddr = KGSL_IOMMU_SECURE_BASE(&device->mmu);   /* ← GPU 地址空间里的位置 */
+	kgsl_global_secure_pt_entry = memdesc;                      /* ← 物理页由 memdesc 自己带着 */
+}
+```
+
+而 `PAS_MEM_SETUP` 收到的参数，厂商写得很清楚（`subsys-pil-tz.c:648-675`）：
 
 ```c
-#define KGSL_IOMMU_SECURE_SIZE  SZ_256M
-#define KGSL_IOMMU_SECURE_BASE(_mmu)  (KGSL_IOMMU_GLOBAL_MEM_BASE(_mmu) - KGSL_IOMMU_SECURE_SIZE)
+static int pil_mem_setup_trusted(struct pil_desc *pil, phys_addr_t addr, size_t size)
+...
+	desc.args[0] = d->pas_id;
+	desc.args[1] = addr;          /* phys_addr_t —— 物理地址 */
+	desc.args[2] = size;
+	desc.arginfo = SCM_ARGS(3);
+	scm_call2(SCM_SIP_FNID(SCM_SVC_PIL, PAS_MEM_SETUP_CMD), &desc);
 ```
 
-—— 即 secure 区**从 GPU 全局地址空间的顶端往下 256 MB**，不是设备树里的固定 carveout。
+**TrustZone 只要「物理地址 + 长度」，它不知道也不关心 GPU 的虚拟地址空间。**
+`0xec000000` 是给 *GPU 硬件* 看的映射位置，物理页是另外分配并映射上去的。
 
-**所以 `chiron_zap_mem` 的设计需要重新想：** 不是"从设备树读一个地址"，而是要么
-(a) 从这块 256 MB secure 窗口里取，要么 (b) 让 loader 真的预留一段物理内存。
-(a) 更接近厂商做法，但需要先知道 `KGSL_IOMMU_GLOBAL_MEM_BASE` 在 chiron 上是什么。
-**这是 M7 之前必须查清的一件事，不能猜。**
+### 对 chiron 的结论
+
+**`chiron_zap_mem=<物理地址>` 的设计是对的，不需要改成从 secure 窗口取。**
+我一度在文档里写"应该从 256 MB secure 窗口取"——**那是错的**，因为那个窗口是 GPU VA。
+
+真正需要的是：**一段 chiron 上真实可用、且没有被别的东西占用的物理内存**，长度 1 MB
+（`KGSL_IOMMU_SECURE_SIZE` 的上限足够，实际 zap 镜像远小于 1 MB）。
+这仍然只能由 loader 提供，或者由内核用 `kmem_alloc` + `kvtophys` 自己给——
+后者其实更简单，且不需要 boot-arg。**这是 M7 时应该优先试的路子。**
+
+顺带确认：我的 PAS 调用编码与厂商一致——
+`args[0]=pas_id, args[1]=addr, args[2]=size, arginfo=SCM_ARGS(3)`，
+我的 `SCM_THREE_VALUES` + `(PAS_GPU, zap_memory, 0x1000)` 正是这个形状。
 
 ---
 

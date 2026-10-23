@@ -216,7 +216,10 @@ jobs:
           ar = '$LLVM_AR'
           ranlib = '$LLVM_RANLIB'
           strip = '$LLVM_STRIP'
-          pkg-config = 'false'
+          # A real pkg-config: this said 'false', so meson ran /usr/bin/false for
+          # every lookup, warned "failed when ran", and gave up on libclc -- which
+          # is installed and does ship a .pc file.
+          pkg-config = '/usr/bin/pkg-config'
 
           [host_machine]
           system = 'darwin'
@@ -228,6 +231,16 @@ jobs:
           [properties]
           needs_exe_wrapper = true
           INI
+          # libclc ships its .pc under the llvm version directory, which pkg-config
+          # does not search by default.
+          for d in /usr/lib/llvm-18/lib/pkgconfig /usr/lib/x86_64-linux-gnu/pkgconfig /usr/share/pkgconfig; do
+            [ -d "$d" ] && export PKG_CONFIG_PATH="$d:${PKG_CONFIG_PATH:-}"
+          done
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+          echo "--- can it see libclc? ---"
+          pkg-config --exists libclc && echo "  libclc: $(pkg-config --modversion libclc)" \
+            || { echo '  libclc not visible to pkg-config'; pkg-config --list-all 2>/dev/null | grep -i clc || true; }
+
           DRIVERS=softpipe,freedreno
           meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
             --prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \

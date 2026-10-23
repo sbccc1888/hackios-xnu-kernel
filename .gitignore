@@ -10,6 +10,7 @@
 !/.github/workflows/
 /.github/workflows/*
 !/.github/workflows/build.yml
+!/.github/workflows/mesa.yml
 !/common/
 !/docs/
 !/xl

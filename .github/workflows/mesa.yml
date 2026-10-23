@@ -1,0 +1,262 @@
+name: mesa
+
+# Builds the mesa libraries HackiOS draws with, on a stock Ubuntu runner.
+#
+# Why CI: the build needs theos cctools, an iOS 16.5 SDK, and a mesa tree long
+# enough to hold every object -- about 3 GB. The machine this was written on had
+# 3.5 GB free, which is not enough, and a runner has the SDK one clone away.
+#
+# What comes out:
+#   libOSMesa.8.dylib      the GL ES implementation the window server draws
+#                          through; userland/src/eagl.c stands in front of it and
+#                          looks its entry points up by name.
+#   libredwoodair.dylib    AIR (Metal IR) -> NIR -> ir3, the compute path: it is
+#                          what lets a Metal shader be compiled for the Adreno.
+#
+# Every number comes from this repository -- the version and checksum in
+# tools/mk-mesa.sh, the patches in tools/mesa/, the AIR frontend in tools/mesa/air/.
+# Nothing is fetched from Apple except the SDK, which is public.
+
+on:
+  push:
+    branches: [main, chiron, 'chiron-*']
+    paths:
+      - 'tools/mesa/**'
+      - 'tools/mk-mesa.sh'
+      - '.github/workflows/mesa.yml'
+  pull_request:
+    paths:
+      - 'tools/mesa/**'
+      - 'tools/mk-mesa.sh'
+      - '.github/workflows/mesa.yml'
+  workflow_dispatch:
+    inputs:
+      air:
+        description: 'also build libredwoodair.dylib (the compute path)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: mesa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  THEOS: ${{ github.workspace }}/theos
+  SDK_REPO: https://github.com/theos/sdks.git
+  TOOLCHAIN_URL: https://github.com/L1ghtmann/llvm-project/releases/latest/download/iOSToolchain-x86_64.tar.xz
+
+jobs:
+  mesa:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential git curl tar xz-utils \
+            python3 python3-venv ninja-build pkg-config
+
+      - name: theos + the iOS 16.5 SDK + cctools
+        run: |
+          # The SDK and the Linux cctools are what make a Mach-O arm64 target
+          # possible; stock gcc cannot produce one.
+          git clone -q --depth 1 "$SDK_REPO" /tmp/sdks
+          mkdir -p "$THEOS/sdks"
+          cp -r /tmp/sdks/iPhoneOS16.5.sdk "$THEOS/sdks/"
+          echo "  SDK: $(du -sh "$THEOS/sdks/iPhoneOS16.5.sdk" | cut -f1)"
+
+          mkdir -p "$THEOS/toolchain"
+          curl -sSL --fail --retry 3 "$TOOLCHAIN_URL" | tar -xJ -C "$THEOS/toolchain"
+
+      - name: The XNU compiler wrapper
+        run: |
+          # mk-mesa.sh compiles with xnu-deps/host/bin/xnu-clang: a wrapper that
+          # forces -target arm64-apple-ios and links with cctools ld64. setup.sh
+          # generates it as part of building the kernel, which is not what this
+          # job does, so recreate just this piece -- and prove it produces a
+          # Mach-O object before going further.
+          mkdir -p xnu-deps/host/bin xnu-deps/hostinc
+          cat > xnu-deps/host/bin/xnu-clang <<'WRAP'
+          #!/bin/bash
+          HB="$(cd "$(dirname "$0")" && pwd)"
+          case "$(basename "$0")" in *++) drv=clang++; extra=(-fno-use-cxa-atexit);; *) drv=clang; extra=();; esac
+          args=()
+          for a in "$@"; do
+            case "$a" in
+              -enable-trivial-auto-var-init-zero-knowing-it-will-be-removed-from-clang) ;;
+              -fapple-kext-vtable-verify|-Wno-vla-cxx-extension) ;;
+              -Werror|-Werror=*|-Weverything|-pedantic-errors) ;;
+              *) args+=("$a");;
+            esac
+          done
+          exec clang -include "$HB/../../hostinc/xnu_clang_compat.h" \
+            -target arm64-apple-ios${XNU_SDK_VERSION:-16.5} --ld-path="$HB/ld64" \
+            -w "${extra[@]}" "${args[@]}"
+          WRAP
+          chmod +x xnu-deps/host/bin/xnu-clang
+          ln -sf xnu-clang xnu-deps/host/bin/xnu-clang++
+          ln -sf "$THEOS/toolchain/linux/iphone/bin/ld64" xnu-deps/host/bin/ld64
+
+          cat > xnu-deps/hostinc/xnu_clang_compat.h <<'HDR'
+          #ifndef XNU_CLANG_COMPAT_H
+          #define XNU_CLANG_COMPAT_H
+          #endif
+          HDR
+
+          printf 'int main(void){return 0;}\n' > /tmp/t.c
+          XNU_SDK_VERSION=16.5 xnu-deps/host/bin/xnu-clang \
+            -arch arm64 -isysroot "$THEOS/sdks/iPhoneOS16.5.sdk" -c /tmp/t.c -o /tmp/t.o
+          file /tmp/t.o
+          file /tmp/t.o | grep -q 'Mach-O' || { echo 'the wrapper does not produce Mach-O'; exit 1; }
+
+      - name: Fetch and patch mesa
+        run: |
+          # Same version, same checksum, same patches as tools/mk-mesa.sh, so a
+          # build here is the build the kernel side expects.
+          VERSION=$(grep -m1 '^VERSION=' tools/mk-mesa.sh | cut -d= -f2)
+          SHA256=$(grep -m1 '^SHA256=' tools/mk-mesa.sh | cut -d= -f2)
+          echo "mesa $VERSION"
+          curl -sL --fail -o mesa.tar.xz "https://archive.mesa3d.org/mesa-$VERSION.tar.xz"
+          echo "$SHA256  mesa.tar.xz" | sha256sum -c --quiet
+          tar xJf mesa.tar.xz
+          for p in tools/mesa/*.patch; do
+            echo "  $(basename "$p")"
+            patch -s --no-backup-if-mismatch -d "mesa-$VERSION" -p1 < "$p"
+          done
+          rm -rf "mesa-$VERSION/src/redwood-drm" "mesa-$VERSION/src/compiler/air"
+          cp -r tools/mesa/redwood-drm "mesa-$VERSION/src/redwood-drm"
+          cp -r tools/mesa/air "mesa-$VERSION/src/compiler/air"
+          echo "  tree: $(du -sh mesa-$VERSION | cut -f1)"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          python3 -m venv venv
+          ./venv/bin/pip -q install mako pyyaml packaging
+          export PATH="$PWD/venv/bin:$PATH"
+          cat > cross.ini <<INI
+          [binaries]
+          c = ['$PWD/xnu-deps/host/bin/xnu-clang', '-arch', 'arm64', '-isysroot', '$THEOS/sdks/iPhoneOS16.5.sdk']
+          cpp = ['$PWD/xnu-deps/host/bin/xnu-clang++', '-arch', 'arm64', '-isysroot', '$THEOS/sdks/iPhoneOS16.5.sdk', '-fuse-cxa-atexit']
+          objc = ['$PWD/xnu-deps/host/bin/xnu-clang', '-arch', 'arm64', '-isysroot', '$THEOS/sdks/iPhoneOS16.5.sdk']
+          ar = 'llvm-ar'
+          ranlib = 'llvm-ranlib'
+          strip = 'llvm-strip'
+          pkg-config = 'false'
+
+          [host_machine]
+          system = 'darwin'
+          subsystem = 'ios'
+          cpu_family = 'aarch64'
+          cpu = 'arm64'
+          endian = 'little'
+
+          [properties]
+          needs_exe_wrapper = true
+          INI
+          DRIVERS=softpipe,freedreno
+          meson setup build mesa-$VERSION --cross-file cross.ini --wrap-mode=nofallback \
+            --prefix=/redwood --libdir=lib --buildtype=release -Db_ndebug=true \
+            -Dplatforms= -Dgallium-drivers="$DRIVERS" -Dfreedreno-kmds=msm -Dvulkan-drivers= \
+            -Dglx=disabled -Degl=disabled -Dgbm=disabled \
+            -Dosmesa=true -Dllvm=disabled -Dshared-glapi=enabled -Dgles1=disabled -Dgles2=enabled -Dopengl=true \
+            -Dzstd=disabled -Dxmlconfig=disabled -Dexpat=disabled -Dshader-cache=disabled -Dvalgrind=disabled \
+            -Dlibunwind=disabled -Dglvnd=disabled -Dvideo-codecs= -Dtools= -Dgallium-vdpau=disabled -Dgallium-va=disabled \
+            -Dgallium-xa=disabled -Dlmsensors=disabled -Dbuild-tests=false
+
+      - name: Build the GL library
+        run: |
+          export PATH="$PWD/venv/bin:$PATH"
+          set +e
+          ninja -C build > ninja.log 2>&1
+          rc=$?
+          set -e
+          echo "ninja exit: $rc"
+          if [ $rc -ne 0 ]; then
+            echo '--- errors ---'
+            grep -n -i 'error' ninja.log | head -50
+            echo '--- tail ---'
+            tail -40 ninja.log
+            exit $rc
+          fi
+          tail -5 ninja.log
+
+      - name: Build the compute library
+        run: |
+          export PATH="$PWD/venv/bin:$PATH"
+          set +e
+          ninja -C build src/gallium/drivers/freedreno/libredwoodair.dylib > air.log 2>&1
+          rc=$?
+          set -e
+          echo "libredwoodair exit: $rc"
+          if [ $rc -ne 0 ]; then
+            echo '--- errors ---'
+            grep -n -i 'error' air.log | head -40
+            tail -30 air.log
+          fi
+          # Not fatal: the GL library is the deliverable and is enough to draw.
+          # A report that says which of the two built is worth more than a job
+          # that fails and says nothing.
+          echo "AIR_RESULT=$rc" >> "$GITHUB_ENV"
+
+      - name: Package
+        run: |
+          mkdir -p out
+          OSMESA=$(find build -name 'libOSMesa*.dylib' | head -1)
+          llvm-strip -x -o out/libOSMesa.8.dylib "$OSMESA"
+          install_name_tool -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
+          nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
+          cp "mesa-$VERSION/src/mapi/glapi/registry/gl.xml" out/gl.xml
+          cat tools/mesa/*.patch tools/mesa/redwood-drm/* | sha256sum > out/built-from
+          echo "libOSMesa: $(stat -c %s out/libOSMesa.8.dylib) bytes, $(wc -l < out/exported-gl.txt) gl* functions"
+
+          if [ "${AIR_RESULT:-1}" = 0 ]; then
+            llvm-strip -x -o out/libredwoodair.dylib build/src/gallium/drivers/freedreno/libredwoodair.dylib
+            install_name_tool -id /redwood/lib/libredwoodair.dylib out/libredwoodair.dylib
+            cat tools/mesa/air/* | sha256sum > out/built-from-air
+            echo "libredwoodair: $(stat -c %s out/libredwoodair.dylib) bytes, $(nm -gU out/libredwoodair.dylib | grep -c ' _rwa_') rwa_* functions"
+          else
+            echo 'libredwoodair did not build; see the compute step in the log'
+          fi
+          ls -l out/
+
+      - name: The libraries must contain what the code looks up
+        run: |
+          # A library that links but exports no gl* functions is the failure worth
+          # catching: eagl.c finds the entry points by name, so a short list means
+          # the window server would find nothing to draw with.
+          n=$(wc -l < out/exported-gl.txt)
+          echo "gl* exports: $n"
+          [ "$n" -gt 100 ] || { echo 'too few GL entry points'; exit 1; }
+          grep -qx 'GetError' out/exported-gl.txt || { echo 'no glGetError in the exports'; exit 1; }
+          if [ -f out/libredwoodair.dylib ]; then
+            r=$(nm -gU out/libredwoodair.dylib | grep -c ' _rwa_')
+            echo "rwa_* in libredwoodair: $r"
+            [ "$r" -gt 0 ] || { echo 'no rwa_* symbols'; exit 1; }
+          fi
+          echo
+          echo "built from: $(cat out/built-from)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mesa-ios-libs
+          path: |
+            out/libOSMesa.8.dylib
+            out/libredwoodair.dylib
+            out/exported-gl.txt
+            out/gl.xml
+            out/built-from
+            out/built-from-air
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mesa-build-log
+          path: |
+            ninja.log
+            air.log
+            build/meson-logs/meson-log.txt
+          if-no-files-found: ignore

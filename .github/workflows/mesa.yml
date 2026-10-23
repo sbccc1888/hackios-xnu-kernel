@@ -115,15 +115,17 @@ jobs:
         run: |
           # Same version, same checksum, same patches as tools/mk-mesa.sh, so a
           # build here is the build the kernel side expects.
-          VERSION=$(grep -m1 '^VERSION=' tools/mk-mesa.sh | cut -d= -f2)
-          SHA256=$(grep -m1 '^SHA256=' tools/mk-mesa.sh | cut -d= -f2)
-          echo "mesa $VERSION"
+          VERSION=$(sed -n 's/^VERSION=//p' tools/mk-mesa.sh | head -1)
+          SHA256=$(sed -n 's/^SHA256=//p' tools/mk-mesa.sh | head -1)
+          echo "mesa VERSION='$VERSION'"
+          test -n "$VERSION" || { echo 'could not read VERSION from tools/mk-mesa.sh'; exit 1; }
+          test -n "$SHA256"  || { echo 'could not read SHA256 from tools/mk-mesa.sh'; exit 1; }
 
           # archive.mesa3d.org serves this file but does not answer a GitHub
           # runner (curl exit 22). The tarball is kept as a release asset in this
           # repository instead, which the job token can always read, with the
           # sha256 below as the thing that actually decides whether it is right.
-          URL="https://github.com/${{ github.repository }}/releases/download/mesa-sources/mesa-$VERSION.tar.xz"
+          URL="https://github.com/${{ github.repository }}/releases/download/mesa-sources/mesa-${VERSION}.tar.xz"
           echo "  from: $URL"
           if ! curl -sSL --fail --retry 3 -o mesa.tar.xz "$URL"; then
             echo "could not download $URL"

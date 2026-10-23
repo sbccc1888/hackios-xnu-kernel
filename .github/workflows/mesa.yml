@@ -57,7 +57,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential git curl tar xz-utils \
             python3 python3-venv ninja-build pkg-config \
-            llvm-18
+            llvm-18 llvm-18-tools
 
       - name: theos + the iOS 16.5 SDK + cctools
         run: |
@@ -339,20 +339,29 @@ jobs:
 
       - name: Package
         run: |
+          # The LLVM binutils are versioned on this image; resolve them once and use
+          # the paths, which is what "llvm-strip: command not found" was about.
+          resolve() { for c in "$@"; do command -v "$c" >/dev/null 2>&1 && { command -v "$c"; return 0; }; done; return 1; }
+          STRIP=$(resolve llvm-strip llvm-strip-18 llvm-strip-17) || { echo 'no llvm-strip'; exit 1; }
+          NM=$(resolve llvm-nm llvm-nm-18 llvm-nm-17)             || { echo 'no llvm-nm'; exit 1; }
+          INSTALL_NAME=$(resolve llvm-install-name-tool install_name_tool llvm-install-name-tool-18) || { echo 'no install-name-tool'; exit 1; }
+          echo "strip: $STRIP"; echo "nm: $NM"; echo "install-name-tool: $INSTALL_NAME"
+
           mkdir -p out
           OSMESA=$(find build -name 'libOSMesa*.dylib' | head -1)
-          llvm-strip -x -o out/libOSMesa.8.dylib "$OSMESA"
-          install_name_tool -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
-          nm -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
+          echo "built: $OSMESA ($(stat -c %s "$OSMESA") bytes)"
+          "$STRIP" -x -o out/libOSMesa.8.dylib "$OSMESA"
+          "$INSTALL_NAME" -id /redwood/lib/libOSMesa.8.dylib out/libOSMesa.8.dylib
+          "$NM" -gU out/libOSMesa.8.dylib | awk '$3 ~ /^_gl/ { print substr($3, 2) }' > out/exported-gl.txt
           cp "mesa-$VERSION/src/mapi/glapi/registry/gl.xml" out/gl.xml
           cat tools/mesa/*.patch tools/mesa/redwood-drm/* | sha256sum > out/built-from
           echo "libOSMesa: $(stat -c %s out/libOSMesa.8.dylib) bytes, $(wc -l < out/exported-gl.txt) gl* functions"
 
           if [ "${AIR_RESULT:-1}" = 0 ]; then
-            llvm-strip -x -o out/libredwoodair.dylib build/src/gallium/drivers/freedreno/libredwoodair.dylib
-            install_name_tool -id /redwood/lib/libredwoodair.dylib out/libredwoodair.dylib
+            "$STRIP" -x -o out/libredwoodair.dylib build/src/gallium/drivers/freedreno/libredwoodair.dylib
+            "$INSTALL_NAME" -id /redwood/lib/libredwoodair.dylib out/libredwoodair.dylib
             cat tools/mesa/air/* | sha256sum > out/built-from-air
-            echo "libredwoodair: $(stat -c %s out/libredwoodair.dylib) bytes, $(nm -gU out/libredwoodair.dylib | grep -c ' _rwa_') rwa_* functions"
+            echo "libredwoodair: $(stat -c %s out/libredwoodair.dylib) bytes, $("$NM" -gU out/libredwoodair.dylib | grep -c ' _rwa_') rwa_* functions"
           else
             echo 'libredwoodair did not build; see the compute step in the log'
           fi
@@ -385,12 +394,14 @@ jobs:
           # A library that links but exports no gl* functions is the failure worth
           # catching: eagl.c finds the entry points by name, so a short list means
           # the window server would find nothing to draw with.
+          resolve() { for c in "$@"; do command -v "$c" >/dev/null 2>&1 && { command -v "$c"; return 0; }; done; return 1; }
+          NM=$(resolve llvm-nm llvm-nm-18) || echo nm
           n=$(wc -l < out/exported-gl.txt)
           echo "gl* exports: $n"
           [ "$n" -gt 100 ] || { echo 'too few GL entry points'; exit 1; }
           grep -qx 'GetError' out/exported-gl.txt || { echo 'no glGetError in the exports'; exit 1; }
           if [ -f out/libredwoodair.dylib ]; then
-            r=$(nm -gU out/libredwoodair.dylib | grep -c ' _rwa_')
+            r=$("$NM" -gU out/libredwoodair.dylib | grep -c ' _rwa_')
             echo "rwa_* in libredwoodair: $r"
             [ "$r" -gt 0 ] || { echo 'no rwa_* symbols'; exit 1; }
           fi

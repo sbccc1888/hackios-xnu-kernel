@@ -116,9 +116,19 @@ jobs:
         run: |
           # Same version, same checksum, same patches as tools/mk-mesa.sh, so a
           # build here is the build the kernel side expects.
-          VERSION=$(sed -n 's/^VERSION=//p' tools/mk-mesa.sh | head -1)
-          SHA256=$(sed -n 's/^SHA256=//p' tools/mk-mesa.sh | head -1)
-          echo "mesa VERSION='$VERSION'"
+          # This step failed once printing nothing at all, which says the first
+          # command died rather than any check failing. Say where we are before
+          # every step, so the next failure names itself.
+          set -x
+          echo "pwd=$(pwd)"
+          echo "file: $(ls -l tools/mk-mesa.sh 2>&1)"
+          echo "first VERSION line: $(grep -n '^VERSION=' tools/mk-mesa.sh 2>&1 | head -1)"
+          set +e
+          VERSION=$(sed -n 's/^VERSION=//p' tools/mk-mesa.sh 2>&1 | head -1)
+          echo "VERSION rc=$? value=[$VERSION]"
+          SHA256=$(sed -n 's/^SHA256=//p' tools/mk-mesa.sh 2>&1 | head -1)
+          echo "SHA256 rc=$? len=${#SHA256}"
+          set -e
           test -n "$VERSION" || { echo 'could not read VERSION from tools/mk-mesa.sh'; exit 1; }
           test -n "$SHA256"  || { echo 'could not read SHA256 from tools/mk-mesa.sh'; exit 1; }
 
@@ -128,6 +138,7 @@ jobs:
           # sha256 below as the thing that actually decides whether it is right.
           URL="https://github.com/${{ github.repository }}/releases/download/mesa-sources/mesa-${VERSION}.tar.xz"
           echo "  from: $URL"
+          rm -f mesa.tar.xz
           if ! curl -sSL --fail --retry 3 -o mesa.tar.xz "$URL"; then
             echo "could not download $URL"
             echo "the release asset is named mesa-$VERSION.tar.xz on the tag mesa-sources"

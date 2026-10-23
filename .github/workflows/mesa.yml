@@ -98,7 +98,14 @@ jobs:
           WRAP
           chmod +x xnu-deps/host/bin/xnu-clang
           ln -sf xnu-clang xnu-deps/host/bin/xnu-clang++
-          ln -sf "$THEOS/toolchain/linux/iphone/bin/ld64" xnu-deps/host/bin/ld64
+          # xnu-deps/setup.sh:123 does `link "$CCTOOLS/ld" host/bin/ld64`: the file
+          # in cctools is named `ld`, and `ld64` is the name it is given here.
+          # Pointing --ld-path at .../bin/ld64 in the toolchain was a dangling path,
+          # which clang rejects with "invalid linker name".
+          CCTOOLS="$THEOS/toolchain/linux/iphone/bin"
+          test -x "$CCTOOLS/ld" || { echo "no linker at $CCTOOLS/ld"; ls -l "$CCTOOLS" | head; exit 1; }
+          ln -sf "$CCTOOLS/ld" xnu-deps/host/bin/ld64
+          echo "linker: $(readlink -f xnu-deps/host/bin/ld64) -> $($PWD/xnu-deps/host/bin/ld64 -v 2>&1 | head -1)"
 
           cat > xnu-deps/hostinc/xnu_clang_compat.h <<'HDR'
           #ifndef XNU_CLANG_COMPAT_H
@@ -111,6 +118,15 @@ jobs:
             -arch arm64 -isysroot "$THEOS/sdks/iPhoneOS16.5.sdk" -c /tmp/t.c -o /tmp/t.o
           file /tmp/t.o
           file /tmp/t.o | grep -q 'Mach-O' || { echo 'the wrapper does not produce Mach-O'; exit 1; }
+
+          # Compiling proves the frontend; meson also probes the *linker*, and that
+          # is what failed next. Link one too, so a broken ld64 says so here rather
+          # than inside meson's linker detection.
+          XNU_SDK_VERSION=16.5 xnu-deps/host/bin/xnu-clang \
+            -arch arm64 -isysroot "$THEOS/sdks/iPhoneOS16.5.sdk" /tmp/t.c -o /tmp/t.bin \
+            || { echo 'the wrapper cannot link'; exit 1; }
+          file /tmp/t.bin | grep -q 'Mach-O' || { echo 'the linked output is not Mach-O'; exit 1; }
+          echo "linked: $(file -b /tmp/t.bin)"
 
       - name: Fetch and patch mesa
         run: |

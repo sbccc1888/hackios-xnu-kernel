@@ -944,6 +944,55 @@ step_counter_after_power(void)
 #define TPL1_MODE_CNTL              0xf02
 #define RBBM_SW_RESET_CMD           0x43
 
+/*
+ * 64-BIT ADDRESS MODE. a540 is a 64-bit GPU, and whether a block treats an address in its
+ * registers as 32 or 64 bits wide is a register per block. Until those are set to 1, the
+ * addresses this driver writes from kvtophys() into CP_PM4_INSTR_BASE_HI, CP_RB_BASE_HI and the
+ * rest have their high halves ignored -- the same class of failure as the dword-versus-byte
+ * defect: nothing faults, and every number in the log looks reasonable.
+ *
+ * The vendor sets them in _adreno_start BEFORE a5xx_start runs (adreno.c:1373 ->
+ * gpudev->enable_64bit(), which is a5xx_enable_64bit at adreno_a5xx.c:1751-1767). So this is a
+ * precondition of step 3, not an optional setting, and it goes at the top of it.
+ *
+ * The twelve registers and the value (1 = 64-bit), in the vendor's own order:
+ *
+ *   adreno_a5xx.c:1756  A5XX_CP_ADDR_MODE_CNTL              0x860   a5xx_reg.h:104
+ *                :1757  A5XX_VSC_ADDR_MODE_CNTL             0xBC1   :128
+ *                :1758  A5XX_GRAS_ADDR_MODE_CNTL            0xC81   :542
+ *                :1759  A5XX_RB_ADDR_MODE_CNTL              0xCC5   :565
+ *                :1760  A5XX_PC_ADDR_MODE_CNTL              0xD01   :600
+ *                :1761  A5XX_HLSQ_ADDR_MODE_CNTL            0xE05   :612
+ *                :1762  A5XX_VFD_ADDR_MODE_CNTL             0xE41   :625
+ *                :1763  A5XX_VPC_ADDR_MODE_CNTL             0xE61   :637
+ *                :1764  A5XX_UCHE_ADDR_MODE_CNTL            0xE80   :644
+ *                :1765  A5XX_SP_ADDR_MODE_CNTL              0xEC1   :674
+ *                :1766  A5XX_TPL1_ADDR_MODE_CNTL            0xF01   :695
+ *                :1767  A5XX_RBBM_SECVID_TSB_ADDR_MODE_CNTL 0xF810  :536
+ *
+ * (Dword indices like every offset from that header; `reg()` shifts them.)
+ */
+#define CP_ADDR_MODE_CNTL               0x860
+#define VSC_ADDR_MODE_CNTL              0xbc1
+#define GRAS_ADDR_MODE_CNTL             0xc81
+#define RB_ADDR_MODE_CNTL               0xcc5
+#define PC_ADDR_MODE_CNTL               0xd01
+#define HLSQ_ADDR_MODE_CNTL             0xe05
+#define VFD_ADDR_MODE_CNTL              0xe41
+#define VPC_ADDR_MODE_CNTL              0xe61
+#define UCHE_ADDR_MODE_CNTL             0xe80
+#define SP_ADDR_MODE_CNTL               0xec1
+#define TPL1_ADDR_MODE_CNTL             0xf01
+#define RBBM_SECVID_TSB_ADDR_MODE_CNTL  0xf810
+
+/* The secure-mode registers (a5xx_reg.h:530-536), dword indices as usual. */
+#define RBBM_SECVID_TRUST_CONFIG        0xf000
+#define RBBM_SECVID_TRUST_CNTL          0xf400
+#define RBBM_SECVID_TSB_TRUSTED_BASE_LO 0xf800
+#define RBBM_SECVID_TSB_TRUSTED_BASE_HI 0xf801
+#define RBBM_SECVID_TSB_TRUSTED_SIZE    0xf802
+#define RBBM_SECVID_TSB_CNTL            0xf803
+
 /* RBBM_STATUS bits (a5xx.xml.h:1263-1295). */
 #define RBBM_STATUS_CP_ME_BUSY          (1u << 1)
 #define RBBM_STATUS_CP_PFP_BUSY         (1u << 2)
@@ -1107,6 +1156,115 @@ step_microcode(void)
 		return false;
 	}
 	return true;
+}
+
+/*
+ * Put every block in 64-bit address mode, and read each one back.
+ *
+ * This runs first in step 3 because everything after it assumes its addresses are 64-bit: the
+ * microcode's instruction bases, the ring's base, the UCHE trap and GMEM ranges. The vendor sets
+ * it in _adreno_start before a5xx_start (adreno.c:1373), which is the same ordering.
+ *
+ * Each is read back and the value that came back is reported, not the one that was written: a
+ * block that ignores the write is a finding, and the raw value is the only way to see it.
+ */
+static void
+step_address_mode(void)
+{
+	static const struct {
+		const char *name;
+		uint32_t   offset;
+	} modes[] = {
+		{ "cp_addr_mode",     CP_ADDR_MODE_CNTL },
+		{ "vsc_addr_mode",    VSC_ADDR_MODE_CNTL },
+		{ "gras_addr_mode",   GRAS_ADDR_MODE_CNTL },
+		{ "rb_addr_mode",     RB_ADDR_MODE_CNTL },
+		{ "pc_addr_mode",     PC_ADDR_MODE_CNTL },
+		{ "hlsq_addr_mode",   HLSQ_ADDR_MODE_CNTL },
+		{ "vfd_addr_mode",    VFD_ADDR_MODE_CNTL },
+		{ "vpc_addr_mode",    VPC_ADDR_MODE_CNTL },
+		{ "uche_addr_mode",   UCHE_ADDR_MODE_CNTL },
+		{ "sp_addr_mode",     SP_ADDR_MODE_CNTL },
+		{ "tpl1_addr_mode",   TPL1_ADDR_MODE_CNTL },
+		{ "secvid_addr_mode", RBBM_SECVID_TSB_ADDR_MODE_CNTL },
+	};
+	unsigned set = 0, refused = 0;
+
+	announce("64-bit address mode: every block told its addresses are 64 bits wide");
+
+	for (unsigned i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) {
+		uint32_t back;
+
+		put(&kgsl, modes[i].name, modes[i].offset, 0x1);
+		back = reg(modes[i].offset);
+		if (back == 0x1) {
+			set++;
+		} else {
+			say("chiron-adreno: %u: %s read back %#010x, not 1: that block did not take it\n",
+			    step, modes[i].name, back);
+			refused++;
+		}
+	}
+
+	say("chiron-adreno: %u: 64-bit address mode: %u of %u registers set%s\n", step, set,
+	    (unsigned)(sizeof(modes) / sizeof(modes[0])),
+	    refused ? " -- THE OTHERS DID NOT TAKE IT, so their addresses are still 32-bit" : "");
+	if (refused == 0) {
+		say("chiron-adreno: %u:   CP_PM4_INSTR_BASE_HI, CP_RB_BASE_HI and the GMEM ranges mean what\n"
+		    "chiron-adreno: %u:   they say from here; before this they would not have\n", step, step);
+	}
+}
+
+/*
+ * Ask the GPU to leave secure mode, and report what the register says afterwards.
+ *
+ * A GPU comes up in secure mode: the 3D core will not do ordinary work until it is told that this
+ * kernel may leave it. The vendor has two paths (adreno_a5xx.c:2457-2477):
+ *
+ *   if the GPU has CONTENT_PROTECTION -- a540 does -- it switches through the CP, which needs the
+ *   zap shader, i.e. step 7; otherwise it simply writes RBBM_SECVID_TRUST_CNTL = 0.
+ *
+ * This tries the second, because step 7 needs firmware that is not available here. What makes it
+ * worth doing rather than skipping is that the answer is falsifiable: write 0, read back, compare.
+ * Reading 0 back means TrustZone let the write through. Reading anything else -- most likely the
+ * value it already had -- means the write was refused, and the 3D core stays in secure mode until
+ * a zap shader is loaded.
+ *
+ * WRITTEN AS AN ATTEMPT, NOT A SUCCESS: on a device with content protection the vendor would not
+ * use this path at all, so whether it works here is not something this driver can know. It says
+ * what the register did and claims nothing beyond that.
+ */
+static bool
+step_unsecure(void)
+{
+	uint32_t before, after;
+
+	announce("asking the GPU to leave secure mode (RBBM_SECVID_TRUST_CNTL = 0), and reading it back");
+
+	before = get(&kgsl, "secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL);
+	if (before == 0xffffffffu) {
+		say("chiron-adreno: %u: it reads all ones, which is also what a refused access looks like:\n"
+		    "chiron-adreno: %u:   the write below is what tells the two apart\n", step, step);
+	}
+
+	put(&kgsl, "secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL, 0x0);
+	after = get(&kgsl, "secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL);
+
+	if (after == 0x0) {
+		say("chiron-adreno: %u: unsecured mode: asked, and the register reads 0 -- the write was taken.\n"
+		    "chiron-adreno: %u:   This is NOT the path the vendor takes on a device with content protection\n"
+		    "chiron-adreno: %u:   (it switches through the CP with the zap shader instead), so treat it as\n"
+		    "chiron-adreno: %u:   evidence that the register is writable, and nothing more.\n", step, step, step, step);
+		return true;
+	}
+
+	say("chiron-adreno: %u: unsecured mode: asked, and it reads %#010x (was %#010x) -- the write was NOT\n"
+	    "chiron-adreno: %u:   taken. TrustZone refused it, which is what a device with content protection\n"
+	    "chiron-adreno: %u:   is expected to do: the 3D core stays in secure mode and will refuse ordinary\n"
+	    "chiron-adreno: %u:   work until a zap shader is loaded -- step 7, which needs a540_zap.mdt from\n"
+	    "chiron-adreno: %u:   the phone.\n",
+	    step, after, before, step, step, step, step);
+	return false;
 }
 
 /*
@@ -2294,11 +2452,17 @@ chiron_adreno_init(void)
 			break;
 		case 3:
 			/*
-			 * RBBM is set either way; only the micro engine needs microcode. A step that
-			 * cannot start the engine still reports what RBBM holds, because that is most of
-			 * what can be verified without one -- so "no microcode" is not a failure of the
-			 * step, it is a smaller step.
+			 * The order is the vendor's, and it matters:
+			 *   address mode first -- everything below writes 64-bit addresses;
+			 *   then the microcode and RBBM (either way: a step that cannot start the engine
+			 *   still reports what RBBM holds, which is most of what can be verified without
+			 *   one, so "no microcode" is a smaller step rather than a failure);
+			 *   then the micro engine;
+			 *   and only then the attempt to leave secure mode, because the vendor's own path
+			 *   needs a running CP -- and a refused register write is easier to read once the
+			 *   CP is known good.
 			 */
+			step_address_mode();
 			ok = step_microcode();
 			step_rbbm();
 			if (ok) {
@@ -2306,6 +2470,13 @@ chiron_adreno_init(void)
 			} else {
 				say("chiron-adreno: %u: RBBM was set and read back; the micro engine was not started\n", step);
 			}
+			/*
+			 * The secure-mode attempt does not decide whether step 3 passed. It can legitimately
+			 * be refused on a device that has a zap shader coming, and step 3's own claim -- the
+			 * engine started and did not fault -- stands either way. It is attempted, its answer
+			 * is reported raw, and step 7 is where it gets settled properly.
+			 */
+			step_unsecure();
 			/*
 			 * Remembered for step 4: what it needs is not "step 3 passed" but "the engine is
 			 * running", which is a narrower thing and the one it should act on.

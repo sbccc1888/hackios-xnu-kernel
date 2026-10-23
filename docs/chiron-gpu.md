@@ -56,11 +56,28 @@ minute later and without a word (`redwood_adreno.c`, the note at the top).
 | 0 | prints one line with a compile-time stamp | the file is in the kernel at all | no (it either prints or it does not) |
 | 1 | enables `gcc_gpu_cfg_ahb_clk`; reads 15 GPUCC registers twice | **may this kernel reach the GPU's registers?** | yes — stops if all 15 read `0xffffffff` |
 | 2 | CX then GX power switches on; 3D clock source root enabled | power and clocks really came up | yes — GDSC `bit31` never sets |
-| 3 | ~40 RBBM registers as a540 wants; CP microcode loaded; `ME_HALT` cleared | micro engine out of halt without faulting | yes — `CP_HW_FAULT` ≠ 0 |
+| **3a** | **12 `*_ADDR_MODE_CNTL` registers set to 1, each read back** | **the high halves of every GPU address mean something** | yes — a register that does not read back 1 |
+| 3b | ~40 RBBM registers as a540 wants; CP microcode loaded; `ME_HALT` cleared | micro engine out of halt without faulting | yes — `CP_HW_FAULT` ≠ 0 |
+| 3c | `RBBM_SECVID_TRUST_CNTL = 0`, read back | whether TrustZone lets this kernel leave secure mode | reported, not judged — see below |
 | 4 | ring buffer, `CP_ME_INIT`, then a `CP_INTERRUPT` | **the CP fetches and executes what it is given** | yes — RPTR never reaches WPTR |
 | 5 | `a540_gpmu.fw2` → PM4 → its instruction RAM; handshake | the GPMU's firmware started | yes — no `0xBABEFACE` |
 | 6 | reads the SMMU (identity, `sCR0`, stream 0's `SMR`/`S2CR`) | **what steps 3–5 are assuming about addresses** | read-only; always reports |
 | 7 | zap shader through TrustZone | the 3D core may leave secure mode | yes — and **unverified**, see §6 |
+
+**3a comes first in step 3, and that ordering is the vendor's.** `a5xx_enable_64bit`
+(`adreno_a5xx.c:1751-1767`) is called from `_adreno_start` at `adreno.c:1373`, *before* `a5xx_start`
+runs. It is a precondition, not a setting: until those twelve registers say 64-bit, the high halves of
+the addresses this driver writes into `CP_PM4_INSTR_BASE_HI`, `CP_RB_BASE_HI` and the GMEM ranges are
+not what the driver meant. Nothing faults — the same silent class as the defects in §9.
+
+**3c is an attempt, not a success.** On a device with content protection — which a540 has — the vendor
+does not use this path at all; it switches through the CP with the zap shader (step 7). So the driver
+writes 0, reads back, and reports which happened:
+- reads 0 back → the write was taken: evidence that the register is writable, and nothing more;
+- reads anything else → **refused**, and the 3D core stays in secure mode until a zap shader is loaded.
+
+That comparison is the falsifiable judgement; the log names which of the two it saw rather than
+claiming success.
 
 All of it is gated on `chiron_gpu=1`. Without the boot-arg the driver says it is present and does
 nothing.
@@ -201,7 +218,10 @@ because it can explain those failures outright.
 | **step 2**, CX GDSC `bit31` never sets | the CX rail has no voltage — Linux raises it through RPMh and XNU has no RPMh client (§7) | nothing in this kernel can fix it; the boot loader's rail level is all there is |
 | **step 2**, GDSCs say `POWER ON` but the counter never moves | switches obeyed, block still silent — **almost always the rail** | same as above |
 | **step 2**, counter moves, ratio **below** 1000 | the crystal is not reaching the block at full rate (loop overhead only ever makes the ratio *higher*, so a low one is real) | the PLL's post-divider; step 1's PLL reading |
-| **step 3**, `CP_HW_FAULT` ≠ 0 | the engine started and refused something — most often an instruction base address it cannot read | **step 6 first** (is the stream bypassed?), then the microcode address |
+| **step 3a**, a block's address mode does not read back 1 | that block still treats addresses as 32-bit; the high halves of anything the driver gave it were dropped | the twelve are printed individually — whichever failed names the block |
+| **step 3b/4**, the addresses seem wrong (fault, RPTR dead, instruction base unreadable) | **check step 3a first**: if the 64-bit address mode did not take, the instruction bases and the ring base were written with their high halves ignored | step 3a's line: "N of 12 registers set" |
+| **step 3c**, `RBBM_SECVID_TRUST_CNTL` does not read back 0 | TrustZone refused the write — expected on a device with content protection | the 3D core stays in secure mode; that is step 7's job |
+| **step 3b**, `CP_HW_FAULT` ≠ 0 | the engine started and refused something — most often an instruction base address it cannot read | **step 3a, then step 6** (is the stream bypassed?), then the microcode address |
 | **step 3**, no busy bit ever seen | **not proof of failure** — a parked engine with an empty ring looks idle | step 4 is the real test |
 | **step 4**, RPTR never moved at all | the engine is not fetching: not running, or the ring's address is unreadable | **step 6 first**, then step 3 |
 | **step 4**, RPTR moved and stopped part way | the engine *is* fetching and choked on the packet it stopped at | that packet; check its parity word by hand against `odd_parity()` in a compiled test |

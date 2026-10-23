@@ -73,6 +73,8 @@ jobs:
 
       - name: The XNU compiler wrapper
         run: |
+          # The SDK ships libc++.tbd and libz.tbd; objects built against them need
+          # them named at link time, which is what the rest of this step sets up.
           # mk-mesa.sh compiles with xnu-deps/host/bin/xnu-clang: a wrapper that
           # forces -target arm64-apple-ios and links with cctools ld64. setup.sh
           # generates it as part of building the kernel, which is not what this
@@ -92,8 +94,12 @@ jobs:
               *) args+=("$a");;
             esac
           done
+          # Linking needs the SDK's stubs named: libc++ for the C++ objects mesa
+          # builds (libglsl, the compiler), libz because something still calls
+          # gz*. Without them ld64 reports 16 undefined symbols.
           exec clang -include "$HB/../../hostinc/xnu_clang_compat.h" \
             -target arm64-apple-ios${XNU_SDK_VERSION:-16.5} --ld-path="$HB/ld64" \
+            -Wl,-lc++ -Wl,-lz \
             -w "${extra[@]}" "${args[@]}"
           WRAP
           chmod +x xnu-deps/host/bin/xnu-clang
@@ -127,6 +133,27 @@ jobs:
             || { echo 'the wrapper cannot link'; exit 1; }
           file /tmp/t.bin | grep -q 'Mach-O' || { echo 'the linked output is not Mach-O'; exit 1; }
           echo "linked: $(file -b /tmp/t.bin)"
+
+          # A C++ program that uses exactly what mesa's objects use, linked the same
+          # way. If libc++ is not being found, this fails here with the same
+          # symbols the real build reported (logic_error, __cxa_guard_acquire).
+          cat > /tmp/t.cc <<'CPP'
+          #include <stdexcept>
+          #include <vector>
+          #include <string>
+          int main() {
+            try { throw std::length_error("x"); }
+            catch (const std::logic_error &) { return 0; }
+          }
+          CPP
+          # a guard variable forces __cxa_guard_acquire, as libglsl's static
+          # initialisers do
+          static std::vector<std::string> v = {"a", "b"};
+          XNU_SDK_VERSION=16.5 xnu-deps/host/bin/xnu-clang++ \
+            -arch arm64 -isysroot "$THEOS/sdks/iPhoneOS16.5.sdk" /tmp/t.cc -o /tmp/t.cc.bin \
+            || { echo 'C++ link failed: libc++ is not being found'; exit 1; }
+          file /tmp/t.cc.bin | grep -q 'Mach-O' || { echo 'C++ output is not Mach-O'; exit 1; }
+          echo "c++ linked: $(file -b /tmp/t.cc.bin)"
 
       - name: Fetch and patch mesa
         run: |

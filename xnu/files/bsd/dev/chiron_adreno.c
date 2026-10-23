@@ -92,6 +92,15 @@ extern void loader_log_putc(char c);
 #define CHIRON_ADRENO_STEP 7            /* the last step this file performs */
 
 static uint32_t step;                   /* the one being performed */
+/*
+ * boot-arg chiron_try_unsecure: perform the RBBM_SECVID_TRUST_CNTL = 0 write that mainline uses
+ * on a device with no zap shader. It is NOT done by default because on this generation it resets
+ * the phone (measured on the Adreno 530 port; see step_unsecure).
+ */
+static uint32_t try_unsecure;
+
+/* boot-arg chiron_smmu_identity: build the GPU's SMMU identity map (see step 6). */
+static uint32_t smmu_identity;
 static bool core_started;               /* step 3 got the micro engine going: step 4 needs it */
 
 static int say(const char *format, ...) __printflike(1, 2);
@@ -597,13 +606,31 @@ step_counter(void)
  * So CX gets steps 4-5 only, and GX gets all of them -- which is what gdsc_enable() reads
  * out of those same properties (sc->sw_reset, sc->domain_addr, sc->reset_aon).
  *
- * There is one thing Linux does that this cannot: between CX and GX it turns on the graphics
+ * There is one thing Linux does that this does not: between CX and GX it turns on the graphics
  * voltage rail through its regulator framework ("Turn on the Graphics rail",
- * clock-gpu-8998.c:414-416, via vdd_gpucc). On this phone that rail is a PM8998 regulator
- * whose level the boot loader has already set for the GPU's power level -- and raising it
- * needs RPMh, which this kernel has no client for. That is why the sequence below is CX, GX
- * and nothing between, and why the counter read afterwards is the test of whether it worked:
- * if the rail were too low the GDSCs would report on and the block would still not answer.
+ * clock-gpu-8998.c:414-416, via vdd_gpucc). On this phone that rail is a PM8998 regulator whose
+ * level the boot loader has already set for the GPU's power level. Raising it needs RPMh, which
+ * this kernel has no *client* for -- but the Adreno 530 port (ios-sailfish, patch 0119) shows the
+ * rail can still be reached on this generation: it writes the S2 regulator directly over SPMI
+ * (fixed 745 mV, "0.5 mV steps from 0, FTS2.5 from 80 mV"). So this is not a hard limit, it is a
+ * driver that does not exist here yet. If it turns out to be needed, that is the model to follow.
+ *
+ * Until then the sequence below is CX, GX and nothing between, and the counter read afterwards is
+ * the test of whether it was enough: if the rail were too low, the GDSCs would report on and the
+ * block would still not answer.
+ *
+ * TWO MORE PREREQUISITES, both from the same port and both cheap to state because a missing one
+ * looks like something else entirely:
+ *
+ *  - the two INTERNAL power islands, GPMU_RBCCU_POWER_CNTL and GPMU_SP_POWER_CNTL, both set to
+ *    0x778000 and each waited on via its PWR_CLK_STATUS bit 20 (patch 0127). Without them
+ *    "the CP hung on the first 2D blit (0126a, RBBM_STATUS c00001c3)" -- i.e. it looks like a
+ *    command-processor bug, not a power bug. Step 3 sets them.
+ *  - the GPU's SMMU register writes must go through a real register, never wzr: "firmware traps
+ *    and emulates some SMMU writes (S2CR), and a trapped `str wzr` stalled the CPU" (patch 0124).
+ *    rd()/wr() here already take the value in a register (the same fix, arrived at from the
+ *    hypervisor note in redwood_adreno.c), including for the value zero -- which is what that
+ *    patch is about.
  */
 #define GDSC_HW_CONTROL         (1u << 1)       /* gdsc.c:29: hardware, not software, operates it */
 #define GDSC_SW_OVERRIDE        (1u << 2)       /* gdsc.c:28 */
@@ -1159,6 +1186,72 @@ step_microcode(void)
 }
 
 /*
+ * The two power islands INSIDE the GPU block: RB/CCU and SP.
+ *
+ * From the vendor's a5xx_regulator_enable (adreno_a5xx.c:487-520), which writes
+ * 0x778000 to each control register and waits for bit 20 of the matching status
+ * register -- and which the Adreno 530 port needed in the same place, with a measured
+ * consequence for leaving it out (ios-sailfish patch 0127): "power the RB/CCU and SP
+ * islands; without them the CP hung on the first 2D blit (0126a, RBBM_STATUS c00001c3)".
+ *
+ * That failure is worth noting because it does not look like a power problem at all: the
+ * command processor is out of halt, the ring is fine, and it stops in the middle of a
+ * command. So this runs before the micro engine is started.
+ *
+ * Register offsets, dword indices from a5xx_reg.h:
+ *   0xA881 GPMU_SP_POWER_CNTL      :770
+ *   0xA887 GPMU_RBCCU_POWER_CNTL   :772
+ *   0xA88B GPMU_SP_PWR_CLK_STATUS  :773
+ *   0xA88D GPMU_RBCCU_PWR_CLK_STATUS :774
+ */
+#define GPMU_SP_POWER_CNTL          0xa881
+#define GPMU_RBCCU_POWER_CNTL       0xa887
+#define GPMU_SP_PWR_CLK_STATUS      0xa88b
+#define GPMU_RBCCU_PWR_CLK_STATUS   0xa88d
+#define GPMU_ISLAND_POWER_ON        0x778000u
+#define GPMU_ISLAND_STATUS_ON       (1u << 20)      /* "the GDSC is up", both status registers */
+
+static bool
+step_islands(void)
+{
+	uint32_t sp, rbccu;
+	bool sp_ok, rb_ok;
+
+	announce("the two power islands inside the GPU block: RB/CCU and SP");
+
+	put(&kgsl, "gpmu_rbccu_power_cntl", GPMU_RBCCU_POWER_CNTL, GPMU_ISLAND_POWER_ON);
+	sleep_us(3);                            /* "delay between RAC and SPTP GDSC to reduce voltage droop" */
+	for (unsigned i = 0; i < 100; i++) {
+		if (reg(GPMU_RBCCU_PWR_CLK_STATUS) & GPMU_ISLAND_STATUS_ON) {
+			break;
+		}
+		sleep_us(10);
+	}
+	rbccu = get(&kgsl, "gpmu_rbccu_pwr_clk_status", GPMU_RBCCU_PWR_CLK_STATUS);
+	rb_ok = (rbccu & GPMU_ISLAND_STATUS_ON) != 0;
+
+	put(&kgsl, "gpmu_sp_power_cntl", GPMU_SP_POWER_CNTL, GPMU_ISLAND_POWER_ON);
+	for (unsigned i = 0; i < 100; i++) {
+		if (reg(GPMU_SP_PWR_CLK_STATUS) & GPMU_ISLAND_STATUS_ON) {
+			break;
+		}
+		sleep_us(10);
+	}
+	sp = get(&kgsl, "gpmu_sp_pwr_clk_status", GPMU_SP_PWR_CLK_STATUS);
+	sp_ok = (sp & GPMU_ISLAND_STATUS_ON) != 0;
+
+	say("chiron-adreno: %u: RB/CCU island %s (%#010x), SP island %s (%#010x)\n", step,
+	    rb_ok ? "ON" : "NOT ON", rbccu, sp_ok ? "ON" : "NOT ON", sp);
+	if (!rb_ok || !sp_ok) {
+		say("chiron-adreno: %u: an island that does not come up makes the CP hang in the middle of a\n"
+		    "chiron-adreno: %u:   command -- which reads like a command-processor fault, not a power one.\n"
+		    "chiron-adreno: %u:   It is not fatal to starting the engine, so the sequence continues; but\n"
+		    "chiron-adreno: %u:   expect step 4 to stall if this is what failed.\n", step, step, step, step);
+	}
+	return rb_ok && sp_ok;
+}
+
+/*
  * Put every block in 64-bit address mode, and read each one back.
  *
  * This runs first in step 3 because everything after it assumes its addresses are 64-bit: the
@@ -1216,55 +1309,62 @@ step_address_mode(void)
 }
 
 /*
- * Ask the GPU to leave secure mode, and report what the register says afterwards.
+ * Secure mode: read it, and leave it alone unless the loader explicitly says otherwise.
  *
- * A GPU comes up in secure mode: the 3D core will not do ordinary work until it is told that this
- * kernel may leave it. The vendor has two paths (adreno_a5xx.c:2457-2477):
+ * A GPU comes up in secure mode and will refuse ordinary work until told otherwise. The vendor has
+ * two paths (adreno_a5xx.c:2457-2477): with CONTENT_PROTECTION -- a540 has it -- it switches
+ * through the CP using the zap shader; without it, it writes RBBM_SECVID_TRUST_CNTL = 0, which is
+ * also what mainline does on a device whose device tree has no zap shader.
  *
- *   if the GPU has CONTENT_PROTECTION -- a540 does -- it switches through the CP, which needs the
- *   zap shader, i.e. step 7; otherwise it simply writes RBBM_SECVID_TRUST_CNTL = 0.
+ * THE SECOND PATH IS NOT SAFE ON THIS GENERATION, and this is measured rather than reasoned. The
+ * Adreno 530 port for the Google Pixel -- ios-sailfish, patch 0125 -- tried exactly that write and
+ * wrote the result into its own comment:
  *
- * This tries the second, because step 7 needs firmware that is not available here. What makes it
- * worth doing rather than skipping is that the answer is falsifiable: write 0, read back, compare.
- * Reading 0 back means TrustZone let the write through. Reading anything else -- most likely the
- * value it already had -- means the write was refused, and the 3D core stays in secure mode until
- * a zap shader is loaded.
+ *     "The GPU stays in secure mode (TRUST_CNTL 1): writing RBBM_SECVID_TRUST_CNTL = 0
+ *      (mainline's no-zap-shader path) reset the phone; leaving it needs the zap shader
+ *      loaded through TZ."
  *
- * WRITTEN AS AN ATTEMPT, NOT A SUCCESS: on a device with content protection the vendor would not
- * use this path at all, so whether it works here is not something this driver can know. It says
- * what the register did and claims nothing beyond that.
+ * MSM8996 is a5xx like this SoC, with the same generation of TrustZone arrangement, so the same
+ * write here is expected to do the same thing. A step whose failure mode is "the phone resets" is
+ * not one to run by default, and reading back does not make it safe -- the reset happens before
+ * anything can be read.
+ *
+ * So this reads the register and reports what it says, which is worth having: it tells whether the
+ * 3D core is still in secure mode when 3b and 4 run, and that is the most likely explanation for a
+ * step 4 that fetches nothing. It writes only with boot-arg chiron_try_unsecure=1, for someone who
+ * knows the phone can be recovered.
  */
 static bool
-step_unsecure(void)
+step_unsecure(uint32_t try_unsecure)
 {
-	uint32_t before, after;
+	uint32_t before;
 
-	announce("asking the GPU to leave secure mode (RBBM_SECVID_TRUST_CNTL = 0), and reading it back");
+	announce("secure mode: reading RBBM_SECVID_TRUST_CNTL, and leaving it alone unless asked");
 
 	before = get(&kgsl, "secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL);
 	if (before == 0xffffffffu) {
-		say("chiron-adreno: %u: it reads all ones, which is also what a refused access looks like:\n"
-		    "chiron-adreno: %u:   the write below is what tells the two apart\n", step, step);
+		say("chiron-adreno: %u: it reads all ones, which is also what a refused access looks like\n", step);
+	}
+	if (before == 0x1) {
+		say("chiron-adreno: %u: the 3D core is IN SECURE MODE. It refuses ordinary work until a zap shader\n"
+		    "chiron-adreno: %u:   is loaded through TrustZone (step 7, needing a540_zap.mdt from the phone).\n"
+		    "chiron-adreno: %u:   If step 4 fetches nothing, this is the first thing to suspect.\n", step, step, step);
 	}
 
+	if (!try_unsecure) {
+		say("chiron-adreno: %u: not writing it: on this generation that write resets the phone. Measured on\n"
+		    "chiron-adreno: %u:   the Adreno 530 port, ios-sailfish patch 0125: \"writing\n"
+		    "chiron-adreno: %u:   RBBM_SECVID_TRUST_CNTL = 0 ... reset the phone\".\n"
+		    "chiron-adreno: %u:   boot-arg chiron_try_unsecure=1 performs it anyway.\n", step, step, step, step);
+		return false;
+	}
+
+	say("chiron-adreno: %u: chiron_try_unsecure=1: writing 0 to RBBM_SECVID_TRUST_CNTL. THE PHONE MAY RESET\n"
+	    "chiron-adreno: %u:   HERE, before anything below can be read back.\n", step, step);
 	put(&kgsl, "secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL, 0x0);
-	after = get(&kgsl, "secvid_trust_cntl", RBBM_SECVID_TRUST_CNTL);
-
-	if (after == 0x0) {
-		say("chiron-adreno: %u: unsecured mode: asked, and the register reads 0 -- the write was taken.\n"
-		    "chiron-adreno: %u:   This is NOT the path the vendor takes on a device with content protection\n"
-		    "chiron-adreno: %u:   (it switches through the CP with the zap shader instead), so treat it as\n"
-		    "chiron-adreno: %u:   evidence that the register is writable, and nothing more.\n", step, step, step, step);
-		return true;
-	}
-
-	say("chiron-adreno: %u: unsecured mode: asked, and it reads %#010x (was %#010x) -- the write was NOT\n"
-	    "chiron-adreno: %u:   taken. TrustZone refused it, which is what a device with content protection\n"
-	    "chiron-adreno: %u:   is expected to do: the 3D core stays in secure mode and will refuse ordinary\n"
-	    "chiron-adreno: %u:   work until a zap shader is loaded -- step 7, which needs a540_zap.mdt from\n"
-	    "chiron-adreno: %u:   the phone.\n",
-	    step, after, before, step, step, step, step);
-	return false;
+	say("chiron-adreno: %u: it read back %#010x, and the phone is still up -- which is itself the finding\n",
+	    step, reg(RBBM_SECVID_TRUST_CNTL));
+	return true;
 }
 
 /*
@@ -2079,6 +2179,149 @@ s2cr_type(const uint32_t value)
 	}
 }
 
+/*
+ * Build an identity map in the GPU's SMMU, and report whether every write took.
+ *
+ * THIS EXISTS BECAUSE A REAL a5xx NEEDS IT, and the evidence is unambiguous. The Adreno 530 port
+ * for the Google Pixel (ios-sailfish, patch 0121) found:
+ *
+ *     "firmware ignores sCR0.CLIENTPD (bypass) and the stream starts as FAULT
+ *      (0120a: S2CR0 0x000200ff, the first CP fetch reset the phone)"
+ *
+ * which is the answer to the question step 6 only reports. It means steps 3b and 4 -- which hand
+ * the CP physical addresses from kvtophys() and rely on them arriving unchanged -- cannot work on
+ * this generation unless a context bank is built first. CLIENTPD does not save you, and a FAULT
+ * stream resets the phone on the first fetch.
+ *
+ * The register sequence below is that port's, which is in turn mainline's shape for MSM8996
+ * translated down to an identity map: context bank 0, stage 1 AArch64, 4 KB granule, 36-bit
+ * VA = PA with 1 GB blocks over the DRAM window, normal non-cacheable, SMR0 matching every stream
+ * ID. The bit values are theirs and are not re-derived here.
+ *
+ * IT IS OPT-IN (chiron_smmu_identity=1), for one reason: it is new hardware code that has never
+ * run on this phone, and it overwrites the SMMU's stream configuration. Step 6 reports what the
+ * SMMU looks like before it runs, and if stream 0 is already BYPASS there is nothing to fix. Run
+ * step 6 first, then decide.
+ *
+ * Every write is read back and the register values are printed whether or not the check passes:
+ * a half-built context bank is exactly the state that produces a silent reset later.
+ */
+#define SMMU_GR1_CBAR(n)    (0x1000 + ((n) << 2))
+#define SMMU_GR1_CBA2R(n)   (0x1800 + ((n) << 2))
+#define SMMU_CB_SCTLR       0x0000
+#define SMMU_CB_TCR2        0x0010
+#define SMMU_CB_TTBR0_LO    0x0020
+#define SMMU_CB_TTBR0_HI    0x0024
+#define SMMU_CB_TCR         0x0030
+#define SMMU_CB_MAIR0       0x0038
+#define SMMU_CB_FSR         0x0058
+#define SMMU_CB_FAR_HI      0x0064
+#define SMMU_CB_FSONR       0x0068
+#define SMMU_sTLBIALLNSNH   0x0068
+#define SMMU_sTLBGSYNC      0x0070
+#define SMMU_sTLBGSTATUS    0x0074
+#define SMMU_CB_OFFSET      0x8000      /* context banks start here (their own offsets) */
+
+static bool
+step_smmu_identity(void)
+{
+	vm_offset_t table = 0;
+	uint64_t *l1;
+	uint64_t table_phys;
+	vm_offset_t cb = SMMU_CB_OFFSET;
+	uint32_t smr, s2cr, cbar, cb_a2r, sctlr, tcr, ttbr, mair, fsr, far_hi, fsonr;
+	bool synced;
+
+	announce("the GPU's SMMU: building an identity map over DRAM (chiron_smmu_identity=1)");
+
+	/*
+	 * One page of 1 GB blocks. Entry n = 1 GB block at n<<30, with
+	 *   bit 0 the valid bit, bit 6 AF, bits 7-8 AP (01 = EL0 read-only,
+	 *   11 = read/write from bit 6 plus bit 7 -- hence `1u<<6 | 2u<<8` in the port,
+	 *   which is AP[2:0] = 011 = read/write at EL0), bits 9-10 SH outer,
+	 *   bits 2-4 AttrIndx 0.
+	 * Blocks 2..7 cover 0x80000000..0x1FFFFFFFF, the phone's DRAM window.
+	 */
+	if (kmem_alloc(kernel_map, &table, PAGE_SIZE,
+	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || table == 0) {
+		say("chiron-adreno: %u: cannot allocate a page for the translation table\n", step);
+		return false;
+	}
+	l1 = (uint64_t *)table;
+	for (uint64_t gb = 2; gb < 8; gb++) {
+		l1[gb] = (gb << 30) | 1u | (1u << 6) | (2u << 8) | (1u << 10);
+	}
+	to_memory(table, PAGE_SIZE);
+	table_phys = kvtophys(table);
+	if (table_phys == 0) {
+		say("chiron-adreno: %u: the translation table has no physical address\n", step);
+		return false;
+	}
+	say("chiron-adreno: %u: translation table at %#llx, %u 1 GB blocks covering 0x80000000..0x1FFFFFFFF\n",
+	    step, (unsigned long long)table_phys, 6u);
+
+	need(&smmu);
+
+	/* Stage 1 AArch64, 4 KB granule, 36-bit VA, identity. Values from ios-sailfish 0121. */
+	wr(smmu.base + SMMU_CB_OFFSET + SMMU_CB_SCTLR, 0);
+	put_at(&smmu, "cbar0", SMMU_GR1_CBAR(0), 1u << 16, false);   /* S1 translate, S2 bypass */
+	put_at(&smmu, "cba2r0", SMMU_GR1_CBA2R(0), 1u, false);      /* VA64 */
+	put_at(&smmu, "cb0_tcr2", cb + SMMU_CB_TCR2, (7u << 15) | 1u, false);   /* PASIZE 36 bit */
+	put_at(&smmu, "cb0_tcr", cb + SMMU_CB_TCR, 28u | (1u << 23), false);    /* T0SZ 28, TG0 4K */
+	put_at(&smmu, "cb0_mair0", cb + SMMU_CB_MAIR0, 0x44u, false);           /* normal non-cacheable */
+	put_at(&smmu, "cb0_ttbr0_lo", cb + SMMU_CB_TTBR0_LO, (uint32_t)table_phys, false);
+	put_at(&smmu, "cb0_ttbr0_hi", cb + SMMU_CB_TTBR0_HI, (uint32_t)(table_phys >> 32), false);
+	put_at(&smmu, "cb0_fsr", cb + SMMU_CB_FSR, 0xffffffffu, false);
+	/* CFRE | AFE | TRE | M: fault reporting, address fault enable, translation enable, MMU on. */
+	put_at(&smmu, "cb0_sctlr", cb + SMMU_CB_SCTLR, (1u << 5) | (1u << 2) | (1u << 1) | 1u, false);
+	put_at(&smmu, "smr0", SMMU_SMR(0), (1u << 31) | (0x7fffu << 16), false);  /* any stream id */
+	put_at(&smmu, "s2cr0", SMMU_S2CR(0), 0, false);                            /* translate, CB0 */
+	put_at(&smmu, "tlbi", SMMU_sTLBIALLNSNH, 0, false);
+	put_at(&smmu, "tlbgsync", SMMU_sTLBGSYNC, 0, false);
+
+	for (unsigned i = 0; i < 100; i++) {
+		if (!(rd(smmu.base + SMMU_sTLBGSTATUS) & 1u)) {
+			break;
+		}
+		sleep_us(100);
+	}
+	synced = !(rd(smmu.base + SMMU_sTLBGSTATUS) & 1u);
+
+	/* Read back every one, and print them: a half-built context bank resets the phone later. */
+	smr = rd(smmu.base + SMMU_SMR(0));
+	s2cr = rd(smmu.base + SMMU_S2CR(0));
+	cbar = rd(smmu.base + SMMU_GR1_CBAR(0));
+	cb_a2r = rd(smmu.base + SMMU_GR1_CBA2R(0));
+	sctlr = rd(smmu.base + SMMU_CB_OFFSET + SMMU_CB_SCTLR);
+	tcr = rd(smmu.base + SMMU_CB_OFFSET + SMMU_CB_TCR);
+	ttbr = rd(smmu.base + SMMU_CB_OFFSET + SMMU_CB_TTBR0_LO);
+	mair = rd(smmu.base + SMMU_CB_OFFSET + SMMU_CB_MAIR0);
+	fsr = rd(smmu.base + SMMU_CB_OFFSET + SMMU_CB_FSR);
+	far_hi = rd(smmu.base + SMMU_CB_OFFSET + SMMU_CB_FAR_HI);
+	fsonr = rd(smmu.base + SMMU_CB_OFFSET + SMMU_CB_FSONR);
+
+	say("chiron-adreno: %u: SMR0 %#010x S2CR0 %#010x CBAR0 %#010x CBA2R0 %#010x\n",
+	    step, smr, s2cr, cbar, cb_a2r);
+	say("chiron-adreno: %u: CB0 SCTLR %#010x TCR %#010x TTBR0 %#010x MAIR0 %#010x\n",
+	    step, sctlr, tcr, ttbr, mair);
+	say("chiron-adreno: %u: CB0 FSR %#010x FAR_HI %#010x FSONR %#010x, tlb synced: %s\n",
+	    step, fsr, far_hi, fsonr, synced ? "yes" : "NO");
+
+	if (synced && smr == ((1u << 31) | (0x7fffu << 16)) && (s2cr & 0x300ffu) == 0 &&
+	    (cbar & (3u << 16)) == (1u << 16) && (sctlr & 0x27u) == 0x27u &&
+	    tcr == (28u | (1u << 23)) && ttbr == (uint32_t)table_phys) {
+		say("chiron-adreno: %u: THE SMMU NOW TRANSLATES, IDENTITY: the CP's physical addresses arrive\n"
+		    "chiron-adreno: %u:   unchanged, and they are not taken for secure-memory accesses.\n", step, step);
+		return true;
+	}
+
+	say("chiron-adreno: %u: the context bank did NOT take: compare the values above with the ones written.\n"
+	    "chiron-adreno: %u:   Nothing this driver puts in the GPU's hands can be trusted from here, and\n"
+	    "chiron-adreno: %u:   a FAULT stream resets the phone on the first fetch -- so steps 3b/4 should\n"
+	    "chiron-adreno: %u:   not be run after this failure.\n", step, step, step, step);
+	return false;
+}
+
 static bool
 step_smmu_state(void)
 {
@@ -2434,6 +2677,14 @@ chiron_adreno_init(void)
 	PE_parse_boot_argn("chiron_zap_mem", &asked, sizeof(asked));
 	zap_memory = asked;
 
+	asked = 0;
+	PE_parse_boot_argn("chiron_try_unsecure", &asked, sizeof(asked));
+	try_unsecure = asked;
+
+	asked = 0;
+	PE_parse_boot_argn("chiron_smmu_identity", &asked, sizeof(asked));
+	smmu_identity = asked;
+
 	for (step = 1; step <= CHIRON_ADRENO_STEP; step++) {
 		bool ok;
 
@@ -2463,6 +2714,7 @@ chiron_adreno_init(void)
 			 *   CP is known good.
 			 */
 			step_address_mode();
+			step_islands();
 			ok = step_microcode();
 			step_rbbm();
 			if (ok) {
@@ -2476,7 +2728,7 @@ chiron_adreno_init(void)
 			 * engine started and did not fault -- stands either way. It is attempted, its answer
 			 * is reported raw, and step 7 is where it gets settled properly.
 			 */
-			step_unsecure();
+			step_unsecure(try_unsecure);
 			/*
 			 * Remembered for step 4: what it needs is not "step 3 passed" but "the engine is
 			 * running", which is a narrower thing and the one it should act on.
@@ -2507,6 +2759,16 @@ chiron_adreno_init(void)
 		case 6:
 			/* Read-only, and useful even when everything before it failed: it says why. */
 			ok = step_smmu_state();
+			/*
+			 * And, opt-in only, build the identity map that a real a5xx needs: on the Adreno
+			 * 530 port the stream started as FAULT and the first CP fetch reset the phone, so
+			 * steps 3b/4 cannot work without one. Step 6's own report says whether it is
+			 * needed here; this acts on that answer only when asked, because it is new
+			 * hardware code that overwrites the SMMU's stream configuration.
+			 */
+			if (smmu_identity) {
+				ok = step_smmu_identity() && ok;
+			}
 			break;
 		case 7:
 			/*

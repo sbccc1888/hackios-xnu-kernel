@@ -1053,12 +1053,18 @@ step_counter_after_power(void)
  * ("a530_pm4.fw", "a530_pfp.fw" -- adreno-gpulist.h:251-252, the a540 entry), which is the
  * kind of detail that is easy to get wrong: there is no "a540_pm4.fw".
  *
- * Each file is the microcode with one dword of version in front of it:
- *   adreno_a5xx.c:2547  memcpy(ucode->hostptr, &fw->data[4], fw->size - 4);
- *   adreno_a5xx.c:2549  *ucode_version = *(unsigned int *)&fw->data[4];
- * The bytes after that dword are copied unchanged into memory the GPU reads.
+ * The file layout, from the vendor (adreno_a5xx.c:2549-2557):
+ *
+ *     kgsl_allocate_global(device, ucode, fw->size - 4, ...);   // 2549
+ *     memcpy(ucode->hostptr, &fw->data[4], fw->size - 4);       // 2555
+ *     *ucode_version = *(unsigned int *)&fw->data[4];           // 2557
+ *
+ * so exactly ONE dword at the front is skipped, and the version is the first dword of what
+ * follows -- it is part of the code image, not a separate header in front of it. The dword that
+ * gets skipped is not the version: a530_pm4.fw starts 00000000 005ff063, and 0x005ff063 is the
+ * version. Reading the file's first dword instead would report 0 for a good file.
  */
-#define UCODE_HEADER_DWORDS         1
+#define UCODE_HEADER_DWORDS         1       /* dwords skipped before the version and code */
 
 /*
  * The ring buffer and the microcode have to be memory the GPU can read, so the kernel must
@@ -1133,7 +1139,25 @@ microcode_in_memory(const char *name, uint32_t *version)
 		return 0;
 	}
 
-	*version = *(const uint32_t *)data;
+	/*
+	 * Where the version lives, exactly as the vendor does it (adreno_a5xx.c:2549-2557):
+	 *
+	 *     kgsl_allocate_global(device, ucode, fw->size - 4, ...);
+	 *     memcpy(ucode->hostptr, &fw->data[4], fw->size - 4);
+	 *     *ucode_version = *(unsigned int *)&fw->data[4];
+	 *
+	 * Both the code and the version come from offset 4, so the version is the FIRST dword of
+	 * the code region and not a separate header word -- only the 4 bytes at offset 0 are
+	 * skipped. The a530_pm4.fw on this machine shows it:
+	 *
+	 *     dword[0] = 0x00000000      <- skipped, not the version
+	 *     dword[1] = 0x005ff063      <- the version, and the first dword copied
+	 *
+	 * Reading dword[0] would have reported "version 0x00000000" for a perfectly good file;
+	 * an earlier version of this function did exactly that, which is why the offset is spelled
+	 * out here rather than implied by a constant.
+	 */
+	*version = *(const uint32_t *)(data + 4);
 	dwords = (uint32_t)((size - UCODE_HEADER_DWORDS * 4) / 4);
 	say("chiron-adreno: %u: fw/%s: version %#010x, %u dwords of code after it\n",
 	    step, name, *version, dwords);
@@ -2235,12 +2259,19 @@ step_smmu_identity(void)
 	announce("the GPU's SMMU: building an identity map over DRAM (chiron_smmu_identity=1)");
 
 	/*
-	 * One page of 1 GB blocks. Entry n = 1 GB block at n<<30, with
-	 *   bit 0 the valid bit, bit 6 AF, bits 7-8 AP (01 = EL0 read-only,
-	 *   11 = read/write from bit 6 plus bit 7 -- hence `1u<<6 | 2u<<8` in the port,
-	 *   which is AP[2:0] = 011 = read/write at EL0), bits 9-10 SH outer,
-	 *   bits 2-4 AttrIndx 0.
-	 * Blocks 2..7 cover 0x80000000..0x1FFFFFFFF, the phone's DRAM window.
+	 * One page of 1 GB block descriptors.
+	 *
+	 * Entry n describes the 1 GB block at n << 30. The bits, by ARMv8-A VMSAv8-64:
+	 *   [1:0]  0b01      block descriptor (0b11 would be a page, 0b00 invalid)
+	 *   [4:2]  AttrIndx  MAIR index 0
+	 *   [7:6]  AP[2:1]   0b01 = read/write at EL1 and at EL0. Note this is AP[1] at bit 6,
+	 *                    NOT AP[2]: AP[2] is bit 7, and setting it means read-only.
+	 *   [9:8]  SH        0b10 = outer shareable
+	 *   [10]   AF        1 = do not fault on first access
+	 * so the constant is 1 | (1<<6) | (2<<8) | (1<<10); the output address is already in
+	 * [47:30] because gb << 30 puts it there.
+	 *
+	 * Blocks 2..7 cover 0x80000000..0x1FFFFFFFF, the DRAM window.
 	 */
 	if (kmem_alloc(kernel_map, &table, PAGE_SIZE,
 	    KMA_KOBJECT | KMA_ZERO | KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS || table == 0) {

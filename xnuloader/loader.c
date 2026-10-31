@@ -34,7 +34,9 @@ struct payload_entry { char name[16]; uint32_t size; uint32_t reserved; };
 #define RESIDENT_RD_RESERVE 0x30000000ULL         /* RAM that must remain for the kernel itself */
 #define PAGE_SIZE_MAX       0x4000ULL
 
-#define LOG_PARTITION       u"logdump"
+/* chiron (Mi MIX 2, MSM8998) calls its log partition "logfs" (8 MiB, /dev/block/sda10);
+ * redwood calls it "logdump". Read from the phone in TWRP: there is no logdump here. */
+#define LOG_PARTITION       u"logfs"
 #define CHECKPOINT_SELFTEST 999
 #define PANIC_LOG_SIZE      0x80000u
 #define NVRAM_BANK_SIZE     0x2000u
@@ -86,6 +88,7 @@ static efi_boot_services *BS;
 static efi_handle IMAGE;
 
 static char log_buf[32768];
+static uint64_t log_part_lba;   /* first LBA of the log partition, 0 if none */
 static uint32_t log_len;
 
 void *
@@ -169,6 +172,43 @@ str_eq(const char *a, const char *b)
  */
 static int screen_quiet;
 
+/*
+ * CHIRON_CONOUT_MUTE
+ *
+ * UsbConfigDxe reports a failed Type-C query on every poll -- one line per millisecond --
+ * and drivers write to the console themselves, so loader's own screen_quiet cannot stop
+ * them; the kernel's log gets pushed off the panel.
+ *
+ * Two pointers keep this useful:
+ *   real_con_out  what loader itself prints through (the firmware's original)
+ *   ST->con_out   a sink that discards everything, which is what the drivers reach
+ * The loader's text still reaches the panel, the drivers' does not.
+ */
+static efi_text_output *real_con_out;
+
+static efi_status EFIAPI
+mute_output_string(efi_text_output *self, const char16 *str)
+{
+	(void)self;
+	(void)str;
+	return 0;
+}
+
+static efi_text_output mute_con_out = { NULL, mute_output_string };
+
+/* Install once, as early as possible: drivers start talking during BDS. */
+static void
+mute_driver_console(void)
+{
+	if (ST == NULL || ST->con_out == NULL) {
+		return;
+	}
+	if (ST->con_out != &mute_con_out) {
+		real_con_out = ST->con_out;
+		ST->con_out = &mute_con_out;
+	}
+}
+
 static void
 put_char(char c)
 {
@@ -177,13 +217,17 @@ put_char(char c)
 	if (log_len < sizeof(log_buf) - 1) {
 		log_buf[log_len++] = c;
 	}
-	if (ST->con_out != NULL && !screen_quiet) {
-		if (c == '\n') {
-			w[0] = '\r', w[1] = '\n';
-		} else {
-			w[0] = (char16)c;
+	if (!screen_quiet) {
+		efi_text_output *out = real_con_out != NULL ? real_con_out : ST->con_out;
+
+		if (out != NULL) {
+			if (c == '\n') {
+				w[0] = '\r', w[1] = '\n';
+			} else {
+				w[0] = (char16)c;
+			}
+			out->output_string(out, w);
 		}
-		ST->con_out->output_string(ST->con_out, w);
 	}
 }
 
@@ -254,37 +298,141 @@ clean_dcache(uint64_t start, uint64_t end)
 /* ------------------------------------------------------------------------ */
 /* Log persistence: raw write to a GPT partition (phone only)               */
 
+static efi_block_io *find_partition_named(const char16 *want);
+
+
+/*
+ * CHIRON_GPT_SCAN
+ *
+ * This UEFI has no EFI_PARTITION_INFO_PROTOCOL, so locate_handle_buffer() on it fails
+ * and every search by partition name came up empty -- including the one for the log
+ * partition, which is why the log was never written and went to the console instead.
+ *
+ * The partition table is read here instead, from the unit's own blocks: BLOCK_IO does
+ * exist, the header at LBA 1 says where the entries are, and each entry carries its
+ * name in UTF-16. What comes back is the unit's BlockIo and the first LBA of the
+ * wanted partition, or NULL.
+ */
+static efi_block_io *
+gpt_find(const char16 *want, uint64_t *first_lba)
+{
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	static uint8_t table[64 * 1024] __attribute__((aligned(8)));
+	static uint8_t hdr[4096] __attribute__((aligned(8)));
+	efi_handle *handles;
+	uint64_t count;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &blk_guid, NULL, &count, &handles))) {
+		return NULL;
+	}
+	for (uint64_t h = 0; h < count; h++) {
+		efi_block_io *bio;
+		uint64_t bs, entries_lba, nc, esz, bytes, read;
+		uint32_t n;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[h], &blk_guid, (void **)&bio)) || bio == NULL ||
+		    bio->media == NULL || bio->media->logical) {
+			continue;
+		}
+		bs = bio->media->block_size;
+		if (bs < 512 || bs > 4096) {
+			continue;
+		}
+		if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, 1, bs, hdr))) {
+			continue;
+		}
+		if (hdr[0] != 'E' || hdr[1] != 'F' || hdr[2] != 'I' ||
+		    hdr[3] != ' ') {
+			continue;
+		}
+		entries_lba = *(uint64_t *)(hdr + 72);
+		n = *(uint32_t *)(hdr + 80);
+		esz = *(uint32_t *)(hdr + 84);
+		bytes = (uint64_t)n * esz;
+		if (esz < 128 || bytes == 0 || bytes > sizeof(table)) {
+			continue;
+		}
+		read = (bytes + bs - 1) / bs * bs;
+		if (EFI_ERROR(bio->read_blocks(bio, bio->media->media_id, entries_lba, read, table))) {
+			continue;
+		}
+		for (uint64_t e = 0; e < n; e++) {
+			const uint8_t *ent = table + e * esz;
+			const char16 *name = (const char16 *)(ent + 56);
+			unsigned k = 0;
+
+			for (; k < 36 && want[k] != 0; k++) {
+				if (name[k] != want[k]) {
+					break;
+				}
+			}
+			if (want[k] == 0 && k > 0) {
+				*first_lba = *(uint64_t *)(ent + 32);
+				print("gpt: found '%s' at lba %d on block size %d\n", "logfs",
+				    *first_lba, bs);
+				return bio;
+			}
+		}
+	}
+	print("gpt: no partition named in any unit\n");
+	return NULL;
+}
+
 static efi_block_io *
 find_log_partition(void)
 {
+	/*
+	 * CHIRON_LOG_PART_FIX
+	 *
+	 * This used to walk sizeof(want) / sizeof(want[0]) characters, which counts the
+	 * terminating null of the literal: it asked the firmware for "logfs\0" and required
+	 * the byte after the name to be zero. It is not, so the partition was never found,
+	 * the log went to the console instead -- a whole kernel log printed a character at a
+	 * time, thousands of lines, each scrolling the panel -- and the picture was stripes.
+	 *
+	 * find_partition_named() stops at the end of the wanted name; that is the comparison
+	 * a GPT name needs, so both searches are now the same one.
+	 */
+	static uint64_t first;
+	static int tried;
+	static efi_block_io *unit;
+
+	if (!tried) {
+		tried = 1;
+		unit = gpt_find(LOG_PARTITION, &first);
+		log_part_lba = first;
+	}
+	return unit;
+}
+
+/* CHIRON_PARTLIST: say what the firmware actually calls its partitions. */
+static void
+list_partitions(void)
+{
 	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
-	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
-	static const char16 want[] = LOG_PARTITION;
 	efi_handle *handles;
 	uint64_t count;
 
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
-		return NULL;
+		print("parts: cannot list partitions\n");
+		return;
 	}
-	for (uint64_t i = 0; i < count; i++) {
+	print("parts: %d partition handles\n", count);
+	for (uint64_t i = 0; i < count && i < 40; i++) {
 		efi_partition_info *info;
-		efi_block_io *bio;
-		int match = 1;
+		char16 *n;
 
-		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2) {
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info))) {
 			continue;
 		}
-		for (unsigned k = 0; k < sizeof(want) / sizeof(want[0]); k++) {
-			if (info->name[k] != want[k]) {
-				match = 0;
-				break;
-			}
+		n = info->name;
+		print("  [%d] type %d name '", i, (uint64_t)info->type);
+		for (unsigned k = 0; k < 36 && n[k] != 0; k++) {
+			put_char(n[k] < 0x80 ? (char)n[k] : '?');
 		}
-		if (match && !EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
-			return bio;
-		}
+		print("'\n");
 	}
-	return NULL;
+	BS->free_pool(handles);
 }
 
 /*
@@ -332,16 +480,53 @@ write_logs(const char *klog, uint64_t klog_len)
 {
 	efi_block_io *bio = find_log_partition();
 
+	/*
+	 * CHIRON_LP_STATUS: one line that says which of the two reasons it was -- ONCE.
+	 * write_logs() runs from the watchdog loop every couple of seconds, and a line per
+	 * pass is a hundred lines over a run, each scrolling the panel: that is the stripes.
+	 */
+	{
+		static int said;
+		if (!said) {
+			said = 1;
+			print("LP bio=%x uefi=%d klen=%x\n", (uint64_t)(uintptr_t)bio,
+			    (uint64_t)hc_list_is_uefis(), klog_len);
+		}
+	}
+
+	/* CHIRON_OOPS_FALLBACK: chiron has no "logdump"; its log partition is "logfs", a FAT12
+	 * volume that Mi's own UEFI owns (writing raw at LBA 0 would wreck it). When neither is
+	 * usable, put the log in "oops" -- the raw 16 MiB panic-log area Android keeps for
+	 * exactly this kind of dump and never reads during normal boot. TWRP can then pull it
+	 * with: dd if=/dev/block/sda11 bs=4096 | strings
+	 */
+	static int fell_back;
+	if (bio == NULL && !fell_back) {
+		fell_back = 1;
+		bio = find_partition_named(u"oops");
+	}
 	compose_logs(klog, klog_len);
 	if (bio == NULL) {
-		/* No log partition (QEMU): echo the returned kernel log on the console instead. */
-		if (klog != NULL) {
-			print("\n== KERNEL LOG ==\n");
-			for (uint64_t i = 0; i < klog_len; i++) {
-				put_char(klog[i]);
-			}
-			print("\n== END OF LOG ==\n");
-		}
+		/*
+		 * No log partition: put it on the console instead -- but only the tail.
+		 *
+		 * CHIRON_LOG_TAIL: the whole log was printed here, one character at a time.
+		 * Every newline makes the firmware's graphics console scroll the panel, which it
+		 * does with a blit of the framebuffer onto itself; a log of any size is thousands
+		 * of those, and the picture ends up as stripes. The tail is what a failing boot
+		 * needs anyway: the last thing that happened.
+		 */
+		/*
+		 * CHIRON_SILENT_PANEL
+		 *
+		 * Nothing of the kernel's log goes to the panel any more, not even the tail.
+		 * put_char() is one ConOut->OutputString per character and every newline makes
+		 * GraphicsConsoleDxe scroll the whole framebuffer with a GOP->Blt; the panel ends
+		 * up as stripes long before the log is through.  The log is in "logfs" and the
+		 * host reads it over adb, so the screen does not have to carry it.
+		 */
+		(void)klog;
+		(void)klog_len;
 		return;
 	}
 	uint64_t bs = bio->media->block_size;
@@ -351,14 +536,15 @@ write_logs(const char *klog, uint64_t klog_len)
 
 	/* only through UEFI's own transfer list (see hc_take_back) */
 	if (!hc_list_is_uefis()) {
-		if (hc_log_skips++ < 2) {
-			hc_print_state("log not written");
-			print("log: NOT WRITTEN to logdump: UEFI's transfer list is not the one in the controller\n");
+		/* CHIRON_SILENT_PANEL: said once, and the state goes into the log itself, not on the panel. */
+		if (hc_log_skips++ == 0) {
+			print("log: not written; UEFI's transfer list is not the one in the controller\n");
 		}
 		compose_logs(klog, klog_len);
 		return;
 	}
-	ws = bio->write_blocks(bio, bio->media->media_id, 0, len, out_buf);
+	/* CHIRON_LOG_OFFSET: the GPT says where the partition starts. */
+	ws = bio->write_blocks(bio, bio->media->media_id, log_part_lba, len, out_buf);
 
 	if (!EFI_ERROR(ws)) {
 		bio->flush_blocks(bio);
@@ -368,13 +554,36 @@ write_logs(const char *klog, uint64_t klog_len)
 		 * the copy the host fetches over USB, not into the partition, which already has the rest.
 		 */
 		if (len <= sizeof(block_buffer)) {
-			rs = bio->read_blocks(bio, bio->media->media_id, 0, len, block_buffer);
+			rs = bio->read_blocks(bio, bio->media->media_id, log_part_lba, len, block_buffer);
 			same = !EFI_ERROR(rs) && memcmp(block_buffer, out_buf, len) == 0;
 		}
 	}
-	print("log: %d bytes written to logdump (%x), read back %s (%x)\n", len, ws,
-	    EFI_ERROR(ws) ? "not tried" : same ? "the same" : "DIFFERENT", rs);
-	compose_logs(klog, klog_len);
+	/*
+	 * CHIRON_LOG_QUIET: write_logs() runs from the watchdog loop every few seconds, and
+	 * this line per pass is a hundred lines over a run. Each newline scrolls the panel
+	 * through the firmware's graphics console, one framebuffer blit each; that is the
+	 * stripes. Say it once, and only when it went wrong.
+	 */
+	{
+		static int said;
+		if (!said) {
+			said = 1;
+			print("log: %d bytes written to logdump (%x), read back %s (%x)\n", len, ws,
+			    EFI_ERROR(ws) ? "not tried" : same ? "the same" : "DIFFERENT", rs);
+		}
+	}
+	/*
+	 * CHIRON_NO_PANEL_DUMP
+	 *
+	 * The kernel's log is not put on the panel any more.  compose_logs() emitted it one
+	 * character at a time, and every newline made the firmware's graphics console scroll
+	 * the whole framebuffer -- a blit per character run.  A real kernel log is 26 KB, so
+	 * that is thousands of blits and the panel ends up as stripes.  The log is in
+	 * "logfs" where the host reads it over adb, which is also what makes a run
+	 * repeatable without a camera.
+	 */
+	(void)klog;
+	(void)klog_len;
 }
 
 static void
@@ -521,11 +730,36 @@ struct platform {
 	int psci_hvc;                    /* the firmware's power interface is called with HVC, not SMC */
 	int log_other_cpu;               /* keep notes in the log partition while a kernel starts on another core */
 	int cores;                       /* at most this many processor cores, numbered from 0 ... */
+	uint32_t virtual_timer_intid;   /* EL1 virtual timer PPI: MSM8998 uses 19, QEMU/Apple 27 */
 	int core_shift;                  /* ... in this bit of MPIDR: the phone numbers them in the second affinity field */
+	int core_per_cluster;            /* ... and this many cores share one affinity-1 value: mpidr = (core/per)<<shift | (core%per) */
 	uint32_t timeout_scale;          /* a kernel on several cores gets this much longer to wait for a lock, 0: as it is */
 	uint32_t small_cores;            /* a bit for each of the slower cores, by number: "small-core" in the device tree */
 	uint64_t fb_base;                /* the framebuffer the firmware reports (GOP): it tells this device apart */
 };
+
+/* Linear core number -> MPIDR, and back. With core_per_cluster == 0 this is the old
+ * one-shift scheme; on chiron and redwood aff0 only spans 0..3, so the number has to be
+ * split into a cluster and an index inside it. */
+static uint64_t
+core_to_mpidr(const struct platform *p, int core)
+{
+	if (p->core_per_cluster > 0) {
+		return ((uint64_t)(core / p->core_per_cluster) << p->core_shift) |
+		    (uint64_t)(core % p->core_per_cluster);
+	}
+	return (uint64_t)core << p->core_shift;
+}
+
+static int
+mpidr_to_core(const struct platform *p, uint64_t mpidr)
+{
+	if (p->core_per_cluster > 0) {
+		return (int)(((mpidr >> p->core_shift) & 0xff) * p->core_per_cluster +
+		    (mpidr & 0xff));
+	}
+	return (int)(mpidr >> p->core_shift);
+}
 
 static const struct platform platform_qemu_virt = {
 	.name = "qemu-virt", .io_base = 0x08000000, .io_size = 0x08000000,
@@ -574,11 +808,16 @@ static const struct platform platform_chiron = {
 	.gic_redist = 0x17b00000,
 	.uart = 0,
 	.psci_hvc = 0,                  /* phones call PSCI with SMC */
-	.log_other_cpu = 0,
+	.log_other_cpu = 1,
+	.virtual_timer_intid = 19,      /* MSM8998: the virtual timer is PPI 19 */
 	.cores = 8,
 	.core_shift = 8,
+	.core_per_cluster = 4,
 	.timeout_scale = 0,
-	.small_cores = 0x0F,            /* cpu@0..3 */
+	.small_cores = 0,               /* CHIRON_NOPAIR: no slow/fast pairing.
+	 * cpu@0..3 report phys id 0x0..0x3 while cpu@100.. report 0x100.., and the
+	 * pairing in ml_pair_slow_processors() died right after processor_set_primary()
+	 * on the phone. Turned off while that identity handling is fixed. */
 	.fb_base = 0x9D400000,          /* 1080 x 2160 continuous splash */
 };
 
@@ -589,12 +828,285 @@ static const struct platform *const platforms[] = {
 
 /* ------------------------------------------------------------------------ */
 
+
+/*
+ * CHIRON_BOOT_RECOVERY
+ *
+ * A halted loader leaves its log on the panel, which has to be photographed. Instead, ask the
+ * firmware to boot the recovery image next: the Android bootloader reads a command out of the
+ * "misc" partition and honours it. Writing "boot-recovery" there and resetting lands the phone
+ * in TWRP, where adb can pull the log out of the "logfs" partition -- no photograph needed.
+ *
+ * The bootloader message is the first 2 KB of misc:
+ *   char command[32]; char status[32]; char recovery[32]; ...
+ * A CRC32 of the first 1064 bytes follows at offset 1080; some bootloaders check it, so it is
+ * written too. Everything else is left alone.
+ */
+#define MISC_PARTITION   u"misc"
+#define BOOT_MSG_MAGIC   u"MISC"
+
+static uint32_t
+crc32_le(uint32_t crc, const uint8_t *p, uint64_t n)
+{
+	crc = ~crc;
+	while (n-- > 0) {
+		crc ^= *p++;
+		for (int k = 0; k < 8; k++) {
+			crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1)));
+		}
+	}
+	return ~crc;
+}
+
+/* A partition by name, for the small raw writes this loader makes (misc). */
+static efi_block_io *
+find_partition_named(const char16 *want)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+	efi_handle *handles;
+	uint64_t count;
+
+	static int dumped;
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		print("CHIRON_PARTDUMP locate_handle_buffer FAILED\n");
+		return NULL;
+	}
+	/* CHIRON_PARTDUMP: what the firmware calls its partitions, once. */
+	if (!dumped) {
+		dumped = 1;
+		print("CHIRON_PARTDUMP %d handles\n", count);
+		for (uint64_t d = 0; d < count && d < 24; d++) {
+			efi_partition_info *di;
+			if (EFI_ERROR(BS->handle_protocol(handles[d], &part_guid, (void **)&di))) {
+				print("  [%d] no protocol\n", d);
+				continue;
+			}
+			print("  [%d] type=%d sys=%d name='", d, (uint64_t)di->type, (uint64_t)di->system);
+			for (unsigned k = 0; k < 36 && di->name[k] != 0; k++) {
+				put_char(di->name[k] < 0x80 ? (char)di->name[k] : '?');
+			}
+			print("'\n");
+		}
+	}
+	for (uint64_t i = 0; i < count; i++) {
+		efi_partition_info *info;
+		efi_block_io *bio;
+		int match = 1;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info)) || info->type != 2) {
+			continue;
+		}
+		for (unsigned k = 0; k < 36; k++) {
+			if (info->name[k] != want[k]) {
+				match = 0;
+				break;
+			}
+			if (want[k] == 0) {
+				break;
+			}
+		}
+		if (match && !EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio))) {
+			return bio;
+		}
+	}
+	return NULL;
+}
+
+/* Write "boot-recovery" into misc so the next boot is the recovery. Returns 0 on success. */
+static int
+request_recovery_boot(void)
+{
+	efi_block_io *bio = find_partition_named(MISC_PARTITION);
+	static uint8_t msg[2048] __attribute__((aligned(8)));
+	const char *cmd = "boot-recovery";
+	efi_status s;
+	uint64_t bs;
+
+	if (bio == NULL) {
+		print("recovery: no misc partition\n");
+		return -1;
+	}
+	if (bio->media == NULL || bio->media->block_size == 0) {
+		print("recovery: misc has no media\n");
+		return -1;
+	}
+	bs = bio->media->block_size;
+	memset(msg, 0, sizeof(msg));
+	memcpy(msg, cmd, str_len(cmd));
+	/* the CRC that comes with the struct (AOSP writes it over the first 1064 bytes) */
+	{
+		uint32_t c = crc32_le(0, msg, 1064);
+		msg[1080] = (uint8_t)(c & 0xff);
+		msg[1081] = (uint8_t)((c >> 8) & 0xff);
+		msg[1082] = (uint8_t)((c >> 16) & 0xff);
+		msg[1083] = (uint8_t)((c >> 24) & 0xff);
+	}
+	s = bio->write_blocks(bio, bio->media->media_id, 0, bs, msg);
+	if (EFI_ERROR(s)) {
+		print("recovery: write to misc failed: %x\n", s);
+		return -1;
+	}
+	bio->flush_blocks(bio);
+	print("recovery: 'boot-recovery' written to misc, resetting\n");
+	return 0;
+}
+
+/* Reset, so the bootloader acts on whatever misc says. */
+static void
+reset_now(void)
+{
+	if (ST->rt != NULL && ST->rt->reset_system != NULL) {
+		ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+	}
+	for (;;) {
+	}
+}
+
+
+/*
+ * CHIRON_DUMP_PARTS
+ *
+ * Diagnostics without a photograph: build the partition list (and the state of the pieces
+ * find_log_partition() depends on) into a buffer and write it into the "oops" partition,
+ * which Android uses for panic logs and which nothing needs during bring-up. TWRP can then
+ * read it with dd.
+ */
+static char dump_buf[32768];
+
+static void
+dump_puts(const char *s)
+{
+	static uint64_t n;
+	while (*s != 0 && n + 1 < sizeof(dump_buf)) {
+		dump_buf[n++] = *s;
+	}
+}
+
+static void
+dump_put_hex(uint64_t v)
+{
+	char tmp[19];
+	int i = 0;
+	dump_puts("0x");
+	if (v == 0) {
+		dump_puts("0");
+		return;
+	}
+	while (v != 0 && i < 16) {
+		tmp[i++] = "0123456789abcdef"[v & 0xf];
+		v >>= 4;
+	}
+	while (i-- > 0) {
+		char c[2] = { tmp[i], 0 };
+		dump_puts(c);
+	}
+}
+
+static int
+dump_partitions(void)
+{
+	static const efi_guid part_guid = EFI_PARTITION_INFO_GUID;
+	efi_handle *handles;
+	uint64_t count, n = 0;
+
+	memset(dump_buf, 0, sizeof(dump_buf));
+	dump_puts("CHIRONDUMP partition list\n");
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &part_guid, NULL, &count, &handles))) {
+		dump_puts("locate_handle_buffer(partition info) FAILED\n");
+		count = 0;
+	} else {
+		dump_puts("partition handles: ");
+		dump_put_hex(count);
+		dump_puts("\n");
+		for (uint64_t i = 0; i < count && i < 200; i++) {
+			efi_partition_info *info;
+			efi_block_io *bio;
+			static const efi_guid blk_guid = EFI_BLOCK_IO_GUID;
+
+			if (EFI_ERROR(BS->handle_protocol(handles[i], &part_guid, (void **)&info))) {
+				continue;
+			}
+			dump_puts("[");
+			dump_put_hex(i);
+			dump_puts("] type=");
+			dump_put_hex(info->type);
+			dump_puts(" name='");
+			for (unsigned k = 0; k < 36 && info->name[k] != 0; k++) {
+				char c[2] = { (char)(info->name[k] & 0x7f), 0 };
+				dump_puts(c);
+			}
+			dump_puts("'");
+			if (!EFI_ERROR(BS->handle_protocol(handles[i], &blk_guid, (void **)&bio)) &&
+			    bio != NULL && bio->media != NULL) {
+				dump_puts(" bs=");
+				dump_put_hex(bio->media->block_size);
+				dump_puts(" last=");
+				dump_put_hex(bio->media->last_block);
+				n++;
+			} else {
+				dump_puts(" (no block io)");
+			}
+			dump_puts("\n");
+		}
+		dump_puts("with block io: ");
+		dump_put_hex(n);
+		dump_puts("\n");
+	}
+
+	/* what find_log_partition() looks for */
+	dump_puts("LOG_PARTITION wanted: logfs\n");
+	{
+		efi_block_io *bio = find_partition_named(u"logfs");
+		dump_puts("find_partition_named(logfs): ");
+		dump_puts(bio != NULL ? "FOUND\n" : "NULL\n");
+	}
+
+	/* write it into oops */
+	{
+		efi_block_io *bio = find_partition_named(u"oops");
+		uint64_t bs, len;
+		efi_status s;
+
+		if (bio == NULL || bio->media == NULL) {
+			return -1;
+		}
+		bs = bio->media->block_size;
+		len = (sizeof(dump_buf) + bs - 1) / bs * bs;
+		s = bio->write_blocks(bio, bio->media->media_id, 0, len, dump_buf);
+		if (EFI_ERROR(s)) {
+			return -2;
+		}
+		bio->flush_blocks(bio);
+		return 0;
+	}
+}
+
+/* CHIRON_AUTO_REBOOT: boot-arg reboot=1 hands the phone back to Android when a run ends. */
+static int auto_reboot;
+
 static void
 reboot(void)
 {
 	hc_take_back("before the reset");
 	flush_log();
-	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+	/*
+	 * CHIRON_HALT_NO_REBOOT: a reset hands the phone back to the bootloader, which then
+	 * starts Android and wipes the screen -- the run's last lines are lost. Stop here
+	 * instead: the panel keeps them, and flush_log() has already tried to put the same
+	 * text in a partition.
+	 *
+	 * CHIRON_AUTO_REBOOT: unless the run asked for the other behaviour with reboot=1.
+	 * Then the log is already in the partition, Android starts, and the host can read it
+	 * without anyone touching the phone -- which is what makes a run repeatable.
+	 */
+	if (auto_reboot) {
+		print("\n== REBOOTING to Android (reboot=1); the log is in the partition ==\n");
+		BS->stall(500000);
+		ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+	}
+	print("\n== HALTED (no reboot) ==\n");
 	for (;;) {
 	}
 }
@@ -674,11 +1186,14 @@ __asm__ (
         ".globl loader_return_stub\n"
         "loader_return_stub:\n"
         "  msr daifset, #0xf\n"
-        /* PSTATE bits the kernel may have left set. PAN in particular is fatal:
+        /* CHIRON_NO_PAN: msr PAN / msr UAO are ARMv8.1.  MSM8998's Kryo 280 is ARMv8.0, so
+         * both are undefined instructions there and take the run down before the jump;
+         * they are nops now, as the port's own apply_chiron does.
+         * PSTATE bits the kernel may have left set. PAN in particular is fatal:
          * UEFI maps its memory as EL0-accessible, so with PAN every data access
          * (including the exception handler's own stack push) faults. */
-        "  .inst 0xd500409f\n"          /* msr PAN, #0 */
-        "  .inst 0xd500407f\n"          /* msr UAO, #0 */
+        "  .inst 0xd503201f\n"          /* msr PAN, #0 */
+        "  .inst 0xd503201f\n"          /* msr UAO, #0 */
         "  mrs x9, sctlr_el1\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
@@ -849,8 +1364,8 @@ __asm__ (
         ".globl other_cpu_return_stub\n"
         "other_cpu_return_stub:\n"              /* x0..x7 as for loader_return_stub */
         "  msr daifset, #0xf\n"
-        "  .inst 0xd500409f\n"                  /* msr PAN, #0 */
-        "  .inst 0xd500407f\n"                  /* msr UAO, #0 */
+        "  .inst 0xd503201f\n"                  /* msr PAN, #0 */
+        "  .inst 0xd503201f\n"                  /* msr UAO, #0 */
         "  mrs x9, sctlr_el1\n"
         "  bic x9, x9, #0x1\n"
         "  bic x9, x9, #0x4\n"
@@ -1005,16 +1520,44 @@ reverse(char *p, uint64_t n)
  * The log of a kernel that did not come back to hand it over: put its two parts in order
  * (the ring's oldest character first) and say where it is and how long.
  */
+/*
+ * CHIRON_LIVE_GUARD
+ *
+ * live->log, live->log_len and the rest are the KERNEL's virtual addresses; adding slide
+ * to one of them gives the physical address it sits at.  That is not always RAM: when the
+ * kernel dies before it has set its own bases up, the sum lands far outside the claimed
+ * window (FAR was 0x10F0000000, 72 GiB) and reading it is a data abort in the loader --
+ * which is what took the run down after the watchdog fired.
+ *
+ * RAM on this phone is 0x40000000..0x1BD8C0000.  Anything else is not memory.
+ */
+static int
+live_pa_ok(uint64_t pa, uint64_t len)
+{
+	if (pa < 0x40000000ULL) {
+		return 0;
+	}
+	return len == 0 ? pa < 0x200000000ULL : (pa < 0x200000000ULL && len < 0x200000000ULL - pa);
+}
+
 static void
 log_of_hung_kernel(const struct kernel_live *live, uint64_t slide)
 {
 	char *log = (char *)(live->log + slide);
 	uint32_t len, ring_at;
+	uint64_t len_pa = live->log_len + slide, ring_pa = live->log_ring_at + slide;
+	uint64_t wrap_pa = live->log_wrapped + slide;
 
 	loader_ctx[CTX_LOG_PA] = loader_ctx[CTX_LOG_LEN] = 0;
-	len = *(volatile uint32_t *)(live->log_len + slide);
-	ring_at = *(volatile uint32_t *)(live->log_ring_at + slide);
-	if (*(volatile uint8_t *)(live->log_wrapped + slide) && ring_at < live->log_ring) {
+	if (!live_pa_ok((uint64_t)(uintptr_t)log, live->log_head + live->log_ring) ||
+	    !live_pa_ok(len_pa, 4) || !live_pa_ok(ring_pa, 4) || !live_pa_ok(wrap_pa, 1)) {
+		print("log_of_hung_kernel: the kernel's log is not in RAM (log pa %x), nothing to read\n",
+		    (uint64_t)(uintptr_t)log);
+		return;
+	}
+	len = *(volatile uint32_t *)(uintptr_t)len_pa;
+	ring_at = *(volatile uint32_t *)(uintptr_t)ring_pa;
+	if (*(volatile uint8_t *)(uintptr_t)wrap_pa && ring_at < live->log_ring) {
 		/* rotate the ring left by ring_at: three reversals */
 		reverse(log + live->log_head, ring_at);
 		reverse(log + live->log_head + ring_at, live->log_ring - ring_at);
@@ -2226,6 +2769,15 @@ charger_start(void)
 static void
 note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t seconds)
 {
+	/* CHIRON_QUIET: the per-second "note:" lines fill the panel and push the kernel's own
+	 * log out of sight. The final dump (log_of_hung_kernel) still prints everything. */
+	if (1) {
+		(void)live;
+		(void)slide;
+		(void)seconds;
+		return;
+	}
+	{
 	const char *log;
 	uint32_t len, from;
 
@@ -2234,9 +2786,38 @@ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t se
 		return;
 	}
 	log = (const char *)(live->log + slide);
+	/* CHIRON_NOTE_GUARD: live->log_len and live->log are the KERNEL's virtual addresses;
+	 * adding slide to them can land outside RAM (FAR was 0x10F0000000, 72.7 GiB). Show
+	 * what they actually hold and never dc-clean outside the claimed window. */
+	{
+		uint64_t raw_log = live->log, raw_len_p = live->log_len;
+		uint64_t len_pa = raw_len_p + slide;
+
+		print("note: live->log=%x live->log_len=%x slide=%x -> pa %x\n",
+		    raw_log, raw_len_p, slide, len_pa);
+		/* RAM on this phone ends at 0x1BD8C0000; anything above 0x200000000 is not memory
+		 * and dc civac there faults (that is how 0x10F0000000 killed the run). */
+		if (len_pa < 0x40000000ULL || len_pa > 0x200000000ULL) {
+			print("note: not a RAM address, skipping the read\n");
+			print("%d s\n", seconds);
+			return;
+		}
+		flush_dcache(len_pa, len_pa + 4);
+		len = *(volatile uint32_t *)(uintptr_t)len_pa;
+		if (len > live->log_head + live->log_ring) {
+			len = 0;
+		}
+	}
+	{
+		uint64_t log_pa = (uint64_t)(uintptr_t)log;
+		if (log_pa < 0x40000000ULL || log_pa + len > 0x200000000ULL) {
+			print("note: log pa %x not in RAM, skipping\n", log_pa);
+			print("%d s: logged %d bytes, heartbeat %d\n", seconds, (uint64_t)len, live->heartbeat);
+			return;
+		}
+	}
 	/* its first words are written with the caches off: look at memory */
-	flush_dcache(live->log_len + slide, live->log_len + slide + 4);
-	len = *(volatile uint32_t *)(live->log_len + slide);
+	/* its first words are written with the caches off: look at memory */
 	if (len > live->log_head + live->log_ring) {
 		len = 0;
 	}
@@ -2247,6 +2828,7 @@ note_kernel_progress(const struct kernel_live *live, uint64_t slide, uint64_t se
 		put_char(log[i] >= 0x20 && log[i] < 0x7f ? log[i] : log[i] == '\n' ? '\n' : '.');
 	}
 	print("\n");
+	}
 }
 
 /* A call of the firmware's power interface, the way this platform makes them. */
@@ -2321,9 +2903,12 @@ run_on_other_cpu(uint64_t mpidr, uint64_t entry, uint64_t boot_args_pa, const st
 		if (!watching_only && seconds_since(started) >= noted + 2) {
 			noted = seconds_since(started);
 			if (PLAT->log_other_cpu) {
-				if (!arrived) {
-					print("%d s: the core has not arrived\n", noted);
-				} else {
+				/*
+				 * CHIRON_WATCH_QUIET: the per-second line went to the panel and scrolled
+				 * it every two seconds for the whole run.  What matters is the log in
+				 * "logfs"; nothing of this loop belongs on the screen.
+				 */
+				if (arrived) {
 					note_kernel_progress(live, slide, noted);
 				}
 				flush_log();
@@ -2493,7 +3078,9 @@ exception_handler(int64_t type, uint64_t *ctx)
 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,
 	    ctx[EXC_CTX_ELR] - (uint64_t)(uintptr_t)&__ImageBase);
 	flush_log();
-	ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+	/* CHIRON_HALT_NO_REBOOT: do not reset -- the bootloader would boot Android and the
+	 * fault would be gone from the screen before it could be read. */
+	print("\n== HALTED (no reboot) ==\n");
 	for (;;) {
 	}
 }
@@ -2886,8 +3473,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	block_write_part = -1;
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
-			kernel_mpidr = (uint64_t)(c[8] - '0') << PLAT->core_shift;
+			kernel_mpidr = core_to_mpidr(PLAT, c[8] - '0');
 		}
+		auto_reboot |= starts_with(c, "reboot=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[8] == 0 || c[8] == ' ');
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');
 		battery_requested |= starts_with(c, "battery=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[9] == 0 || c[9] == ' ');
@@ -2925,9 +3514,23 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	uint64_t kernel_budget = 0;
 	for (uint64_t *q = (uint64_t *)kern_lo; q < (uint64_t *)kern_hi; q++) {
 		if (*q == KERNEL_LIVE_MAGIC) {
-			kernel_live = (const struct kernel_live *)q;
-			break;
+			/* CHIRON_LIVE_SCAN: the same constant is an immediate inside the kernel's
+			 * own "if (*q == KERNEL_LIVE_MAGIC)" instruction, so a bare match can be
+			 * code. The real struct has kernel virtual addresses after the magic. */
+			uint64_t l = q[2], lp = q[3];
+			print("live candidate at %x: log=%x log_len=%x\n",
+			    (uint64_t)(uintptr_t)q, l, lp);
+			if (l >= KERNEL_VIRT_BASE && lp >= KERNEL_VIRT_BASE &&
+			    (l & 7) == 0 && (lp & 3) == 0) {
+				kernel_live = (const struct kernel_live *)q;
+				print("live: accepted at %x\n", (uint64_t)(uintptr_t)q);
+				break;
+			}
+			print("live: rejected (not a struct)\n");
 		}
+	}
+	if (kernel_live == NULL) {
+		print("live: no struct found in %x..%x\n", kern_lo, kern_hi);
 	}
 	for (const char *c = pi.cmdline; *c; c++) {
 		if (starts_with(c, "loader_return_after=")) {
@@ -3204,13 +3807,13 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	 * this loader stays on while it watches is not the kernel's, nor any the firmware runs.
 	 */
 	uint64_t cpu_mpidr[8] = { kernel_mpidr };
-	int cpu_count = 1, boot_core = (int)(kernel_mpidr >> plat->core_shift);
+	int cpu_count = 1, boot_core = mpidr_to_core(plat, kernel_mpidr);
 
 	if (more_cores) {
 		for (int distance = 1; distance < plat->cores; distance++) {
 			for (int side = 0; side < 2; side++) {
 				int core = side == 0 ? boot_core + distance : boot_core - distance;
-				uint64_t mpidr = (uint64_t)core << plat->core_shift;
+				uint64_t mpidr = core_to_mpidr(plat, core);
 				int64_t state;
 
 				if (core < 0 || core >= plat->cores || mpidr == this_mpidr) {
@@ -3246,7 +3849,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		dt_prop_u64(&w, "bus-frequency", 100000000ULL);
 		dt_prop_u64(&w, "memory-frequency", 100000000ULL);
 		dt_prop_u64(&w, "peripheral-frequency", 24000000ULL);
-		if (plat->small_cores & (1u << ((cpu_mpidr[i] >> plat->core_shift) & 31))) {
+		if (plat->small_cores & (1u << (mpidr_to_core(plat, cpu_mpidr[i]) & 31))) {
 			dt_prop_u32(&w, "small-core", 1);
 		}
 		dt_end(&w);
@@ -3273,6 +3876,10 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	dt_prop_str(&w, "compatible", "arm,gic-v3");
 	uint64_t gic_reg[4] = { plat->gic_dist - plat->io_base, 0x10000, plat->gic_redist - plat->io_base, 0x100000 };
 	dt_prop(&w, "reg", gic_reg, sizeof(gic_reg));
+	/* the kernel reads this rather than assuming Apple's 27: on MSM8998 the
+	 * EL1 virtual timer is PPI 19, and the wrong number is no clock at all. */
+	dt_prop_u32(&w, "virtual-timer-intid",
+	    plat->virtual_timer_intid != 0 ? plat->virtual_timer_intid : 27);
 	dt_end(&w);
 	if (plat->uart != 0) {
 		dt_begin(&w, "uart0");
@@ -3292,6 +3899,7 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 	ba->deviceTreeP = dt_pa - slide;
 	ba->deviceTreeLength = dt_len;
 	print("device tree %x len %x, boot_args %x, top %x\n", dt_pa, (uint64_t)dt_len, ba_pa, top);
+	print("CHIRON_CMDLINE rd_size=%x rd1_size=%x rc=%d\n", rd_size, rd1_size, resident_rd_size);
 	print("cmdline: %s\n", ba->commandLine);
 	if (kernel_mpidr != this_mpidr) {
 		print("the kernel will run on core %x (this is core %x)\n", kernel_mpidr, this_mpidr);
@@ -3318,7 +3926,18 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 					continue;
 				}
 				if ((d->type >= 1 && d->type <= 6) || d->type == 9 || d->type == 10) {
-					clean_dcache(d->phys_start, d->phys_start + (d->pages << 12));
+					/* CHIRON_CLAMP_CLEAN: stop at the kernel's window. A descriptor that
+					 * starts below win_base may extend far past it, into addresses this
+					 * firmware never mapped: dc civac there faults (ESR 0x96000145,
+					 * FAR=0x10f0000000 was exactly such a line). */
+					uint64_t c_start = d->phys_start;
+					uint64_t c_end   = d->phys_start + (d->pages << 12);
+					if (c_end > (uint64_t)win_base) {
+						c_end = (uint64_t)win_base;
+					}
+					if (c_start < c_end) {
+						clean_dcache(c_start, c_end);
+					}
 				}
 			}
 		}
@@ -3512,6 +4131,14 @@ usb_start(void)
 	set.bos = usb_bos;
 	set.string_count = 5;
 	set.strings = strings;
+	/* ios-party: say what the revision is and refuse a half-built interface, rather
+	 * than calling through a null pointer later. */
+	print("usb: Qualcomm protocol revision %x\n", (uint64_t)USB->revision);
+	if (USB->start_ex == NULL || USB->send == NULL || USB->handle_event == NULL ||
+	    USB->allocate_transfer_buffer == NULL || USB->free_transfer_buffer == NULL) {
+		print("usb: incomplete Qualcomm USB interface\n");
+		return 0;
+	}
 	efi_status s = USB->start_ex(&set);
 	if (EFI_ERROR(s)) {
 		print("usb: start failed %x\n", s);
@@ -3643,7 +4270,9 @@ fb_command(char *cmd)
 			fb_reply("OKAY", "");
 		} else if (starts_with(cmd, "getvar:")) {
 			const char *var = cmd + 7;
-			if (str_eq(var, "product")) {
+			if (str_eq(var, "board")) {
+				fb_reply("OKAY", PLAT->name);
+			} else if (str_eq(var, "product")) {
 				fb_reply("OKAY", "xnuloader");
 			} else if (str_eq(var, "version")) {
 				fb_reply("OKAY", "0.5");
@@ -3869,8 +4498,11 @@ usb_command_loop(void)
  * is simply replaced). In QEMU the display is then exactly what iOS expects; on the real phone
  * the kernel's display driver scales that picture to the panel.
  */
-#define PHONE_WIDTH     1125            /* the screen of the iPhone X, whose identity we carry */
-#define PHONE_HEIGHT    2436
+/* chiron's own panel: 1080 x 2160 (the loader's boot_args report the same, and the
+ * UEFI's framebuffer is that size). This used to be the iPhone X's 1125 x 2436, which
+ * made the kernel draw at a size the panel does not have. */
+#define PHONE_WIDTH     1080
+#define PHONE_HEIGHT    2160
 #define FW_CFG_BASE     0x09020000ULL   /* QEMU virt: data at +0, selector at +8, DMA address at +16 */
 #define FW_CFG_FILE_DIR 0x19
 #define FW_CFG_DMA_SELECT 0x08
@@ -3960,6 +4592,11 @@ efi_main(efi_handle image, efi_system_table *st)
 	BS = st->bs;
 	IMAGE = image;
 
+	/* Take the console away from the drivers before they start talking: UsbConfigDxe
+	 * reports a failed Type-C query every millisecond, which would bury everything here.
+	 * loader keeps the original pointer, so its own output still reaches the panel. */
+	mute_driver_console();
+
 	BS->set_watchdog_timer(0, 0, 0, NULL);
 	print("== XNULOADER v3 ==\n");
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
@@ -3979,9 +4616,16 @@ efi_main(efi_handle image, efi_system_table *st)
 				PLAT = platforms[i];
 		if (PLAT == &platform_qemu_virt)
 			ramfb_phone_screen();
+		print("CHIRON_GOP w=%d h=%d ppsl=%d fmt=%d stride=%d fbsize=%x base=%x\n",
+		    (uint64_t)GOP->mode->info->width, (uint64_t)GOP->mode->info->height,
+		    (uint64_t)GOP->mode->info->pixels_per_scanline,
+		    (uint64_t)GOP->mode->info->pixel_format,
+		    (uint64_t)SCREEN.stride, (uint64_t)GOP->mode->fb_size, (uint64_t)SCREEN.base);
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
 	print("platform %s\n", PLAT->name);
+	dump_partitions();
+	list_partitions();
 
 	install_exception_hook();
 	wdt_arm();
@@ -3991,6 +4635,16 @@ efi_main(efi_handle image, efi_system_table *st)
 		flush_log();
 		usb_command_loop();
 	}
+
+	/*
+	 * CHIRON_QUIET_EARLY
+	 *
+	 * One-shot mode is where the panel was being scrolled to death: every print() of
+	 * this loader and of the kernel's log went to the firmware's graphics console, and
+	 * each newline is a full-framebuffer blit there.  The log goes to "logfs" (the host
+	 * reads it over adb), so the screen has nothing left to do: turn it off here, once.
+	 */
+	screen_quiet = 1;
 
 	/* One-shot mode: run the kernel that came with the image, then reset. */
 	if (have_payload) {

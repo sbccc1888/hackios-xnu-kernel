@@ -223,6 +223,7 @@ GenericARMPE::start(IOService * provider)
 	 * and then start them, the boot processor (number master_cpu) first.
 	 */
 	static GenericARMCPU * cpus[MAX_CPUS];        /* (static: the slower cores may be started later, see below) */
+	uint32_t later = 28;   /* CHIRON_LATER_SCOPE */
 	unsigned int count = 0;
 	OSIterator * iter = getChildIterator(gIOServicePlane);
 	if (iter != NULL) {
@@ -231,6 +232,14 @@ GenericARMPE::start(IOService * provider)
 			IOService * nub = OSDynamicCast(IOService, obj);
 			int number = nub ? GenericARMCPU::cpuNumberOfNub(nub) : -1;
 
+			/* CHIRONDBG: what the kernel made of this /cpus node */
+			{
+				OSData *r = nub ? OSDynamicCast(OSData, nub->getProperty("reg")) : NULL;
+				OSData *st = nub ? OSDynamicCast(OSData, nub->getProperty("state")) : NULL;
+				IOLog("CHIRONDBG nub %s: reg=%s state=%s number=%d\n",
+				    nub ? nub->getName() : "(null)",
+				    r ? "yes" : "NULL", st ? "yes" : "NULL", number);
+			}
 			if (number < 0 || number >= MAX_CPUS || cpus[number] != NULL) {
 				continue;
 			}
@@ -249,11 +258,20 @@ GenericARMPE::start(IOService * provider)
 		}
 		iter->release();
 	}
+	IOLog("CHIRONDBG master_cpu=%d count=%u cpus[master]=%s\n", master_cpu, count,
+	    cpus[master_cpu] != NULL ? "ok" : "NULL");
+	for (unsigned d = 0; d < MAX_CPUS; d++) {
+		if (cpus[d] != NULL) {
+			IOLog("CHIRONDBG cpus[%u] present\n", d);
+		}
+	}
 	if (cpus[master_cpu] != NULL) {
 		/* Unblocks everything that waits for the CPU count to be known. */
 		ml_set_max_cpus(count);
 		if (count > 1) {
+			IOLog("CHIRONPE a: before psci_smp_init\n");
 			psci_smp_init();
+			IOLog("CHIRONPE b: psci_smp_init returned\n");
 		}
 		/*
 		 * The slower cores (an L2 access penalty, the loader's "small-core") are started 28 seconds
@@ -263,19 +281,17 @@ GenericARMPE::start(IOService * provider)
 		 * SpringBoard's), while that work as a whole was done earlier (34 s instead of 38). With
 		 * the slower cores joining once the lock screen is there: 25.3 s and 36 s.
 		 */
-		uint32_t later = 28;
+		/* CHIRON_LATER_SCOPE: declared outside the block below, which needs it too. */
+		later = 28;
 		static thread_call_t later_call;
 
 		PE_parse_boot_argn("small_cores_after", &later, sizeof(later));
+		IOLog("CHIRONPE c: about to run master cpu %d\n", master_cpu);
 		cpus[master_cpu]->run();
-		for (unsigned int number = 0; number < MAX_CPUS; number++) {
-			if (cpus[number] != NULL && number != (unsigned int)master_cpu) {
-				if (later != 0 && ml_get_topology_info()->cpus[number].l2_access_penalty != 0) {
-					continue;
-				}
-				cpus[number]->run();
-			}
-		}
+		IOLog("CHIRONPE d: master cpu run() returned\n");
+		/* CHIRON_SMP_AFTER_REGISTER: deferred below, after registerService(). */
+		IOLog("CHIRONPE e0: other cores deferred until after registerService, count=%u later=%u\n",
+		    count, later);
 		if (later != 0) {
 			uint64_t deadline;
 
@@ -296,13 +312,47 @@ GenericARMPE::start(IOService * provider)
 	}
 
 	/* BSD looks the platform expert up by class (IOSecureBSDRoot). */
+	IOLog("CHIRON_REG_PROBE 1: before registerService\n");
 	registerService();
-
+	IOLog("CHIRON_REG_PROBE 2: after registerService\n");
 	/* Stand-ins for the closed graphics drivers that the iOS window server talks to. */
+	IOLog("CHIRONFB 7: before MiniIOSurfaceStart\n");
 	MiniIOSurfaceStart(this);
+	IOLog("CHIRONFB 8: before MiniIOMobileFramebufferStart\n");
 	MiniIOMobileFramebufferStart(this);
+	IOLog("CHIRONFB 9: after MiniIOMobileFramebufferStart\n");
 	MiniAppleKeyStoreStart();
+	IOLog("CHIRONFB 10: after MiniAppleKeyStoreStart\n");
 	MiniIONetworkStackStart();
+	IOLog("CHIRONFB 11: GenericARMPE::start returning true\n");
+
+	/*
+	 * CHIRON_SMP_LAST
+	 *
+	 * Only now are the other processors started.  GenericARMCPU::startCPU() ->
+	 * psci_smp_start_cpu() waits up to PSCI_SMP_START_SECONDS (5) for each core to
+	 * join, so with seven of them this loop can sit here for half a minute.  It used
+	 * to run before the display stand-ins below/above, and that is what the stripes
+	 * were: for those thirty-odd seconds no one owned the panel -- the kernel's own
+	 * framebuffer driver had not been started yet, and the loader had already gone.
+	 * With one processor the loop never runs, which is why a single-core boot never
+	 * showed it.
+	 */
+	if (count > 1) {
+		for (unsigned int number = 0; number < MAX_CPUS; number++) {
+			if (cpus[number] != NULL && number != (unsigned int)master_cpu) {
+				if (later != 0 && ml_get_topology_info()->cpus[number].l2_access_penalty != 0) {
+					continue;
+				}
+				IOLog("CHIRONPE e: running cpu %u (penalty %d)\n", number,
+				    (int)ml_get_topology_info()->cpus[number].l2_access_penalty);
+				cpus[number]->run();
+				IOLog("CHIRONPE f: cpu %u run() returned\n", number);
+			}
+		}
+		IOLog("CHIRONPE g: all immediate starts done, count=%u avail=%u later=%u\n",
+		    count, processor_avail_count, later);
+	}
 	return true;
 }
 

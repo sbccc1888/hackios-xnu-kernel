@@ -99,8 +99,10 @@ static uint8_t  gFBCalls[128];          /* how many calls of each selector were 
  * really there (in QEMU the loader makes the panel exactly this size and nothing is scaled).
  * Boot-args fbwidth= and fbheight= change the size reported.
  */
-#define kFBDefaultWidth         1125
-#define kFBDefaultHeight        2436
+/* chiron (Mi MIX 2): the panel is 1080 x 2160, which is what the loader's video
+ * information and the UEFI framebuffer both say. These were the iPhone X's numbers. */
+#define kFBDefaultWidth         1080
+#define kFBDefaultHeight        2160
 #define kFBDotsPerInch          458
 
 static TUNABLE(uint32_t, gFBWidth, "fbwidth", kFBDefaultWidth);
@@ -475,12 +477,18 @@ IOMobileFramebuffer::start(IOService * provider)
 		}
 	}
 
+	IOLog("CHIRONFB 1: after the panel line\n");
 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+	IOLog("CHIRONFB 2: setProperty done\n");
 	/* for who draws with the GPU (userland/src/eagl.c): a frame need not be waited for before it is handed over */
 	setProperty("RedwoodWaitsForGPU", kOSBooleanTrue);
+	IOLog("CHIRONFB 3: before publishModes\n");
 	publishModes();
+	IOLog("CHIRONFB 4: after publishModes\n");
 	setName("disp0");
+	IOLog("CHIRONFB 5: before registerService\n");
 	registerService();
+	IOLog("CHIRONFB 6: after registerService, start() returning\n");
 	return true;
 }
 

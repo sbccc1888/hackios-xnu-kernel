@@ -72,7 +72,13 @@
 
 #define GIC_SGI_SIGNAL          0           /* cpu_signal(): another processor wants this one's attention */
 #define GIC_SGI_STOP            1           /* psci_smp_stop_here(): the system is going back to the boot loader */
-#define GIC_INTID_VTIMER        27          /* EL1 virtual timer PPI */
+/*
+ * chiron (MSM8998) puts the EL1 virtual timer on PPI 19; QEMU and Apple use 27.
+ * The loader says which in the device tree ("virtual-timer-intid"), so the number
+ * is read rather than compiled in -- a wrong one means no clock interrupt at all.
+ */
+static uint32_t gic_vtimer_intid = 27;
+#define GIC_INTID_VTIMER        gic_vtimer_intid
 #define GIC_INTID_SPI_MIN       32
 #define GIC_INTID_SPURIOUS_MIN  1020
 #define GIC_SPI_MOST            48          /* attached at a time */
@@ -418,7 +424,7 @@ gic_v3_irq_cpu_init(void)
 {
 	int cpu = cpu_number();
 	vm_offset_t gicr;
-	uint32_t mine = 1u << GIC_INTID_VTIMER;
+	uint32_t mine;
 
 	if (gicd_base == 0) {
 		DTEntry entry;
@@ -431,6 +437,13 @@ gic_v3_irq_cpu_init(void)
 			panic("gic: no usable /arm-io/gic node in the device tree");
 		}
 		uint64_t const *reg = prop;
+		void const *tp = NULL;
+		uint32_t tp_size = 0;
+		if (SecureDTGetProperty(entry, "virtual-timer-intid", &tp, &tp_size) == kSuccess) {
+			if (tp_size != sizeof(uint32_t)) panic("gic: invalid timer property size");
+			gic_vtimer_intid = *(uint32_t const *)tp;
+			if (gic_vtimer_intid < 16 || gic_vtimer_intid > 31) panic("gic: timer is not a PPI");
+		}
 		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
 
 		simple_lock_init(&gic_spi_lock, 0);
@@ -443,6 +456,8 @@ gic_v3_irq_cpu_init(void)
 	} else if (gicr_cpu_base[cpu] != 0) {
 		return;
 	}
+
+	mine = 1u << GIC_INTID_VTIMER;
 
 	/* System-register CPU interface */
 	__builtin_arm_wsr64("ICC_SRE_EL1", __builtin_arm_rsr64("ICC_SRE_EL1") | 1);

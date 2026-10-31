@@ -75,6 +75,7 @@ struct psci_smp_start_fault {
 } psci_smp_start_fault __attribute__((aligned(64)));
 _Static_assert(sizeof(struct psci_smp_start_fault) == 64, "one cache line");
 
+extern void IOLog(const char *fmt, ...);
 static uint32_t psci_smp_cpu_stage[MAX_CPUS];   /* PSCI_SMP_CPU_*, by cpu number */
 static uint32_t psci_smp_started;               /* a bit per core that CPU_ON was granted for */
 
@@ -195,7 +196,16 @@ psci_smp_start_cpu(int cpu)
 	}
 	os_atomic_or(&psci_smp_started, 1u << cpu, relaxed);
 
-	clock_interval_to_deadline(PSCI_SMP_START_SECONDS, NSEC_PER_SEC, &deadline);
+	{
+		/* CHIRON_RAWWAIT: read the architectural counter instead of the clock */
+		uint64_t freq = 0, from = 0;
+		__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (freq));
+		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (from));
+		if (freq == 0) {
+			freq = 19200000;
+		}
+		deadline = from + freq * PSCI_SMP_START_SECONDS;
+	}
 	do {
 		stage = os_atomic_load(&psci_smp_cpu_stage[cpu], acquire);
 		if (stage >= PSCI_SMP_CPU_RUNNING) {
@@ -206,8 +216,7 @@ psci_smp_start_cpu(int cpu)
 		if (psci_smp_start_fault.valid != 0) {
 			break;
 		}
-		delay_for_interval(1, NSEC_PER_MSEC);
-		now = mach_absolute_time();
+		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
 	} while (now < deadline);
 
 	if (psci_smp_start_fault.valid != 0) {

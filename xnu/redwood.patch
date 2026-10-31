@@ -62,7 +62,7 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..9cd24b42caca 100644
+index 44274016a4cf..0e3f31c5a751 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
 @@ -109,6 +109,38 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
@@ -104,7 +104,7 @@ index 44274016a4cf..9cd24b42caca 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +186,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +187,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -119,7 +119,7 @@ index 44274016a4cf..9cd24b42caca 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +400,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +401,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -127,7 +127,7 @@ index 44274016a4cf..9cd24b42caca 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +423,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +424,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -354,10 +354,20 @@ index 3e6bffa8c48e..43cffb98bdcc 100644
  mdevremoveall(void)
  {
 diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
-index 4df41ba1f61b..16cf4fd8d8f1 100644
+index 4df41ba1f61b..647ef6b7b8ba 100644
 --- a/bsd/kern/bsd_init.c
 +++ b/bsd/kern/bsd_init.c
-@@ -147,6 +147,13 @@
+@@ -79,6 +79,9 @@
+  * Version 2.0.
+  */
+ 
++/* CHIRON_IOLOG: IOLog reaches the panel where kprintf does not, at this stage. */
++extern int IOLog(const char *fmt, ...);
++
+ #include <sys/param.h>
+ #include <sys/filedesc.h>
+ #include <sys/kernel.h>
+@@ -147,6 +150,13 @@
  #include <net/if_ether.h>               /* for ether_family_init() */
  #include <net/if_gif.h>                 /* for gif_init() */
  #include <miscfs/devfs/devfsdefs.h>     /* for devfs_kernel_mount() */
@@ -371,7 +381,15 @@ index 4df41ba1f61b..16cf4fd8d8f1 100644
  #include <vm/vm_kern.h>                 /* for kmem_suballoc() */
  #include <sys/proc_uuid_policy.h>       /* proc_uuid_policy_init() */
  #include <netinet/flow_divert.h>        /* flow_divert_init() */
-@@ -490,7 +497,7 @@ bsd_init(void)
+@@ -476,6 +486,7 @@ bsd_rooted_ramdisk(void)
+ void
+ bsd_init(void)
+ {
++	IOLog("CHIRONSTAGE bsd_init: enter\n");
+ 	struct uthread *ut;
+ 	vnode_t init_rootvnode = NULLVP;
+ 	struct proc_ro_data kernproc_ro_data = {
+@@ -490,7 +501,7 @@ bsd_init(void)
  	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_BSD_INIT);
  #endif
  
@@ -380,7 +398,52 @@ index 4df41ba1f61b..16cf4fd8d8f1 100644
  
  #if DEBUG_BSDINIT
  #define bsd_init_kprintf(x, ...) kprintf("bsd_init: " x, ## __VA_ARGS__)
-@@ -976,6 +983,14 @@ bsd_init(void)
+@@ -850,24 +861,33 @@ bsd_init(void)
+ 	 * the clients that are waiting for the networking stack to be usable.
+ 	 */
+ 	bsd_init_kprintf("calling net_init_run\n");
++	IOLog("CHIRONNET 1: before net_init_run\n");
+ 	net_init_run();
++	IOLog("CHIRONNET 2: after net_init_run RETURNED\n");
+ #endif /* NETWORKING */
+ 
+ 	bsd_init_kprintf("calling inittodr\n");
++	IOLog("CHIRONNET 3: before inittodr\n");
+ 	inittodr(0);
++	IOLog("CHIRONNET 4: after inittodr\n");
+ 
+ 	/* Mount the root file system. */
+ 	while (TRUE) {
+ 		int err;
+ 
+ 		bsd_init_kprintf("calling setconf\n");
++		IOLog("CHIRONNET 5: before setconf\n");
+ 		setconf();
++		IOLog("CHIRONNET 6: after setconf\n");
+ #if CONFIG_NETBOOT
+ 		netboot = (mountroot == netboot_mountroot);
+ #endif
+ 
+ 		bsd_init_kprintf("vfs_mountroot\n");
+-		if (0 == (err = vfs_mountroot())) {
++		IOLog("CHIRONMNT 1: before vfs_mountroot, rootdevice='%s'\n", rootdevice);
++		err = vfs_mountroot();
++		IOLog("CHIRONMNT 2: vfs_mountroot returned %d\n", err);
++		if (0 == err) {
+ 			break;
+ 		}
+ 		rootdevice[0] = '\0';
+@@ -887,7 +907,9 @@ bsd_init(void)
+ 		printf("cannot mount root, errno = %d\n", err);
+ 	}
+ 
++	IOLog("CHIRONROOT 1: before IOSecureBSDRoot\n");
+ 	IOSecureBSDRoot(rootdevice);
++	IOLog("CHIRONROOT 2: after IOSecureBSDRoot\n");
+ 
+ 	mountlist.tqh_first->mnt_flag |= MNT_ROOTFS;
+ 
+@@ -976,6 +998,14 @@ bsd_init(void)
  
  		bsd_init_kprintf("calling devfs_kernel_mount\n");
  		devfs_kernel_mount(mounthere);
@@ -1016,6 +1079,50 @@ index e00012622e77..4f993b3cd47f 100644
  			}
  		}
  
+diff --git a/bsd/net/init.c b/bsd/net/init.c
+index 2e0a6baf134e..f3a5c15c621c 100644
+--- a/bsd/net/init.c
++++ b/bsd/net/init.c
+@@ -74,6 +74,9 @@ net_init_add(
+ 	return 0;
+ }
+ 
++/* CHIRON_DECL_KPRINTF: this file has no kprintf prototype in scope */
++extern int kprintf(const char *fmt, ...);
++
+ __private_extern__ void
+ net_init_run(void)
+ {
+@@ -101,7 +104,10 @@ net_init_run(void)
+ 	while (forward_head != 0) {
+ 		current = forward_head;
+ 		forward_head = current->next;
++		kprintf("CHIRONFN calling %x\n", (uint64_t)(uintptr_t)current->func);
+ 		current->func();
++		kprintf("CHIRONFN returned from %x\n", (uint64_t)(uintptr_t)current->func);
+ 		kfree_type(struct init_list_entry, current);
+ 	}
++	kprintf("CHIRONFN list done\n");
+ }
+diff --git a/bsd/netinet/ip_input.c b/bsd/netinet/ip_input.c
+index f0cd667bbc83..195a82869556 100644
+--- a/bsd/netinet/ip_input.c
++++ b/bsd/netinet/ip_input.c
+@@ -454,11 +454,14 @@ ip_init_delayed(void)
+ 	sin->sin_len = sizeof(struct sockaddr_in);
+ 	sin->sin_family = AF_INET;
+ 	sin->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
++	kprintf("CHIRONIP 1: before in_control SIOCSIFADDR on lo0\n");
+ 	error = in_control(NULL, SIOCSIFADDR, (caddr_t)&ifr, lo_ifp, kernproc);
++	kprintf("CHIRONIP 2: after in_control, error=%d\n", error);
+ 	if (error) {
+ 		printf("%s: failed to initialise lo0's address, error=%d\n",
+ 		    __func__, error);
+ 	}
++	kprintf("CHIRONIP 3: ip_init_delayed done\n");
+ }
+ 
+ /*
 diff --git a/bsd/nfs/nfs_serv.c b/bsd/nfs/nfs_serv.c
 index 6ae9b6bc3fde..58556c324b67 100644
 --- a/bsd/nfs/nfs_serv.c
@@ -1681,26 +1788,37 @@ index 2b14eda8f68f..09337bad5b01 100644
 +#endif
      ")";
 diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
-index 5219fb0d9ed6..29978e9cff43 100644
+index 5219fb0d9ed6..2431482c2628 100644
 --- a/iokit/bsddev/IOKitBSDInit.cpp
 +++ b/iokit/bsddev/IOKitBSDInit.cpp
-@@ -683,7 +683,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+@@ -683,10 +683,24 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  	assert(matching);
  	matching->setObject(gIOResourceMatchedKey, gIOBSDKey);
  
 -	if ((service = IOService::waitForMatchingService(matching, 30ULL * kSecondScale))) {
 +	// A memory-device root needs no filesystem kext, so do not sit out the timeout for one
-+	char rdEarly[kMaxBootVar];
++	/*
++	 * CHIRON_BSD_WAIT
++	 *
++	 * A memory root was given a tenth of a second here: the reasoning was that it needs
++	 * no filesystem kext, so there is nothing to wait for.  That holds with one
++	 * processor.  With more, GenericARMPE::start() is busy in cpus[n]->run() -- waiting
++	 * for a core to join -- at exactly the moment bsd_init gets here, so the service is
++	 * not registered yet and a tenth of a second is not enough: the wait fails, "!BSD"
++	 * is printed and a NULL service goes on to be used.  Give it the same time as
++	 * everything else; a memory root still returns as soon as the service appears.
++	 */
 +	uint64_t bsdWait = 30ULL * kSecondScale;
-+	if (PE_parse_boot_argn("rd", rdEarly, sizeof(rdEarly)) && rdEarly[0] == 'm' && rdEarly[1] == 'd') {
-+		bsdWait = kSecondScale / 10;
-+	}
 +
 +	if ((service = IOService::waitForMatchingService(matching, bsdWait))) {
  		OSSafeReleaseNULL(service);
  	} else {
- 		IOLog("!BSD\n");
-@@ -762,6 +769,17 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+-		IOLog("!BSD\n");
++		IOLog("!BSD: IOBSDResource did not appear within %d ms\n", (uint64_t)(bsdWait / kSecondScale * 1000));
+ 	}
+ 	matching->release();
+ 	matching = NULL;
+@@ -762,6 +776,17 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
  #endif /* __LP64__ */
  				(void)mdevadd(-1, ml_static_ptovirt(ramdParms[0]) >> 12, (unsigned int) (ramdParms[1] >> 12), 0);        /* Initialize it and pass back the device number */
  			}
@@ -1718,6 +1836,19 @@ index 5219fb0d9ed6..29978e9cff43 100644
  			regEntry->release();                                                            /* Toss the entry */
  		}
  	}
+@@ -1017,9 +1042,12 @@ IOSecureBSDRoot(const char * rootName)
+ 	OSDictionary     *matching;
+ 	const OSSymbol   *functionName = OSSymbol::withCStringNoCopy("SecureRootName");
+ 
++	IOLog("CHIRONSECURE 1: serviceMatching for IOPlatformExpert\n");
+ 	matching = IOService::serviceMatching("IOPlatformExpert");
+ 	assert(matching);
++	IOLog("CHIRONSECURE 2: waitForMatchingService, 30s\n");
+ 	pe = (IOPlatformExpert *) IOService::waitForMatchingService(matching, 30ULL * kSecondScale);
++	IOLog("CHIRONSECURE 3: waitForMatchingService returned pe=%p\n", pe);
+ 	matching->release();
+ 	assert(pe);
+ 	// Returns kIOReturnNotPrivileged is the root device is not secure.
 diff --git a/iokit/conf/files b/iokit/conf/files
 index 5fb0a52062e0..6c430c2b23c7 100644
 --- a/iokit/conf/files
@@ -1878,166 +2009,6 @@ index 0316792a3f42..bbef0a4b26d4 100644
  
  # Assume LTO scaling by default, unless it is being explicitly passed on the command-line
  LARGE_BUILD_FOOTPRINT := $(if $(BUILD_LTO),$(BUILD_LTO),1)
-diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
-index e26a1d70f470..f91095c98d26 100644
---- a/osfmk/arm/arm_init.c
-+++ b/osfmk/arm/arm_init.c
-@@ -73,6 +73,9 @@
- #include <sys/kdebug.h>
- 
- #include <pexpert/pexpert.h>
-+#if defined(__arm64__)
-+#include <arm64/psci_smp.h>
-+#endif
- 
- #include <console/serial_protos.h>
- 
-@@ -335,7 +338,11 @@ arm_setup_pre_sign(void)
-  */
- 
- __startup_func
-+/* Bring-up checkpoints, see osfmk/arm64/loader_return.c */
-+extern void loader_checkpoint(uint64_t n);
-+
- void
-+
- arm_init(
- 	boot_args       *args)
- {
-@@ -354,6 +361,7 @@ arm_init(
- 	const_boot_args = *args;
- 	BootArgs = args = &const_boot_args;
- 
-+	loader_checkpoint(10);
- 	cpu_data_init(&BootCpuData);
- #if defined(HAS_APPLE_PAC)
- 	/* bootstrap cpu process dependent key for kernel has been loaded by start.s */
-@@ -362,14 +370,19 @@ arm_init(
- #endif /* defined(HAS_APPLE_PAC) */
- 
- 	PE_init_platform(FALSE, args); /* Get platform expert set up */
-+	loader_checkpoint(11);
- 
- #if __arm64__
- 	configure_timer_apple_regs();
-+	loader_checkpoint(30);
- 	wfe_timeout_configure();
-+	loader_checkpoint(31);
- 	wfe_timeout_init();
-+	loader_checkpoint(32);
- 
- 	configure_misc_apple_boot_args();
- 	configure_misc_apple_regs();
-+	loader_checkpoint(33);
- 
- #if (DEVELOPMENT || DEBUG)
- 	unsigned long const *platform_stall_ptr = NULL;
-@@ -385,6 +398,7 @@ arm_init(
- 	}
- 
- 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_ARM_INIT);
-+	loader_checkpoint(34);
- 
- 	chosen = NULL; // Force a re-lookup later on since VM addresses are not final at this point
- 	dt_entry_size = 0;
-@@ -422,10 +436,13 @@ arm_init(
- 	}
- #endif
- 
-+	loader_checkpoint(35);
- 	ml_parse_cpu_topology();
-+	loader_checkpoint(12);
- 
- 
- 	master_cpu = ml_get_boot_cpu_number();
-+	loader_checkpoint(40);
- 	assert(master_cpu >= 0 && master_cpu <= ml_get_max_cpu_number());
- 
- 	BootCpuData.cpu_number = (unsigned short)master_cpu;
-@@ -439,11 +456,14 @@ arm_init(
- 	CpuDataEntries[master_cpu].cpu_data_paddr = (void *)((uintptr_t)(args->physBase)
- 	    + ((uintptr_t)&BootCpuData
- 	    - (uintptr_t)(args->virtBase)));
-+	loader_checkpoint(41);
- 
- 	thread = thread_bootstrap();
-+	loader_checkpoint(42);
- 	thread->machine.CpuDatap = &BootCpuData;
- 	thread->machine.pcpu_data_base = (vm_offset_t)0;
- 	machine_set_current_thread(thread);
-+	loader_checkpoint(43);
- 
- 	/*
- 	 * Preemption is enabled for this thread so that it can lock mutexes without
-@@ -452,12 +472,16 @@ arm_init(
- 	 * preemption level is not really meaningful for the bootstrap thread.
- 	 */
- 	thread->machine.preemption_count = 0;
-+	loader_checkpoint(44);
- 	cpu_bootstrap();
-+	loader_checkpoint(13);
- 
- 	rtclock_early_init();
-+	loader_checkpoint(14);
- 
- 	kernel_debug_string_early("kernel_startup_bootstrap");
- 	kernel_startup_bootstrap();
-+	loader_checkpoint(15);
- 
- 	/*
- 	 * Initialize the timer callout world
-@@ -465,6 +489,7 @@ arm_init(
- 	timer_call_init();
- 
- 	cpu_init();
-+	loader_checkpoint(16);
- 
- 	processor_bootstrap();
- 
-@@ -514,6 +539,7 @@ arm_init(
- #endif  /* __ARM_PAN_AVAILABLE__ */
- 
- 	arm_vm_init(xmaxmem, args);
-+	loader_checkpoint(17);
- 
- 	if (debug_boot_arg) {
- 		patch_low_glo();
-@@ -527,7 +553,9 @@ arm_init(
- 
- 	/* Setup debugging output. */
- 	const unsigned int serial_exists = serial_init();
-+	loader_checkpoint(18);
- 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
-+	loader_checkpoint(19);
- 	kprintf("kprintf initialized\n");
- 
- 	serialmode = 0;
-@@ -569,6 +597,7 @@ arm_init(
- 		disableConsoleOutput = FALSE;     /* Allow printfs to happen */
- 	}
- 	PE_create_console();
-+	loader_checkpoint(20);
- 
- 	/* setup console output */
- 	PE_init_printf(FALSE);
-@@ -647,6 +676,7 @@ arm_init(
- 	 * against string vulnerabilities
- 	 */
- 	__stack_chk_guard &= ~(0xFFULL << 8);
-+	loader_checkpoint(21);
- 	machine_startup(args);
- }
- 
-@@ -673,6 +703,9 @@ arm_init_cpu(
- 
- 
- 	machine_set_current_thread(cpu_data_ptr->cpu_active_thread);
-+#if defined(GENERIC_PSCI_SMP)
-+	psci_smp_cpu_reached(PSCI_SMP_CPU_IN_KERNEL);
-+#endif
- 
- #if APPLE_ARM64_ARCH_FAMILY
- 	configure_late_apple_regs();
 diff --git a/osfmk/arm/model_dep.c b/osfmk/arm/model_dep.c
 index 39daaf8db949..64ceb1a5f201 100644
 --- a/osfmk/arm/model_dep.c
@@ -2067,10 +2038,20 @@ index 39daaf8db949..64ceb1a5f201 100644
  	}
  	os_atomic_clear_exclusive();
 diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
-index fc2096fa0010..5011ab612305 100644
+index fc2096fa0010..6d589bd14446 100644
 --- a/osfmk/arm/pmap/pmap.c
 +++ b/osfmk/arm/pmap/pmap.c
-@@ -93,6 +93,8 @@
+@@ -25,6 +25,9 @@
+  *
+  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
+  */
++/* CHIRON_IOLOG: IOLog reaches the panel where kprintf does not, at this stage. */
++extern int IOLog(const char *fmt, ...);
++
+ #include <string.h>
+ #include <stdlib.h>
+ #include <mach_assert.h>
+@@ -93,6 +96,8 @@
  
  #include <pexpert/device_tree.h>
  
@@ -2079,7 +2060,15 @@ index fc2096fa0010..5011ab612305 100644
  #include <san/kasan.h>
  #include <sys/cdefs.h>
  
-@@ -4676,8 +4678,8 @@ pmap_page_protect_options_with_flush_range(
+@@ -2095,6 +2100,7 @@ void
+ pmap_bootstrap(
+ 	vm_offset_t vstart)
+ {
++	IOLog("CHIRONSTAGE pmap_bootstrap: enter\n");
+ 	vm_map_offset_t maxoffset;
+ 
+ 	lck_grp_init(&pmap_lck_grp, "pmap", LCK_GRP_ATTR_NULL);
+@@ -4676,8 +4682,8 @@ pmap_page_protect_options_with_flush_range(
  			}
  #endif
  			if (remove && (options & PMAP_OPTIONS_COMPRESSOR)) {
@@ -2090,7 +2079,7 @@ index fc2096fa0010..5011ab612305 100644
  			}
  			goto protect_skip_pve_pass1;
  		}
-@@ -6877,7 +6879,8 @@ void
+@@ -6877,7 +6883,8 @@ void
  pmap_sync_page_attributes_phys(
  	ppnum_t pp)
  {
@@ -2100,7 +2089,7 @@ index fc2096fa0010..5011ab612305 100644
  }
  
  #if CONFIG_COREDUMP
-@@ -11623,7 +11626,8 @@ pmap_cs_lockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+@@ -11623,7 +11630,8 @@ pmap_cs_lockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
  #if XNU_MONITOR
  	pmap_ppl_lockdown_pages(kva, size, PVH_FLAG_LOCKDOWN_CS, ppl_writable);
  #else
@@ -2110,7 +2099,7 @@ index fc2096fa0010..5011ab612305 100644
  #endif
  }
  
-@@ -11633,7 +11637,8 @@ pmap_cs_unlockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
+@@ -11633,7 +11641,8 @@ pmap_cs_unlockdown_pages(vm_address_t kva, vm_size_t size, bool ppl_writable)
  #if XNU_MONITOR
  	pmap_ppl_unlockdown_pages(kva, size, PVH_FLAG_LOCKDOWN_CS, ppl_writable);
  #else
@@ -2148,6 +2137,20 @@ index df672c65b144..d7e1da7c5db2 100644
  #endif /* HAS_APPLE_PAC */
  
  	bool reserved11;
+diff --git a/osfmk/arm64/arm_vm_init.c b/osfmk/arm64/arm_vm_init.c
+index d89b0f19cff7..4f040200934e 100644
+--- a/osfmk/arm64/arm_vm_init.c
++++ b/osfmk/arm64/arm_vm_init.c
+@@ -1953,6 +1953,9 @@ arm_vm_init(uint64_t memory_size, boot_args * args)
+ 	 */
+ 	cpu_tte = (tt_entry_t *)alloc_ptpage(TRUE);
+ 	cpu_ttep = kvtophys((vm_offset_t)cpu_tte);
++	/* CHIRON_TTEP_LOG: the value secondary cores will load into TTBR1 */
++	printf("chiron: cpu_ttep set to 0x%llx (cpu_tte va 0x%llx)\n",
++	    (unsigned long long)cpu_ttep, (unsigned long long)(uintptr_t)cpu_tte);
+ 	bzero(cpu_tte, ARM_PGBYTES);
+ 	avail_end = gPhysBase + mem_size;
+ 	assert(!(avail_end & PAGE_MASK));
 diff --git a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h b/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
 index b9549da357b4..cca31ea32502 100644
 --- a/osfmk/arm64/corecrypto/arm64_isa_compatibility.h
@@ -2162,10 +2165,21 @@ index b9549da357b4..cca31ea32502 100644
  #else
  #define __USES_V_CRYPTO_INTRINSICS 0
 diff --git a/osfmk/arm64/cpu.c b/osfmk/arm64/cpu.c
-index 94e91306b143..0ec1323086b7 100644
+index 94e91306b143..f5ee11e62863 100644
 --- a/osfmk/arm64/cpu.c
 +++ b/osfmk/arm64/cpu.c
-@@ -568,7 +568,12 @@ cpu_idle(void)
+@@ -31,6 +31,10 @@
+  *	cpu specific routines
+  */
+ 
++/* CHIRON_IOLOG: IOLog reaches the panel where kprintf does not, at this stage. */
++extern int IOLog(const char *fmt, ...);
++extern void loader_log_putc(char c);
++
+ #include <pexpert/arm64/board_config.h>
+ #include <kern/kalloc.h>
+ #include <kern/machine.h>
+@@ -568,7 +572,12 @@ cpu_idle(void)
  #endif /* MONOTONIC */
  
  	if (wfi) {
@@ -2179,11 +2193,54 @@ index 94e91306b143..0ec1323086b7 100644
  		platform_cache_idle_enter();
  #endif
  
+@@ -679,6 +688,10 @@ cpu_init(void)
+ 	cpu_data_t     *cdp = getCpuDatap();
+ 	arm_cpu_info_t *cpu_info_p;
+ 
++	kprintf("CPUINIT cdp=%lx num=%d phys=%x exc=%lx istk=%lx\n",
++	    (unsigned long)cdp, (int)cdp->cpu_number, (unsigned)cdp->cpu_phys_id,
++	    (unsigned long)cdp->excepstack_top, (unsigned long)cdp->intstack_top);
++
+ 	assert(exception_stack_pointer() != 0);
+ 
+ 	if (cdp->cpu_type != CPU_TYPE_ARM64) {
+@@ -922,6 +935,13 @@ cpu_start(int cpu)
+ 
+ 		flush_dcache((vm_offset_t)&CpuDataEntries[cpu], sizeof(cpu_data_entry_t), FALSE);
+ 		flush_dcache((vm_offset_t)cpu_data_ptr, sizeof(cpu_data_t), FALSE);
++		/*
++		 * CHIRON_FLUSH_THREAD: the thread's own machine area carries the CpuDatap the
++		 * starting core looks up with getCpuDatap(), and it was not being written back.
++		 * The new core reads it with its caches off, so a line left dirty here is read as
++		 * the old value (0) and cpu_init() dereferences it.
++		 */
++		flush_dcache((vm_offset_t)&first_thread->machine, sizeof(first_thread->machine), FALSE);
+ #if defined(KERNEL_INTEGRITY_CTRR)
+ 
+ 		/* First CPU being started within a cluster goes ahead to lock CTRR for cluster;
 diff --git a/osfmk/arm64/machine_routines.c b/osfmk/arm64/machine_routines.c
-index e76e7e70ab9c..4f540f8caf43 100644
+index e76e7e70ab9c..944b6cecac84 100644
 --- a/osfmk/arm64/machine_routines.c
 +++ b/osfmk/arm64/machine_routines.c
-@@ -734,6 +734,9 @@ ml_get_machine_mem(void)
+@@ -26,6 +26,9 @@
+  * @APPLE_OSREFERENCE_LICENSE_HEADER_END@
+  */
+ 
++/* CHIRON_IOLOG: IOLog reaches the panel where kprintf does not, at this stage. */
++extern int IOLog(const char *fmt, ...);
++
+ #include <arm64/machine_machdep.h>
+ #include <arm64/proc_reg.h>
+ #include <arm/machine_cpu.h>
+@@ -468,6 +471,7 @@ user_timebase_type(void)
+ void
+ machine_startup(__unused boot_args * args)
+ {
++	IOLog("CHIRONSTAGE machine_startup: enter\n");
+ #if defined(HAS_IPI) && (DEVELOPMENT || DEBUG)
+ 	if (!PE_parse_boot_argn("fastipi", &gFastIPI, sizeof(gFastIPI))) {
+ 		gFastIPI = 1;
+@@ -734,6 +738,9 @@ ml_get_machine_mem(void)
  	return machine_info.memory_size;
  }
  
@@ -2193,7 +2250,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  __attribute__((noreturn))
  void
  halt_all_cpus(boolean_t reboot)
-@@ -745,6 +748,9 @@ halt_all_cpus(boolean_t reboot)
+@@ -745,6 +752,9 @@ halt_all_cpus(boolean_t reboot)
  		printf("CPU halted\n");
  		PEHaltRestart(kPEHaltCPU);
  	}
@@ -2203,7 +2260,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  	while (1) {
  		;
  	}
-@@ -932,6 +938,99 @@ ml_read_chip_revision(unsigned int *rev __unused)
+@@ -932,6 +942,99 @@ ml_read_chip_revision(unsigned int *rev __unused)
  #endif
  }
  
@@ -2303,7 +2360,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  void
  ml_parse_cpu_topology(void)
  {
-@@ -945,6 +1044,7 @@ ml_parse_cpu_topology(void)
+@@ -945,6 +1048,7 @@ ml_parse_cpu_topology(void)
  	int64_t cluster_max_cpu_phys_id[MAX_CPU_CLUSTER_PHY_ID + 1];
  	const boolean_t cpus_boot_arg_present = PE_parse_boot_argn("cpus", &cpu_boot_arg, sizeof(cpu_boot_arg));
  	const boolean_t cpumask_boot_arg_present = PE_parse_boot_argn("cpumask", &cpumask_boot_arg, sizeof(cpumask_boot_arg));
@@ -2311,7 +2368,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  
  	// The cpus=N and cpumask=N boot args cannot be used simultaneously. Flag this
  	// so that we trigger a panic later in the boot process, once serial is enabled.
-@@ -1005,6 +1105,20 @@ ml_parse_cpu_topology(void)
+@@ -1005,6 +1109,20 @@ ml_parse_cpu_topology(void)
  		cpu->phys_id = (uint32_t)ml_readprop(child, "reg", ML_READPROP_MANDATORY);
  
  		cpu->l2_access_penalty = (uint32_t)ml_readprop(child, "l2-access-penalty", 0);
@@ -2332,7 +2389,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  		cpu->l2_cache_size = (uint32_t)ml_readprop(child, "l2-cache-size", 0);
  		cpu->l2_cache_id = (uint32_t)ml_readprop(child, "l2-cache-id", 0);
  		cpu->l3_cache_size = (uint32_t)ml_readprop(child, "l3-cache-size", 0);
-@@ -1107,6 +1221,7 @@ ml_parse_cpu_topology(void)
+@@ -1107,6 +1225,7 @@ ml_parse_cpu_topology(void)
  	cluster_offsets[0] = 0;
  #endif
  	assert(topology_info.boot_cpu != NULL);
@@ -2340,7 +2397,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  	ml_read_chip_revision(&topology_info.chip_revision);
  
  	/*
-@@ -1427,17 +1542,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
+@@ -1427,17 +1546,15 @@ ml_processor_register(ml_processor_info_t *in_processor_info,
  	processor_t processor = PERCPU_GET_RELATIVE(processor, cpu_data, this_cpu_datap);
  	if (!is_boot_cpu) {
  		processor_init(processor, this_cpu_datap->cpu_number, pset);
@@ -2366,7 +2423,7 @@ index e76e7e70ab9c..4f540f8caf43 100644
  
  	*processor_out = processor;
  	*ipi_handler_out = cpu_signal_handler;
-@@ -2237,8 +2350,16 @@ _enable_virtual_timer(void)
+@@ -2237,8 +2354,16 @@ _enable_virtual_timer(void)
  	uint64_t cntvctl = CNTV_CTL_EL0_ENABLE; /* One wants to use 32 bits, but "mrs" prefers it this way */
  
  	__builtin_arm_wsr64("CNTV_CTL_EL0", cntvctl);
@@ -2755,10 +2812,27 @@ index c40d57bcc677..1b7a1fcdfcdf 100644
 +osfmk/arm64/gic_v3_irq.c	optional nos_arm_asm
 +osfmk/arm64/psci_smp.c	optional nos_arm_asm
 diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
-index 384118e8d7a9..2573d2ebd4e6 100644
+index 384118e8d7a9..e870cb41a1d8 100644
 --- a/osfmk/console/video_console.c
 +++ b/osfmk/console/video_console.c
-@@ -2855,8 +2855,12 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+@@ -2779,7 +2779,15 @@ vc_initialize(__unused struct vc_info * vinfo_p)
+ {
+ 	vinfo.v_rows = vinfo.v_height / ISO_CHAR_HEIGHT;
+ 	vinfo.v_columns = vinfo.v_width / ISO_CHAR_WIDTH;
+-	vinfo.v_rowscanbytes = ((vinfo.v_depth + 7) / 8) * vinfo.v_width;
++	/*
++	 * The stride of a row is whatever the display leaves between rows, not the width
++	 * times the pixel size: a firmware framebuffer pads each line (pixels_per_scanline
++	 * above width). Using the width here draws every line at the wrong offset and each
++	 * one drifts further, which is what a screen full of stripes is.
++	 */
++	vinfo.v_rowscanbytes = vinfo.v_rowbytes != 0
++	    ? vinfo.v_rowbytes
++	    : ((vinfo.v_depth + 7) / 8) * vinfo.v_width;
+ 	vc_uiscale = vinfo.v_scale;
+ 	if (vc_uiscale > kMaxProgressData) {
+ 		vc_uiscale = kMaxProgressData;
+@@ -2855,8 +2863,12 @@ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
  			gc_acquired = TRUE;
  		} else {
  			if (makeMapping) {
@@ -3009,10 +3083,20 @@ index 8e29586464de..0a7de6fc4be7 100644
  				if (idle_reason == 0) {
  					idle_reason = 4;
 diff --git a/osfmk/kern/startup.c b/osfmk/kern/startup.c
-index bec97fbf7243..203e1f48783f 100644
+index bec97fbf7243..bcdb7438ec98 100644
 --- a/osfmk/kern/startup.c
 +++ b/osfmk/kern/startup.c
-@@ -156,6 +156,7 @@
+@@ -66,6 +66,9 @@
+  *	Mach kernel startup.
+  */
+ 
++/* CHIRON_IOLOG: IOLog reaches the panel where kprintf does not, at this stage. */
++extern int IOLog(const char *fmt, ...);
++
+ #include <debug.h>
+ #include <mach_kdp.h>
+ 
+@@ -156,6 +159,7 @@
  #include <security/mac_mach_internal.h>
  #if CONFIG_VNGUARD
  extern void vnguard_policy_init(void);
@@ -3020,7 +3104,15 @@ index bec97fbf7243..203e1f48783f 100644
  #endif
  #endif
  
-@@ -721,6 +722,9 @@ kernel_bootstrap_thread(void)
+@@ -422,6 +426,7 @@ kernel_startup_initialize_upto(startup_subsystem_id_t upto)
+ void
+ kernel_bootstrap(void)
+ {
++	IOLog("CHIRONSTAGE kernel_bootstrap: enter\n");
+ 	kern_return_t   result;
+ 	thread_t        thread;
+ 	char            namep[16];
+@@ -721,6 +726,9 @@ kernel_bootstrap_thread(void)
  	kernel_bootstrap_log("vnguard_policy_init");
  	vnguard_policy_init();
  #endif
@@ -3138,10 +3230,10 @@ index 65144c74239c..ab6260d52d84 100644
  }
  
 diff --git a/pexpert/pexpert/arm64/BCM2837.h b/pexpert/pexpert/arm64/BCM2837.h
-index d9f0723244e5..53fe4f371d7f 100644
+index d9f0723244e5..740a3ff8c024 100644
 --- a/pexpert/pexpert/arm64/BCM2837.h
 +++ b/pexpert/pexpert/arm64/BCM2837.h
-@@ -11,6 +11,15 @@
+@@ -11,6 +11,20 @@
  #define BCM2837
  #define BCM2837_BRINGUP
  #define ARM_ARCH_TIMER
@@ -3149,15 +3241,20 @@ index d9f0723244e5..53fe4f371d7f 100644
 +#define GENERIC_PSCI_SMP                  1 /* more cores are started through PSCI, see osfmk/arm64/psci_smp.c */
 +
 +/*
-+ * The cores this kernel really runs on (Cortex-A55/A78, QEMU cortex-a76) are
-+ * ARMv8.2: they set PSTATE.PAN on every exception entry, so the kernel must
-+ * know to lift it around user memory accesses.
++ * CHIRON_NO_PAN: PAN arrived in ARMv8.1. The cores this kernel targets are NOT all
++ * ARMv8.2 -- chiron (Xiaomi Mi MIX 2) is a Snapdragon 835, Kryo 280, ARMv8.0 (MIDR
++ * 0x51af8014). "MSR PAN, #1" there is an UNDEFINED instruction, and this early in
++ * arm_init() no exception vector is installed yet, so the machine simply stops: that
++ * is the halt observed between processor_bootstrap() and arm_vm_init().
++ *
++ * PAN only prevents the kernel from touching user memory; leaving it off is correct
++ * (if less strict) on every core, QEMU included.
 + */
-+#define __ARM_PAN_AVAILABLE__     1
++#define __ARM_PAN_AVAILABLE__     0
  
  #define __ARM_ARCH__              8
  #define __ARM_VMSA__              8
-@@ -22,6 +31,7 @@
+@@ -22,6 +36,7 @@
  #ifndef ASSEMBLER
  
  #define PI3_UART
@@ -3165,7 +3262,7 @@ index d9f0723244e5..53fe4f371d7f 100644
  
  #define PI3_BREAK                               asm volatile("brk #0");
  
-@@ -60,8 +70,11 @@
+@@ -60,8 +75,11 @@
  #define BCM2837_PUT32(addr, value) do { *((volatile uint32_t *) addr) = value; } while(0)
  #define BCM2837_GET32(addr) *((volatile uint32_t *) addr)
  

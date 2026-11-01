@@ -159,6 +159,29 @@ typedef struct {
 	efi_status (EFIAPI *take_action)(uint32_t action, const void *battery_status);
 } efi_qcom_charger;
 
+/*
+ * EFI_CLOCK_PROTOCOL, as far as this loader uses it.
+ *
+ * QcomPkg/Include/Protocol/EFIClock.h: the first entries are the ones needed to
+ * turn a clock on by name, which is how the QUSB2 PHY gets its ref clock.
+ */
+typedef struct efi_clock_protocol efi_clock_protocol;
+
+struct efi_clock_protocol {
+	uint64_t revision;
+	efi_status (EFIAPI *get_id)(efi_clock_protocol *self, const char *name, uint32_t *id);
+	efi_status (EFIAPI *enable)(efi_clock_protocol *self, uint32_t id);
+	efi_status (EFIAPI *disable)(efi_clock_protocol *self, uint32_t id);
+	efi_status (EFIAPI *reset)(efi_clock_protocol *self, uint32_t id);
+	efi_status (EFIAPI *set_frequency)(efi_clock_protocol *self, uint32_t id, uint32_t hz);
+	efi_status (EFIAPI *get_frequency)(efi_clock_protocol *self, uint32_t id, uint32_t *hz);
+	efi_status (EFIAPI *is_enabled)(efi_clock_protocol *self, uint32_t id, uint8_t *on);
+	efi_status (EFIAPI *set_parent)(efi_clock_protocol *self, uint32_t id, uint32_t parent);
+	efi_status (EFIAPI *get_parent)(efi_clock_protocol *self, uint32_t id, uint32_t *parent);
+	efi_status (EFIAPI *get_parent_count)(efi_clock_protocol *self, uint32_t id, uint32_t *n);
+	efi_status (EFIAPI *get_parents)(efi_clock_protocol *self, uint32_t id, void *list);
+};
+
 /* Block I/O + Partition Info (used to persist the log on the phone) */
 typedef struct {
 	uint32_t media_id; uint8_t removable, present, logical, read_only, write_caching; uint8_t pad[3];
@@ -274,31 +297,113 @@ typedef struct {
 #endif /* XNULOADER_EFI_H */
 
 /*
- * EFI_USBFN_IO_PROTOCOL, as far as this loader uses it.  The real struct has
- * 18 methods in a fixed order (see QcomPkg/Include/Protocol/EFIUsbfnIo.h);
- * only DetectPort and StartController are called, so everything before them
- * is kept as opaque pointers to preserve the offsets.
+ * EFI_USBFN_IO_PROTOCOL, in the header's own order.
+ *
+ * QcomPkg/Include/Protocol/EFIUsbfnIo.h lists eighteen methods; every one is
+ * declared here even when unused, because a short struct shifts the slots after
+ * it.  An earlier version stopped early and the DetectPort call landed on
+ * garbage: "UEFI EXCEPTION type=0 elr=10002 esr=8a000000 far=10002".
  */
-typedef struct efi_usbfn_io efi_usbfn_io;
-struct efi_usbfn_io {
-	void *detect_port;
-	void *configure_enable_endpoints;
-	void *get_endpoint_max_packet_size;
-	void *get_device_info;
-	void *get_vendor_id_product_id;
-	void *abort_transfer;
-	void *get_endpoint_stall_state;
-	void *set_endpoint_stall_state;
-	void *event_handler;
-	void *transfer;
-	void *get_max_transfer_size;
-	void *allocate_transfer_buffer;
-	void *free_transfer_buffer;
-	efi_status (*start_controller)(efi_usbfn_io *self);
-	efi_status (*stop_controller)(efi_usbfn_io *self);
+typedef struct efi_usbfn_io_protocol efi_usbfn_io;
+
+/* EFI_USBFN_ENDPOINT_TYPE */
+enum {
+	UsbfnEndpointControl = 0,
+	UsbfnEndpointBulk = 1,
+	UsbfnEndpointInterrupt = 2,
+	UsbfnEndpointIsochronous = 3,
 };
 
 /* EFI_USBFN_PORT_TYPE */
-enum { UsbfnUnknownPort = 0, UsbfnStandardDownstreamPort = 1,
-       UsbfnChargingDownstreamPort = 2, UsbfnDedicatedChargingPort = 3,
-       UsbfnInvalidDedicatedChargingPort = 4, UsbfnProprietaryCharger = 5 };
+enum {
+	UsbfnUnknownPort = 0,
+	UsbfnStandardDownstreamPort = 1,
+	UsbfnChargingDownstreamPort = 2,
+	UsbfnDedicatedChargingPort = 3,
+	UsbfnInvalidDedicatedChargingPort = 4,
+	UsbfnProprietaryCharger = 5,
+};
+
+/* EFI_USBFN_ENDPOINT_DIRECTION */
+enum { UsbfnEndpointDirectionInput = 0, UsbfnEndpointDirectionOutput = 1 };
+
+/*
+ * The descriptor chain EFI_USBFN_IO_CONFIGURE_ENABLE_ENDPOINTS() takes, exactly as
+ * QcomPkg/Include/Protocol/EFIUsbfnIo.h defines it:
+ *
+ *   EFI_USB_DEVICE_INFO     { DeviceDescriptor*, ConfigInfoTable** }
+ *   EFI_USB_CONFIG_INFO     { ConfigDescriptor*, InterfaceInfoTable** }
+ *   EFI_USB_INTERFACE_INFO  { InterfaceDescriptor*, EndpointDescriptorTable** }
+ *
+ * (An earlier version of this file passed a flat blob instead, and the driver
+ * dereferenced the wrong words: "far=4000000002100123".)
+ */
+typedef struct {
+	uint8_t length;
+	uint8_t descriptor_type;
+	uint16_t bcd_usb;
+	uint8_t device_class, device_sub_class, device_protocol, max_packet_size;
+	uint16_t id_vendor, id_product, bcd_device;
+	uint8_t str_manufacturer, str_product, str_serial_number, num_configurations;
+} __attribute__((packed)) efi_usb_device_descriptor;
+
+typedef struct {
+	uint8_t length;
+	uint8_t descriptor_type;
+	uint16_t total_length;
+	uint8_t num_interfaces, configuration_value, configuration, attributes;
+	uint8_t max_power;
+} __attribute__((packed)) efi_usb_config_descriptor;
+
+typedef struct {
+	uint8_t length;
+	uint8_t descriptor_type;
+	uint8_t interface_number, alternate_setting, num_endpoints;
+	uint8_t interface_class, interface_sub_class, interface_protocol, interface_string;
+} __attribute__((packed)) efi_usb_interface_descriptor;
+
+typedef struct {
+	uint8_t length;
+	uint8_t descriptor_type;
+	uint8_t endpoint_address, attributes;
+	uint16_t max_packet_size;
+	uint8_t interval;
+} __attribute__((packed)) efi_usb_endpoint_descriptor;
+
+typedef struct {
+	efi_usb_interface_descriptor *interface_descriptor;
+	efi_usb_endpoint_descriptor **endpoint_descriptor_table;
+} efi_usb_interface_info;
+
+typedef struct {
+	efi_usb_config_descriptor *config_descriptor;
+	efi_usb_interface_info **interface_info_table;
+} efi_usb_config_info;
+
+typedef struct {
+	efi_usb_device_descriptor *device_descriptor;
+	efi_usb_config_info **config_info_table;
+} efi_usb_device_info;
+
+struct efi_usbfn_io_protocol {
+	uint64_t revision;
+	efi_status (EFIAPI *detect_port)(efi_usbfn_io *self, uint32_t *port_type);
+	efi_status (EFIAPI *configure_enable_endpoints)(efi_usbfn_io *self, efi_usb_device_info *info);
+	efi_status (EFIAPI *get_endpoint_max_packet_size)(efi_usbfn_io *self, uint32_t type, uint32_t speed, uint32_t *size);
+	efi_status (EFIAPI *get_device_info)(efi_usbfn_io *self, void *info, uint32_t *size);
+	efi_status (EFIAPI *get_vendor_id_product_id)(efi_usbfn_io *self, uint16_t *vid, uint16_t *pid);
+	efi_status (EFIAPI *abort_transfer)(efi_usbfn_io *self, uint32_t endpoint, uint32_t direction);
+	efi_status (EFIAPI *get_endpoint_stall_state)(efi_usbfn_io *self, uint32_t endpoint, uint32_t direction, uint8_t *stalled);
+	efi_status (EFIAPI *set_endpoint_stall_state)(efi_usbfn_io *self, uint32_t endpoint, uint32_t direction, uint8_t stalled);
+	efi_status (EFIAPI *event_handler)(efi_usbfn_io *self, void *event, uint64_t *size, void *data);
+	efi_status (EFIAPI *transfer)(efi_usbfn_io *self, uint32_t endpoint, uint32_t direction, uint64_t *size, void *buffer);
+	efi_status (EFIAPI *get_max_transfer_size)(efi_usbfn_io *self, uint32_t endpoint, uint64_t *size);
+	efi_status (EFIAPI *allocate_transfer_buffer)(efi_usbfn_io *self, uint64_t size, void **buffer);
+	efi_status (EFIAPI *free_transfer_buffer)(efi_usbfn_io *self, void *buffer);
+	efi_status (EFIAPI *start_controller)(efi_usbfn_io *self);
+	efi_status (EFIAPI *stop_controller)(efi_usbfn_io *self);
+	efi_status (EFIAPI *set_endpoint_policy)(efi_usbfn_io *self, uint32_t endpoint, uint32_t direction, void *policy);
+	efi_status (EFIAPI *get_endpoint_policy)(efi_usbfn_io *self, uint32_t endpoint, uint32_t direction, void *policy);
+	efi_status (EFIAPI *configure_enable_endpoints_ex)(efi_usbfn_io *self, efi_usb_device_info *info, void *ss_info);
+};
+

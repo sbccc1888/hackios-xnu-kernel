@@ -1646,8 +1646,13 @@ charger_poll(void)
 		s = CHARGER_EX->get_battery_presence(&present);
 		if (!EFI_ERROR(s) && present) flags |= LOADER_BATTERY_PRESENT;
 		s = CHARGER_EX->get_charger_presence(&plugged);
+		/* CHIRON_CHARGER_VERBOSE: what the firmware actually answers */
+		print("charger: presence st=%x plugged=%d\n", (uint64_t)s, (uint64_t)plugged);
 		if (!EFI_ERROR(s) && plugged) flags |= LOADER_BATTERY_CHARGER_PRESENT;
+		s = CHARGER_EX->get_battery_presence(&present);
+		print("charger: battery st=%x present=%d\n", (uint64_t)s, (uint64_t)present);
 		s = CHARGER_EX->get_battery_voltage(&voltage);
+		print("charger: voltage st=%x mv=%d\n", (uint64_t)s, (uint64_t)voltage);
 		if (!EFI_ERROR(s) && voltage >= 2500 && voltage <= 5000) {
 			have_voltage = 1;
 			flags |= LOADER_BATTERY_VOLTAGE_VALID;
@@ -2747,7 +2752,17 @@ charger_start(void)
 	static const efi_guid qcom_charger_guid = QCOM_CHARGER_GUID;
 	efi_status ex_status, qcom_status, init_status = 0;
 
-	if (charger_enabled || PLAT != &platform_redwood) {
+	/*
+	 * CHIRON_CHARGER_FOR_USB
+	 *
+	 * This used to return for every platform but redwood.  UsbConfigDxe needs the
+	 * PMIC USB protocol and the charger port status -- without them it never
+	 * announces a connection, so the controller stays disconnected however well it
+	 * started -- and those come from here.  chiron ships the same protocols
+	 * (ChargerExDxe, QcomChargerDxeLA, PmicDxe are all in its DXE.inc), so open
+	 * them here as well.
+	 */
+	if (charger_enabled) {
 		return;
 	}
 	ex_status = BS->locate_protocol(&charger_ex_guid, NULL, (void **)&CHARGER_EX);
@@ -3497,7 +3512,24 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		hc_requested |= starts_with(c, "ufs_native=") && (c == pi.cmdline || c[-1] == ' ') && c[11] >= '1' &&
 		    c[11] <= '9';
 	}
-	if (battery_requested) {
+	/*
+	 * CHIRON_CHARGER_FOR_USB
+	 *
+	 * The charger protocols are not a battery feature here: UsbConfigDxe asks the
+	 * PMIC and the charger port whether anything is plugged in, and without an
+	 * answer it never announces a connection -- so a USB session starts the
+	 * controller and then waits for a host that is never told to appear.
+	 * Open them for a USB session too.
+	 */
+	/*
+	 * CHIRON_CHARGER_FOR_USB
+	 *
+	 * pi.usb_mode is not known yet at this point (parse_payload below reads it), so
+	 * ask the payload directly whether it carries a "usb" entry: that is what
+	 * --usb writes.  UsbConfigDxe needs the PMIC and charger-port state to announce
+	 * a connection at all.
+	 */
+	if (battery_requested || pi.usb_mode) {
 		charger_start();
 	}
 	if (ufs_requested >= 2) {
@@ -4249,6 +4281,427 @@ usb_session_check(void)
 	chiron_psci_reset();
 }
 
+
+/*
+ * CHIRON_PHY_DUMP
+ *
+ * The QUSB2 PHY and the DWC3 core, as the firmware left them.  chiron's device
+ * tree puts them at:
+ *
+ *   qusb@c012000   qcom,qusb2phy-v2   -- 0xC012000, 0x2A8
+ *   ssusb@a800000  qcom,dwc-usb3-msm  -- 0xA800000, 0xF8C00
+ *   dwc3@a800000   snps,dwc3          -- 0xA800000, 0xCD00
+ *
+ * Nothing in this firmware drives the PHY (no driver, and UsbInitDxe opens a
+ * protocol that no binary declares), so without this the port can start the
+ * controller and still never appear on the wire.
+ */
+/*
+ * CHIRON_DWC3_RUNSTOP
+ *
+ * Bring the DWC3 device controller up and, more importantly, RUN it.  The
+ * registers this port measured say the second half never happened:
+ *
+ *   DCTL = 0x10f00000  -- RunStop (bit 31) clear: the core is not running
+ *   DSTS = 0x00d29011  -- Connected (bit 24) clear: nothing on the wire
+ *
+ * StartController() returning success only means the request was accepted.
+ * UsbInitDxe is what would set RunStop, and in this firmware it cannot run, so
+ * do it here.
+ */
+/*
+ * CHIRON_PHY_CLOCK
+ *
+ * Turn the QUSB2 PHY's reference clock on before touching anything else.  The
+ * PHY answered every register read with 0x80808080 / 0x13131313, which is what an
+ * unclocked block returns, and its device tree node says what it wants:
+ *
+ *   //soc/qusb@c012000
+ *     clocks = ref_clk_src, ref_clk
+ *     clock-names = "ref_clk_src", "ref_clk"
+ *
+ * The clock driver publishes EFI_CLOCK_PROTOCOL; ask it for those two by name.
+ */
+/*
+ * CHIRON_USBFN_ENDPOINTS
+ *
+ * Configure the endpoints through the controller's own protocol, BEFORE
+ * UsbDeviceDxe's StartEx presents the device: that call is what puts us on the
+ * wire, and endpoints configured afterwards are too late.
+ *
+ * UsbInitDxe normally does this.  It never runs here because its depex names
+ * 3fb022e7-50b2-ce42-8ebd-5bd51812d037, a protocol no binary in this firmware
+ * declares, so the loader does it instead with the descriptors it advertises.
+ *
+ * The chain is the one QcomPkg/Include/Protocol/EFIUsbfnIo.h specifies:
+ *   EFI_USB_DEVICE_INFO    { DeviceDescriptor*, ConfigInfoTable** }
+ *   EFI_USB_CONFIG_INFO    { ConfigDescriptor*, InterfaceInfoTable** }
+ *   EFI_USB_INTERFACE_INFO { InterfaceDescriptor*, EndpointDescriptorTable** }
+ */
+/* CHIRON_UDELAY: the PHY's own timings are given in microseconds. */
+static void
+chiron_udelay(uint64_t us)
+{
+	uint64_t freq = 0, began = 0, now = 0;
+
+	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (freq));
+	__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (began));
+	for (;;) {
+		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
+		if (now - began >= freq * us / 1000000ULL) {
+			break;
+		}
+	}
+}
+
+/*
+ * CHIRON_USB_CLOCKS
+ *
+ * The names are the running kernel's own (read from /sys/kernel/debug/clk on this
+ * phone), not the device tree's short names -- GetId rejected every short name.
+ * gcc_qusb2phy_prim_reset is a reset line rather than a clock and GetId refuses it
+ * too, so it is handled by writing its BCR directly in the PHY init.
+ */
+static void
+chiron_clocks_on(void)
+{
+	static const efi_guid clock_guid = {0x241AFAE6, 0x885F, 0x4F6C,
+	    {0xA7, 0xEA, 0xC2, 0x8E, 0xAB, 0x79, 0xC3, 0xE5}};
+	static const char *names[] = {
+		"gcc_cfg_noc_usb3_axi_clk",
+		"gcc_aggre1_usb3_axi_clk",
+		"gcc_usb30_master_clk",
+		"gcc_usb30_mock_utmi_clk",
+		"gcc_usb3_phy_aux_clk",
+		"gcc_usb30_sleep_clk",
+		"gcc_rx1_usb2_clkref_clk",
+		"gcc_usb3_clkref_clk",
+	};
+	efi_clock_protocol *clk = NULL;
+
+	if (EFI_ERROR(BS->locate_protocol(&clock_guid, NULL, (void **)&clk)) || clk == NULL) {
+		print("clk: no clock protocol\n");
+		return;
+	}
+	for (unsigned i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+		uint32_t id = 0xffffffffu;
+		efi_status g = clk->get_id(clk, names[i], &id);
+		efi_status e = 0xffffffffffffffffULL;
+
+		if (!EFI_ERROR(g)) {
+			e = clk->enable(clk, id);
+		}
+		print("clk: ", 0);
+		print((char *)names[i], 0);
+		print(" get=%x enable=%x\n", (uint64_t)g, (uint64_t)e);
+	}
+}
+
+/*
+ * CHIRON_QUSB2_INIT
+ *
+ * The QUSB2 PHY, following msm_qusb_phy_init() in
+ * drivers/usb/phy/phy-msm-qusb-v2.c step for step:
+ *
+ *   reset assert/deassert
+ *   PWR_CTRL1 |=  POWR_DOWN          <- power down before programming
+ *   write qcom,qusb-phy-init-seq
+ *   PWR_CTRL1 &= ~POWR_DOWN          <- power up
+ *   wmb(); wait 150 us for the PLL
+ *   PLL_COMMON_STATUS_ONE bit0 CORE_READY must be 1
+ *
+ * The previous attempt powered up before the reset, and the reset set POWR_DOWN
+ * again; the run showed r210=0x23 (bit0 set) and r1a0=0x64 (CORE_READY clear),
+ * i.e. the PHY was still off and its PLL never locked.
+ *
+ *   QUSB2PHY_PWR_CTRL1              0x210   bit0 POWR_DOWN
+ *   QUSB2PHY_PLL_COMMON_STATUS_ONE  0x1A0   bit0 CORE_READY
+ *   GCC_QUSB2PHY_PRIM_BCR           0x112000  (GCC 0x100000 + 0x12000), bit0 reset
+ *   TCSR clamp                      0x1FCB24C
+ */
+static void
+chiron_qusb2_init(void)
+{
+	/*
+	 * qcom,qusb-phy-init-seq as (value, offset), written one byte per register:
+	 * a 32-bit store at 0x00 spread 0x80 over four registers, which is where the
+	 * misleading 0x80808080 readbacks came from.
+	 */
+	static const uint32_t seq[][2] = {
+		{0x80, 0x000},
+		{0x13, 0x004},
+		{0x7c, 0x18c},
+		{0x80, 0x02c},
+		{0x0a, 0x184},
+		{0xf0, 0x23c},
+		{0x0f, 0x240},
+	};
+	const uint64_t phy = 0xC012000ULL;
+	const uint64_t bcr = 0x112000ULL;
+	const uint64_t tcsr = 0x1FCB24CULL;
+	uint8_t ready = 0;
+
+	/* clamp released, then reset the PHY */
+	*(volatile uint32_t *)(uintptr_t)tcsr = 1;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(uintptr_t)bcr = 1;
+	chiron_udelay(150);
+	*(volatile uint32_t *)(uintptr_t)bcr = 0;
+	chiron_udelay(50);
+
+	/* CHIRON_QUSB2_PWRDOWN: power down before programming, as the driver does */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x210) |= 1u;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
+		*(volatile uint8_t *)(uintptr_t)(phy + seq[i][1]) = (uint8_t)seq[i][0];
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	/* CHIRON_QUSB2_PWRUP: power up, then wait for the PLL to lock */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x210) &= ~1u;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(200);
+
+	for (int i = 0; i < 100; i++) {
+		ready = *(volatile uint8_t *)(uintptr_t)(phy + 0x1A0);
+		if (ready & 1) {
+			break;
+		}
+		chiron_udelay(100);
+	}
+
+	print("qusb2: PLL %x ready %x\n", (uint64_t)ready, (uint64_t)(ready & 1));
+	print("qusb2: r210 %x (pwrdn %x)\n",
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x210),
+	    (uint64_t)(*(volatile uint8_t *)(uintptr_t)(phy + 0x210) & 1));
+	print("qusb2: r00 %x r04 %x r2c %x r18c %x\n",
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x000),
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x004),
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x02c),
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x18c));
+}
+
+/*
+ * CHIRON_DWC3_RUN
+ *
+ * Start the DWC3 device core and report whether a host has noticed us:
+ *   DCTL bit 31  RunStop
+ *   DSTS bit 24  Connected
+ *   DSTS bits 2:0  speed (1 low, 2 full, 3 high)
+ */
+/*
+ * CHIRON_DWC3_RUN
+ *
+ * Running the core is not enough: DSTS reported LinkState=2 (SUSPEND), so the link
+ * never went ON and the host stayed invisible.  Drive the link out of suspend
+ * (DCTL.ULStChngReq), make sure the PHY is not held in suspend
+ * (GUSB2PHYCFG0.SUSPENDUSB2), and report what changed.
+ */
+/*
+ * CHIRON_DWC3_HIGHSPEED
+ *
+ * DCFG.SPEED was left at 4 (SuperSpeed), so the core advertised SuperSpeed and
+ * waited for an SS link that cannot exist on chiron's micro-USB port.  DSTS kept
+ * reporting USBLNKST=4 (DISCONNECT) with CONNECTSPD=4 (SS) for that reason.
+ *
+ * DWC3_DCFG_SPEED_MASK (7 << 0): 0 HS, 1 FS2, 2 LS, 3 FS1, 4 SS.
+ * Switched to HIGHSPEED, which is what this port's USB2 PHY provides.
+ */
+static void
+chiron_dwc3_highspeed(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+
+	print("dwc3: DCFG before %x speed %x\n",
+	    (uint64_t)dcfg, (uint64_t)(dcfg & 7));
+
+	dcfg &= ~7u;                    /* DWC3_DCFG_SPEED_MASK */
+	dcfg |= 0u;                     /* DWC3_DCFG_HIGHSPEED */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) = dcfg;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+	print("dwc3: DCFG after %x speed %x\n",
+	    (uint64_t)dcfg, (uint64_t)(dcfg & 7));
+}
+
+/*
+ * CHIRON_DWC3_DEVICE_MODE
+ *
+ * GCTL.PrtCapDir (bits 13:12) = 1 means HOST: 00/01 host, 10 device, 11 OTG.
+ * Every log so far showed GCTL=0x00112000, i.e. host mode, which is why the core
+ * ran, the PLL locked and the PHY was programmed correctly, yet DSTS never
+ * reported Connected -- a host-mode controller has no device pull-up to present.
+ *
+ * dwc3_core_init_mode() does it like this; so does this.
+ */
+static void
+chiron_dwc3_device_mode(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t gctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC110);
+
+	print("dwc3: GCTL before %x dir %x\n",
+	    (uint64_t)gctl, (uint64_t)((gctl >> 12) & 3));
+
+	gctl &= ~(3u << 12);            /* clear PrtCapDir */
+	gctl |= (2u << 12);             /* DEVICE */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC110) = gctl;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	gctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC110);
+	print("dwc3: GCTL after %x dir %x\n",
+	    (uint64_t)gctl, (uint64_t)((gctl >> 12) & 3));
+}
+
+/*
+ * CHIRON_QUSB2_RESUME
+ *
+ * Take the PHY's link out of susnd.  The core runs and the PLL is locked, yet
+ * DSTS keeps reporting LinkState=2 (SUSPEND); these are the writes the driver's
+ * resume path makes (phy-msm-qusb-v2.c, qusb_phy_set_suspend(..., 0)):
+ *
+ *   QUSB2PHY_PLL_ANALOG_CONTROLS_ONE   0x000 = 0x80   (clock bypass off)
+ *   QUSB2PHY_PLL_ANALOG_CONTROLS_TWO   0x004 = analog_ctrl_two (default 0x8c)
+ *   QUSB2PHY_INTR_CTRL                 0x22C = 0x00   (clear all interrupts)
+ *   QUSB2PHY_TEST1                     0x24C = 0x91, then 0x90   (auto-resume)
+ *
+ * The last pair is what lets the PHY leave suspend when the host drives the bus.
+ */
+static void
+chiron_qusb2_resume(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+
+	/*
+	 * 0x004 keeps the value the init sequence wrote (0x13).  The driver saves it
+	 * on suspend and writes the same value back on resume; it is not 0x8c.
+	 */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x000) = 0x80;
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x22C) = 0x00;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x24C) = 0x91;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x24C) = 0x90;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("qusb2: resume r0 %x r4 %x r22c %x r24c %x\n",
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x000),
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x004),
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x22C),
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x24C));
+}
+
+/*
+ * CHIRON_DWC3_LATE_RUN
+ *
+ * UsbConfigDxe handles the USB init event by resetting the controller, and then
+ * leaves DCTL.RunStop at 0 -- the snapshots show DCTL=0x00f00000 from just before
+ * start_ex all the way into the command loop.  In the stock firmware UsbInitDxe
+ * starts it again; that module cannot run in this build, so this loader does it,
+ * after start_ex, and clears the auto-suspend bits the way dwc3-msm.c does.
+ */
+static void
+chiron_dwc3_late_run(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t gusb2, dctl, dsts;
+
+	gusb2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
+	gusb2 &= ~((1u << 8) | (1u << 6));      /* ENBLSLPM | SUSPHY */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC200) = gusb2;
+
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	dctl &= ~(1u << 30);
+	dctl |= (1u << 31);                     /* RunStop */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
+
+	chiron_udelay(200000);                  /* 200 ms for a host to answer */
+
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	gusb2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
+	print("late: DCTL %x run %x | DSTS %x conn %x link %x | CFG %x\n",
+	    (uint64_t)dctl, (uint64_t)((dctl >> 31) & 1),
+	    (uint64_t)dsts, (uint64_t)((dsts >> 24) & 1),
+	    (uint64_t)((dsts >> 18) & 0xf), (uint64_t)gusb2);
+}
+
+/* CHIRON_DWC3_SNAP: say where the controller stands, at a named point. */
+static void
+chiron_dwc3_snap(const char *where)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	const uint64_t phy = 0xC012000ULL;
+	uint32_t gctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC110);
+	uint32_t dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	uint32_t dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+	uint8_t  pll  = *(volatile uint8_t *)(uintptr_t)(phy + 0x1A0);
+	uint8_t  pwrc = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
+	uint8_t  istat = *(volatile uint8_t *)(uintptr_t)(phy + 0x230);
+
+	print("snap ", 0);
+	print((char *)where, 0);
+	/* PRTCAP(13:12)  RUN_STOP(31)  DEVCTRLHLT(22)  USBLNKST(21:18) */
+	print(" cap %x run %x hlt %x lkst %x spd %x | pll %x pw%x ln %x\n",
+	    (uint64_t)((gctl >> 12) & 3),
+	    (uint64_t)((dctl >> 31) & 1),
+	    (uint64_t)((dsts >> 22) & 1),
+	    (uint64_t)((dsts >> 18) & 0xf),
+	    (uint64_t)(dcfg & 7),
+	    (uint64_t)pll, (uint64_t)pwrc, (uint64_t)istat);
+}
+
+static void
+chiron_dwc3_run(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t dctl, dsts, gusb2;
+
+	/* the PHY must not be in suspend */
+	gusb2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
+	print("dwc3: GUSB2PHYCFG0 %x\n", (uint64_t)gusb2);
+	if (gusb2 & (1u << 6)) {
+		gusb2 &= ~(1u << 6);
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC200) = gusb2;
+		print("dwc3: cleared SUSPENDUSB2 -> %x\n", (uint64_t)gusb2);
+	}
+
+	/* run the core */
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	dctl &= ~(1u << 30);
+	dctl |= (1u << 31);
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
+
+	/* and ask the link to come out of suspend */
+	dctl |= (1u << 8);                      /* ULStChngReq */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
+
+	{
+		uint64_t freq = 0, began = 0, now = 0;
+
+		__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (freq));
+		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (began));
+		for (;;) {
+			dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+			if (dsts & (1u << 24)) break;
+			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
+			if (now - began > freq / 2) break;
+		}
+	}
+
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	print("dwc3: DCTL %x runstop %x ulst %x\n",
+	    (uint64_t)dctl, (uint64_t)((dctl >> 31) & 1), (uint64_t)((dctl >> 8) & 1));
+	print("dwc3: DSTS %x conn %x link %x speed %x\n", (uint64_t)dsts,
+	    (uint64_t)((dsts >> 24) & 1), (uint64_t)((dsts >> 22) & 3), (uint64_t)(dsts & 7));
+}
+
 static int
 usb_start(void)
 {
@@ -4259,7 +4712,32 @@ usb_start(void)
 	static usb_device_descriptor_set set;
 	void *event;
 
+	/*
+	 * CHIRON_CHARGER_FOR_USB
+	 *
+	 * UsbConfigDxe asks the PMIC and the charger port whether anything is plugged
+	 * in and never announces a connection without an answer, so the controller
+	 * starts and then waits for a host that was never told to look.  charger_start()
+	 * opens those protocols; it used to run only for battery=1, and the earlier
+	 * decision point runs before the payload entries are parsed, so do it here --
+	 * the one place that is certainly a USB session.
+	 */
+	/*
+	 * CHIRON_SNAP_ENTRY
+	 *
+	 * Measured first, before signal_event() and before any write of our own: this
+	 * is what the firmware's own USB stack left behind -- the one fastboot was
+	 * using successfully moments ago.
+	 */
+	chiron_dwc3_snap("0-ENTRY");
+
+	charger_start();
+
 	chiron_depex_check();
+	chiron_clocks_on();
+	chiron_qusb2_init();
+	chiron_dwc3_run();
+	flush_log();
 	/* Ask the platform to bring the controller up in peripheral mode (as the stock fastboot does). */
 	if (!EFI_ERROR(BS->create_event_ex(0x200 /* EVT_NOTIFY_SIGNAL */, 8 /* TPL_CALLBACK */, usb_dummy_notify, NULL,
 	    &init_guid, &event))) {
@@ -4269,25 +4747,6 @@ usb_start(void)
 	if (EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&USB))) {
 		print("usb: device protocol not found\n");
 		return 0;
-	}
-	/*
-	 * CHIRON_USBFN_START
-	 *
-	 * Bring the DWC3 core up before asking UsbDeviceDxe to enumerate.  Without
-	 * this StartEx() answers EFI_UNSUPPORTED (0x800000000000000e) however the
-	 * descriptors are arranged, because there is no controller behind them.
-	 */
-	{
-		static const efi_guid usbfn_guid = QCOM_USBFN_IO_GUID;
-		efi_usbfn_io *fn = NULL;
-
-		if (!EFI_ERROR(BS->locate_protocol(&usbfn_guid, NULL, (void **)&fn)) && fn != NULL &&
-		    fn->start_controller != NULL) {
-			efi_status st2 = fn->start_controller(fn);
-			print("usb: usbfn StartController -> %x\n", (uint64_t)st2);
-		} else {
-			print("usb: no UsbFnIo protocol to start the controller with\n");
-		}
 	}
 	set.device_descriptor = usb_dev_desc;
 	set.descriptors = &cfg;
@@ -4305,11 +4764,25 @@ usb_start(void)
 		print("usb: incomplete Qualcomm USB interface\n");
 		return 0;
 	}
+	chiron_dwc3_snap("A-before-start_ex");
 	efi_status s = USB->start_ex(&set);
+	chiron_dwc3_snap("B-after-start_ex");
+	chiron_dwc3_highspeed();
+	chiron_dwc3_device_mode();
+	chiron_qusb2_resume();
+	chiron_dwc3_late_run();
 	if (EFI_ERROR(s)) {
 		print("usb: start failed %x\n", s);
 		return 0;
 	}
+	/*
+	 * CHIRON_USB_PRESENTED
+	 *
+	 * StartEx succeeding means the firmware has been told to present the device.
+	 * Say it: "started but blind" and "presented but blind" point at different
+	 * faults, and until now the log could not tell them apart.
+	 */
+	print("usb: device presented (start_ex ok); waiting for the host\n");
 	if (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
 	    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf))) {
 		print("usb: no transfer buffers\n");
@@ -4339,13 +4812,24 @@ usb_wait(uint8_t endpoint)
 	 * way out short of holding the power key.
 	 */
 	unsigned polls = 0;
-	const unsigned poll_limit = 2000000;    /* millions of cheap polls, then give up */
+	const unsigned poll_limit = 20000;      /* CHIRON_USB_PRE_POLL: cheap polls, then give up */
 
 	for (;;) {
 		uint32_t msg = UsbDeviceEventNoEvent;
 		uint64_t size = 0;
 		usb_device_event_data data;
 
+		/*
+		 * CHIRON_USB_PRE_POLL
+		 *
+		 * Check the budget BEFORE calling in, because handle_event() is the call
+		 * that does not return when no host is attached: a counter incremented
+		 * after it can never be reached.  Two limits, whichever comes first:
+		 * the wall clock (3 s) and a hard pass count.
+		 */
+		if (++polls > poll_limit) {
+			return -1;
+		}
 		USB->handle_event(&msg, &size, &data);
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
@@ -4361,9 +4845,6 @@ usb_wait(uint8_t endpoint)
 		 */
 		if (READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
 			return -1;
-		}
-		if (++polls > poll_limit) {
-			return -1;              /* CHIRON_USB_WAIT_BOUNDED */
 		}
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
 			return data.transfer.status == UsbDeviceTransferStatusCompleteOK ? (int64_t)data.transfer.bytes_completed : -1;
@@ -4663,12 +5144,78 @@ usb_command_loop(void)
 	}
 	idle_limit = idle_freq * (uint64_t)idle_secs;
 
+	/*
+	 * CHIRON_USB_LOOP_ENTER
+	 *
+	 * Say we are here, and put it in logfs before touching the controller: if the
+	 * log stops after this line the very first USB call is what hangs, and if this
+	 * line never appears usb_command_loop() was never reached.
+	 */
+	print("usb: command loop entered\n");
+	flush_log();
+
+	/*
+	 * CHIRON_DWC3_SNAP at C
+	 *
+	 * A second after the loop starts, the driver has had its say.  Comparing this
+	 * with B says whether our RunStop write survives or the driver undoes it.
+	 */
+	{
+		uint64_t freq = 0, began = 0, now = 0;
+
+		__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (freq));
+		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (began));
+		for (;;) {
+			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
+			if (now - began > freq) {
+				break;
+			}
+		}
+	}
+	chiron_dwc3_snap("C-in-loop-1s");
+	/*
+	 * CHIRON_QUSB2_STAT: the PHY's own view of the wire.  INTR_STAT (0x230)
+	 * carries the single-ended D+/D- levels (DPSE / DMSE).
+	 */
+	{
+		const uint64_t phy = 0xC012000ULL;
+
+		print("phy230 ", 0);
+		for (uint32_t off = 0x200; off <= 0x250; off += 0x10) {
+			print("+", (uint64_t)off);
+			print("=", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + off));
+			print(" ", 0);
+		}
+		print("\n", 0);
+		for (uint32_t off = 0; off <= 0x30; off += 0x10) {
+			print("lo+", (uint64_t)off);
+			print("=", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + off));
+			print(" ", 0);
+		}
+		print("\n", 0);
+	}
+	flush_log();
+
 	screen_quiet = 1;
 	for (;;) {
 		char cmd[128];
+		uint64_t pass_now = 0;
+
+		/*
+		 * CHIRON_USB_NO_SPAM
+		 *
+		 * Nothing here may run once per pass without a bound: an unconditional
+		 * flush_log() writes the log partition every iteration, and a print() per
+		 * pass makes the graphics console blit the framebuffer for every newline,
+		 * which is what kept the phone unresponsive and stopped the deadline below
+		 * from ever being reached.
+		 */
+		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (pass_now));
+
 		int64_t n;
 		uint64_t idle_now = 0;
 
+		/* CHIRON_USB_NO_SPAM: checked first, every pass, cheaply */
 		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (idle_now));
 		if (idle_now - idle_from > idle_limit) {
 			print("\n== USB session idle for %d s; resetting ==\n", (uint64_t)idle_secs);
@@ -4690,13 +5237,24 @@ usb_command_loop(void)
 			if (!announced || idle_now - said_disconnected > idle_freq * 5) {
 				announced = 1;
 				said_disconnected = idle_now;
-				print("usb: waiting for a host to connect (%d s of %d)\n",
-				    (idle_now - idle_from) / idle_freq, (uint64_t)idle_secs);
+				print("usb: waiting for a host (%d s of %d) connected=%d\n",
+				    (idle_now - idle_from) / idle_freq, (uint64_t)idle_secs,
+				    (uint64_t)(usb_connected != 0));
 			}
 			continue;
 		}
 		n = usb_rx(usb_rx_buf, 511);
 		if (n <= 0) {
+			/* CHIRON_USB_LOOP_ENTER: a wait that returned nothing */
+			static uint64_t said_nothing;
+			uint64_t t = 0;
+
+			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (t));
+			if (said_nothing == 0 || t - said_nothing > idle_freq * 3) {
+				said_nothing = t;
+				print("usb: no command yet (connected=%d)\n",
+				    (uint64_t)(usb_connected != 0));
+			}
 			continue;
 		}
 		if (n > (int64_t)sizeof(cmd) - 1) {

@@ -1085,6 +1085,8 @@ dump_partitions(void)
 
 /* CHIRON_AUTO_REBOOT: boot-arg reboot=1 hands the phone back to Android when a run ends. */
 static int auto_reboot;
+/* CHIRON_USB_IDLE_RESET: seconds a USB session may sit with no command (usb_idle=N) */
+static int usb_idle_seconds;
 
 static void
 reboot(void)
@@ -3167,6 +3169,8 @@ parse_payload(struct payload_info *pi, int verbose)
 			pi->checkpoint = parse_number(text, 10);  /* where the kernel should stop and come back */
 		} else if (str_eq(e->name, "usb")) {
 			pi->usb_mode = 1;                         /* stay in the loader and take commands over USB */
+		} else if (str_eq(e->name, "usb_idle")) {
+			usb_idle_seconds = (int)parse_number(text, 10);   /* CHIRON_USB_IDLE_RESET */
 		}
 		p += sizeof(*e) + ((e->size + 15) & ~15u);
 	}
@@ -4103,6 +4107,148 @@ usb_dummy_notify(void *event, void *ctx)
 {
 }
 
+
+static void
+proto_dump(void)
+{
+	static const efi_guid usb_dev = QCOM_USB_DEVICE_GUID;
+	static const efi_guid usbfn = QCOM_USBFN_IO_GUID;
+	efi_handle *h = NULL;
+	uint64_t n = 0;
+
+	if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &usb_dev, NULL, &n, &h)) && n)
+		print("proto: UsbDevice %d\n", n);
+	else
+		print("proto: UsbDevice ABSENT\n");
+	if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &usbfn, NULL, &n, &h)) && n)
+		print("proto: UsbfnIo %d\n", n);
+	else
+		print("proto: UsbfnIo ABSENT\n");
+}
+
+/*
+ * CHIRON_DEPEX_CHECK
+ *
+ * UsbfnDwc3Dxe is in the volume and listed after everything it names, yet
+ * gEfiUsbfnIoProtocolGuid never appears -- so one of the protocols in its depex
+ * is never satisfied and the driver is never dispatched.  The depex is one AND
+ * over fifteen GUIDs; check every one of them and say which are missing.
+ *
+ * The table is generated from the driver's own .depex, so it cannot drift.
+ */
+static const struct {
+	const char *name;
+	efi_guid guid;
+} chiron_depex_deps[] = {
+	{"gEfiDriverBindingProtocolGuid", {0x18a031ab, 0xb443, 0x4d1a, {0xa5, 0xc0, 0x0c, 0x09, 0x26, 0x1e, 0x9f, 0x71}}},
+	{"dep01", {0x76b95dad, 0x1e66, 0x4d98, {0x9c, 0xe7, 0xb2, 0x94, 0xd9, 0x59, 0x68, 0x95}}},
+	{"gEfiPlatformInfoProtocolGuid", {0x157a5c45, 0x21b2, 0x43c5, {0xba, 0x7c, 0x82, 0x2f, 0xee, 0x5f, 0xe5, 0x99}}},
+	{"gEfiBdsArchProtocolGuid", {0x665e3ff6, 0x46cc, 0x11d4, {0x9a, 0x38, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d}}},
+	{"gEfiCpuArchProtocolGuid", {0x26baccb1, 0x6f42, 0x11d4, {0xbc, 0xe7, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81}}},
+	{"gEfiMetronomeArchProtocolGuid", {0x26baccb2, 0x6f42, 0x11d4, {0xbc, 0xe7, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81}}},
+	{"gEfiMonotonicCounterArchProtocolGuid", {0x1da97072, 0xbddc, 0x4b30, {0x99, 0xf1, 0x72, 0xa0, 0xb5, 0x6f, 0xff, 0x2a}}},
+	{"gEfiRealTimeClockArchProtocolGuid", {0x27cfac87, 0x46cc, 0x11d4, {0x9a, 0x38, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d}}},
+	{"gEfiResetArchProtocolGuid", {0x27cfac88, 0x46cc, 0x11d4, {0x9a, 0x38, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d}}},
+	{"gEfiRuntimeArchProtocolGuid", {0xb7dfb4e1, 0x052f, 0x449f, {0x87, 0xbe, 0x98, 0x18, 0xfc, 0x91, 0xb7, 0x33}}},
+	{"gEfiSecurityArchProtocolGuid", {0xa46423e3, 0x4617, 0x49f1, {0xb9, 0xff, 0xd1, 0xbf, 0xa9, 0x11, 0x58, 0x39}}},
+	{"gEfiTimerArchProtocolGuid", {0x26baccb3, 0x6f42, 0x11d4, {0xbc, 0xe7, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81}}},
+	{"gEfiVariableWriteArchProtocolGuid", {0x6441f818, 0x6362, 0x4e44, {0xb5, 0x70, 0x7d, 0xba, 0x31, 0xdd, 0x24, 0x53}}},
+	{"gEfiVariableArchProtocolGuid", {0x1e5668e2, 0x8481, 0x11d4, {0xbc, 0xf1, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81}}},
+	{"gEfiWatchdogTimerArchProtocolGuid", {0x665e3ff5, 0x46cc, 0x11d4, {0x9a, 0x38, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d}}}
+};
+
+static void
+chiron_depex_check(void)
+{
+	unsigned missing = 0;
+	unsigned total = sizeof(chiron_depex_deps) / sizeof(chiron_depex_deps[0]);
+
+	print("depex: UsbfnDwc3Dxe needs %d protocols\n", (uint64_t)total);
+	for (unsigned i = 0; i < total; i++) {
+		efi_handle *h = NULL;
+		uint64_t n = 0;
+
+		if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &chiron_depex_deps[i].guid,
+		    NULL, &n, &h)) && n != 0) {
+			continue;
+		}
+		missing++;
+		print("depex: MISSING %s\n", (uint64_t)(uintptr_t)chiron_depex_deps[i].name);
+	}
+	print("depex: %d of %d missing\n", (uint64_t)missing, (uint64_t)total);
+}
+
+
+/*
+ * CHIRON_PSCI_RESET
+ *
+ * The one way to reset this phone that needs no driver at all: PSCI SYSTEM_RESET
+ * over SMC (chiron's platform entry has psci_hvc = 0).  Used when the loader has
+ * to give up while a USB session may not be answering -- there is no watchdog on
+ * this platform, so otherwise the phone sits until someone holds the power key.
+ *
+ * SYSTEM_RESET, function 0x00000009 in the PSCI control range: a0 = 0x84000009,
+ * a1 = 0 Cold Reset, a2 = 0 no vendor-specific reason, a3.. = 0.
+ */
+static void
+chiron_psci_reset(void)
+{
+	register uint64_t a0 __asm__("x0") = 0x84000009ULL;
+	register uint64_t a1 __asm__("x1") = 0;         /* cold reset */
+	register uint64_t a2 __asm__("x2") = 0;
+	register uint64_t a3 __asm__("x3") = 0;
+
+	__asm__ volatile ("smc #0" : "+r" (a0) : "r" (a1), "r" (a2), "r" (a3) : "memory");
+	/* if the SMC came back, fall through and let UEFI try */
+	if (ST != NULL && ST->rt != NULL && ST->rt->reset_system != NULL) {
+		ST->rt->reset_system(0, 0, 0, NULL);
+	}
+	for (;;) {
+	}
+}
+
+/*
+ * CHIRON_USB_HANDLE_BOUNDED
+ *
+ * USB->handle_event() is where a stalled session blocks: with the controller
+ * started but no host enumerating it, the Qualcomm driver's event call never
+ * returns, so no deadline inside usb_wait() can ever be checked.  Poll it a
+ * bounded number of times from here, and when the deadline passes, reset the
+ * phone instead of waiting for ever.
+ */
+static uint64_t usb_session_deadline;    /* CNTVCT value, 0 = no deadline */
+static uint64_t usb_session_freq;
+
+static void
+usb_session_begin(uint64_t seconds)
+{
+	uint64_t f = 0, now = 0;
+
+	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (f));
+	__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
+	if (f == 0) {
+		f = 19200000;
+	}
+	usb_session_freq = f;
+	usb_session_deadline = now + f * seconds;
+}
+
+static void
+usb_session_check(void)
+{
+	uint64_t now = 0;
+
+	if (usb_session_deadline == 0) {
+		return;
+	}
+	__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
+	if (now - usb_session_deadline < (1ULL << 63)) {       /* unsigned "not yet" */
+		return;
+	}
+	print("\n== USB session deadline reached; resetting the phone ==\n");
+	chiron_psci_reset();
+}
+
 static int
 usb_start(void)
 {
@@ -4113,6 +4259,7 @@ usb_start(void)
 	static usb_device_descriptor_set set;
 	void *event;
 
+	chiron_depex_check();
 	/* Ask the platform to bring the controller up in peripheral mode (as the stock fastboot does). */
 	if (!EFI_ERROR(BS->create_event_ex(0x200 /* EVT_NOTIFY_SIGNAL */, 8 /* TPL_CALLBACK */, usb_dummy_notify, NULL,
 	    &init_guid, &event))) {
@@ -4122,6 +4269,25 @@ usb_start(void)
 	if (EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&USB))) {
 		print("usb: device protocol not found\n");
 		return 0;
+	}
+	/*
+	 * CHIRON_USBFN_START
+	 *
+	 * Bring the DWC3 core up before asking UsbDeviceDxe to enumerate.  Without
+	 * this StartEx() answers EFI_UNSUPPORTED (0x800000000000000e) however the
+	 * descriptors are arranged, because there is no controller behind them.
+	 */
+	{
+		static const efi_guid usbfn_guid = QCOM_USBFN_IO_GUID;
+		efi_usbfn_io *fn = NULL;
+
+		if (!EFI_ERROR(BS->locate_protocol(&usbfn_guid, NULL, (void **)&fn)) && fn != NULL &&
+		    fn->start_controller != NULL) {
+			efi_status st2 = fn->start_controller(fn);
+			print("usb: usbfn StartController -> %x\n", (uint64_t)st2);
+		} else {
+			print("usb: no UsbFnIo protocol to start the controller with\n");
+		}
 	}
 	set.device_descriptor = usb_dev_desc;
 	set.descriptors = &cfg;
@@ -4164,6 +4330,16 @@ usb_wait(uint8_t endpoint)
 	/* static: a long transfer is many short waits, and the watchdog must be fed across them */
 	static uint64_t last_pet;
 	uint64_t freq = READ_SYSREG(CNTFRQ_EL0), began = READ_SYSREG(CNTVCT_EL0);
+	/*
+	 * CHIRON_USB_WAIT_BOUNDED
+	 *
+	 * handle_event() may not return at all when the controller is up and no host
+	 * ever attaches.  Poll a bounded number of times so the caller gets control
+	 * back and can act on its own deadline; without this the phone hangs with no
+	 * way out short of holding the power key.
+	 */
+	unsigned polls = 0;
+	const unsigned poll_limit = 2000000;    /* millions of cheap polls, then give up */
 
 	for (;;) {
 		uint32_t msg = UsbDeviceEventNoEvent;
@@ -4175,9 +4351,19 @@ usb_wait(uint8_t endpoint)
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
 			return -1;
 		}
-		/* with a kernel running, a host that went away must not keep this core from watching it */
-		if (running_live != NULL && READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
+		/*
+		 * CHIRON_USB_WAIT_TIMEOUT
+		 *
+		 * This used to give up only when running_live != NULL.  In USB mode there
+		 * is no kernel, so waiting for a cable state change spun for ever and the
+		 * idle deadline in usb_command_loop() was never reached -- which is why a
+		 * session with no host never reset the phone.  Always bound the wait.
+		 */
+		if (READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
 			return -1;
+		}
+		if (++polls > poll_limit) {
+			return -1;              /* CHIRON_USB_WAIT_BOUNDED */
 		}
 		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
 			return data.transfer.status == UsbDeviceTransferStatusCompleteOK ? (int64_t)data.transfer.bytes_completed : -1;
@@ -4467,13 +4653,46 @@ usb_poll_command(void)
 static void
 usb_command_loop(void)
 {
+	/* CHIRON_USB_IDLE_RESET: a host that never connects must not strand the phone */
+	uint64_t idle_freq = 0, idle_from = 0, idle_limit;
+	int idle_secs = usb_idle_seconds > 0 ? usb_idle_seconds : 300;
+	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (idle_freq));
+	__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (idle_from));
+	if (idle_freq == 0) {
+		idle_freq = 19200000;			/* msm8998 */
+	}
+	idle_limit = idle_freq * (uint64_t)idle_secs;
+
 	screen_quiet = 1;
 	for (;;) {
 		char cmd[128];
 		int64_t n;
+		uint64_t idle_now = 0;
 
+		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (idle_now));
+		if (idle_now - idle_from > idle_limit) {
+			print("\n== USB session idle for %d s; resetting ==\n", (uint64_t)idle_secs);
+			auto_reboot = 1;
+			reboot();
+		}
+
+		usb_session_check();
 		if (!usb_connected) {
-			usb_wait(0xff); /* returns on the next cable state change */
+			/*
+			 * CHIRON_USB_QUIET_WAIT: with no host attached this runs again and again.
+			 * Say it, but not on every pass.
+			 */
+			static uint64_t said_disconnected;
+			static int announced;
+
+			usb_wait(0xff);        /* bounded now, see usb_wait() */
+			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (idle_now));
+			if (!announced || idle_now - said_disconnected > idle_freq * 5) {
+				announced = 1;
+				said_disconnected = idle_now;
+				print("usb: waiting for a host to connect (%d s of %d)\n",
+				    (idle_now - idle_from) / idle_freq, (uint64_t)idle_secs);
+			}
 			continue;
 		}
 		n = usb_rx(usb_rx_buf, 511);
@@ -4483,6 +4702,7 @@ usb_command_loop(void)
 		if (n > (int64_t)sizeof(cmd) - 1) {
 			n = sizeof(cmd) - 1;
 		}
+		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (idle_from));   /* a live host */
 		memcpy(cmd, usb_rx_buf, (size_t)n);
 		cmd[n] = 0;
 		fb_command(cmd);
@@ -4631,9 +4851,18 @@ efi_main(efi_handle image, efi_system_table *st)
 	wdt_arm();
 
 	int have_payload = parse_payload(&pi, 0);
-	if (have_payload && pi.usb_mode && usb_start()) {
-		flush_log();
-		usb_command_loop();
+	/* CHIRON_USB_FAIL_RESET: no gadget means nothing to drive and nothing to boot;
+	 * go back to Android rather than sit on a black screen for ever. */
+	if (have_payload && pi.usb_mode) {
+		if (usb_start()) {
+			flush_log();
+			/* CHIRON_USB_HANDLE_BOUNDED: a session with no host must end by itself */
+			usb_session_begin(usb_idle_seconds > 0 ? (uint64_t)usb_idle_seconds : 300);
+			usb_command_loop();
+		}
+		print("\n== USB session unavailable; resetting ==\n");
+		auto_reboot = 1;
+		reboot();
 	}
 
 	/*

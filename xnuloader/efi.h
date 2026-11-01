@@ -34,7 +34,8 @@ typedef struct efi_text_output {
 
 enum { EfiLoaderData = 2, EfiConventionalMemory = 7 };
 enum { AllocateAnyPages = 0, AllocateMaxAddress = 1, AllocateAddress = 2 };
-enum { ByProtocol = 2 };
+enum { AllHandles = 0, ByRegisterNotify = 1, ByProtocol = 2 };
+typedef efi_status (EFIAPI *EFI_PROTOCOLS_PER_HANDLE)(efi_handle handle, efi_guid ***protocols, uint64_t *count);
 
 typedef struct {
 	uint32_t type; uint32_t pad; uint64_t phys_start; uint64_t virt_start; uint64_t pages; uint64_t attribute;
@@ -251,7 +252,18 @@ typedef struct {
 #define EFI_CPU_ARCH_GUID       { 0x26baccb1, 0x6f42, 0x11d4, { 0xbc, 0xe7, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81 } }
 #define QCOM_USB_DEVICE_GUID    { 0xd9d9ce48, 0x44b8, 0x4f49, { 0x8e, 0x3e, 0x2a, 0x3b, 0x92, 0x7d, 0xc6, 0xc1 } }
 #define QCOM_USB_INIT_EVENT_GUID { 0x1c0cffce, 0xfc8d, 0x4e44, { 0x8c, 0x78, 0x9c, 0x9e, 0x5b, 0x53, 0x0d, 0x36 } }
+/* gEfiUsbfnIoProtocolGuid (QcomPkg.dec): the DWC3 controller itself.
+ * StartController() here is what makes UsbDeviceDxe's StartEx() work; without
+ * it StartEx answers EFI_UNSUPPORTED. */
+#define QCOM_USBFN_IO_GUID      { 0x32d2963a, 0xfe5d, 0x4f30, { 0xb6, 0x33, 0x6e, 0x5d, 0xc5, 0x58, 0x03, 0xcc } }
 #define EFI_GOP_GUID            { 0x9042a9de, 0x23dc, 0x4a38, { 0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a } }
+/* gEfiUsbfnChgProtocolGuid: the charger/connection half of the DWC3 stack */
+#define QCOM_USBFN_CHG_GUID     { 0xb1ccba26, 0x6f42, 0xd411, { 0xbc, 0xe7, 0x00, 0x80, 0xc7, 0x3c, 0x88, 0x81 } }
+#define QCOM_PLATFORM_INFO_GUID { 0x157a5c45, 0x21b2, 0x43c5, { 0xba, 0x7c, 0x82, 0x2f, 0xee, 0x5f, 0xe5, 0x99 } }
+#define QCOM_CHIP_INFO_GUID     { 0xb0760469, 0x970c, 0x487a, { 0xa4, 0xb5, 0x28, 0xdb, 0x7b, 0x45, 0xce, 0xf1 } }
+#define QCOM_SMEM_GUID          { 0xf4e5c7d0, 0xd239, 0x47cb, { 0xaa, 0xcd, 0x7f, 0x66, 0xef, 0x76, 0x32, 0x38 } }
+#define QCOM_TLMM_GUID          { 0x2a9f2e27, 0x0a1e, 0x4b1c, { 0x8f, 0x3f, 0x1e, 0x2b, 0x00, 0x00, 0x00, 0x00 } }
+#define QCOM_CLOCK_GUID         { 0x241afae6, 0x885f, 0x4f6c, { 0xa7, 0xea, 0xc2, 0x8e, 0xab, 0x79, 0xc3, 0xe5 } }
 #define EFI_BLOCK_IO_GUID       { 0x964e5b21, 0x6459, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
 #define EFI_BLOCK_IO2_GUID      { 0xa77b2472, 0xe282, 0x4e9f, { 0xa2, 0x45, 0xc2, 0xc0, 0xe2, 0x7b, 0xbc, 0xc1 } }
 #define EFI_DEVICE_PATH_GUID    { 0x09576e91, 0x6d3f, 0x11d2, { 0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b } }
@@ -260,3 +272,33 @@ typedef struct {
 #define QCOM_CHARGER_GUID        { 0x21bfb78b, 0x02ea, 0x4ab7, { 0x99, 0x40, 0xb5, 0x8a, 0x2a, 0xd6, 0x58, 0x29 } }
 
 #endif /* XNULOADER_EFI_H */
+
+/*
+ * EFI_USBFN_IO_PROTOCOL, as far as this loader uses it.  The real struct has
+ * 18 methods in a fixed order (see QcomPkg/Include/Protocol/EFIUsbfnIo.h);
+ * only DetectPort and StartController are called, so everything before them
+ * is kept as opaque pointers to preserve the offsets.
+ */
+typedef struct efi_usbfn_io efi_usbfn_io;
+struct efi_usbfn_io {
+	void *detect_port;
+	void *configure_enable_endpoints;
+	void *get_endpoint_max_packet_size;
+	void *get_device_info;
+	void *get_vendor_id_product_id;
+	void *abort_transfer;
+	void *get_endpoint_stall_state;
+	void *set_endpoint_stall_state;
+	void *event_handler;
+	void *transfer;
+	void *get_max_transfer_size;
+	void *allocate_transfer_buffer;
+	void *free_transfer_buffer;
+	efi_status (*start_controller)(efi_usbfn_io *self);
+	efi_status (*stop_controller)(efi_usbfn_io *self);
+};
+
+/* EFI_USBFN_PORT_TYPE */
+enum { UsbfnUnknownPort = 0, UsbfnStandardDownstreamPort = 1,
+       UsbfnChargingDownstreamPort = 2, UsbfnDedicatedChargingPort = 3,
+       UsbfnInvalidDedicatedChargingPort = 4, UsbfnProprietaryCharger = 5 };

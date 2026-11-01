@@ -62,10 +62,10 @@ index a4d25040f38f..aad72993d139 100644
  kern_debug.o_INCFLAGS += -I$(SRCROOT)/osfmk
  
 diff --git a/bsd/conf/files b/bsd/conf/files
-index 44274016a4cf..0e3f31c5a751 100644
+index 44274016a4cf..eb208a994f8c 100644
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -109,6 +109,38 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
+@@ -109,6 +109,39 @@ bsd/dev/munge.c 			optional config_requires_u32_munging
  bsd/dev/unix_startup.c			standard
  
  bsd/dev/monotonic.c optional monotonic
@@ -82,6 +82,7 @@ index 44274016a4cf..0e3f31c5a751 100644
 +bsd/dev/redwood_cpufreq.c	standard
 +bsd/dev/redwood_adreno.c	standard
 +bsd/dev/chiron_adreno.c	standard
++bsd/dev/chiron_dsx.c	standard
 +bsd/dev/redwood_audio.c		standard
 +bsd/dev/redwood_virtio_sound.c	standard
 +bsd/dev/redwood_speaker.c	standard
@@ -104,7 +105,7 @@ index 44274016a4cf..0e3f31c5a751 100644
  bsd/dev/dev_perfmon.c optional config_perfmon
  
  bsd/libkern/crc32.c			standard
-@@ -155,6 +187,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
+@@ -155,6 +188,14 @@ bsd/miscfs/devfs/devfs_vfsops.c		optional devfs
  bsd/miscfs/mockfs/mockfs_fsnode.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vfsops.c	optional mockfs
  bsd/miscfs/mockfs/mockfs_vnops.c	optional mockfs
@@ -119,7 +120,7 @@ index 44274016a4cf..0e3f31c5a751 100644
  
  bsd/miscfs/routefs/routefs_ops.c	optional routefs
  
-@@ -361,6 +401,7 @@ bsd/security/audit/audit_syscalls.c		standard
+@@ -361,6 +402,7 @@ bsd/security/audit/audit_syscalls.c		standard
  bsd/security/audit/audit_worker.c		optional config_audit
  
  bsd/pthread/pthread_shims.c		standard
@@ -127,7 +128,7 @@ index 44274016a4cf..0e3f31c5a751 100644
  bsd/pthread/pthread_priority.c		standard
  bsd/pthread/pthread_workqueue.c		standard
  
-@@ -383,6 +424,7 @@ bsd/kern/kern_debug.c			standard
+@@ -383,6 +425,7 @@ bsd/kern/kern_debug.c			standard
  bsd/kern/kern_symfile.c			standard
  bsd/kern/kern_descrip.c			standard
  bsd/kern/kern_guarded.c			standard
@@ -472,7 +473,7 @@ index 95192dd62449..b00da803b5b4 100644
  
  	/*
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 1d71c66629fb..3e1737c21b86 100644
+index 1d71c66629fb..b24115d076ec 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -1157,6 +1157,9 @@ SYSCTL_PROC(_vm, OID_AUTO, shared_region_control,
@@ -800,7 +801,42 @@ index 1d71c66629fb..3e1737c21b86 100644
  	task_set_uniqueid(task);
  	set_security_token_task_internal(p, task);
  
-@@ -7538,6 +7745,11 @@ process_signature(proc_t p, struct image_params *imgp)
+@@ -6933,6 +7140,34 @@ load_init_program(proc_t p)
+ 	}
+ #endif
+ 
++	/*
++	 * CHIRON_INITPATH
++	 *
++	 * init_path=<path> names process 1 directly.  The image this port boots from
++	 * holds /sbin/init and nothing called launchd, so the list below cannot
++	 * succeed there; naming the program is simpler than pretending the image is
++	 * a full iOS root.
++	 */
++	{
++		char init_path[128];
++
++		if (PE_parse_boot_argn("init_path", init_path, sizeof(init_path))) {
++			printf("load_init_program: init_path says %s\n", init_path);
++			error = load_init_program_at_path(p, (user_addr_t)scratch_addr, init_path);
++			/*
++			 * CHIRON_INIT_RET: execve returning 0 means process 1 is now that
++			 * program and this never runs again.  Saying so distinguishes "init
++			 * never started" from "init ran and exited", which look the same from
++			 * the log otherwise.
++			 */
++			printf("load_init_program: %s returned %d%s\n", init_path, error,
++			    error ? "" : " (process 1 handed over)");
++			if (!error) {
++				return;
++			}
++		}
++	}
++
+ 	error = ENOENT;
+ 	for (i = 0; i < sizeof(init_programs) / sizeof(init_programs[0]); i++) {
+ 		printf("load_init_program: attempting to load %s\n", init_programs[i]);
+@@ -7538,6 +7773,11 @@ process_signature(proc_t p, struct image_params *imgp)
  	}
  
  done:

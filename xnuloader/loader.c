@@ -4139,21 +4139,25 @@ static efi_handle usb_dev_handle;
  * DCTL fields this port never programs.
  */
 static const uint8_t usb_dev_desc[18] = { 18, 1, 0x00, 0x02, 0, 0, 0, 64, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
-static const uint8_t usb_ss_dev_desc[18] = { 18, 1, 0x00, 0x03, 0, 0, 0, 9, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
 static const uint8_t usb_cfg_desc[32] = {
 	9, 2, 32, 0, 1, 1, 0, 0x80, 0x50,
 	9, 4, 0, 0, 2, 0xff, 0x42, 0x03, 4,   /* fastboot interface */
 	7, 5, USB_EP_IN, 2, 0x00, 0x02, 0,
 	7, 5, USB_EP_OUT, 2, 0x00, 0x02, 0,
 };
-static const uint8_t usb_ss_cfg_desc[44] = {
-	9, 2, 44, 0, 1, 1, 0, 0x80, 0x10,
-	9, 4, 0, 0, 2, 0xff, 0x42, 0x03, 4,
-	7, 5, USB_EP_IN, 2, 0x00, 0x04, 0,   6, 0x30, 4, 0, 0, 0,
-	7, 5, USB_EP_OUT, 2, 0x00, 0x04, 0,  6, 0x30, 4, 0, 0, 0,
-};
 /* bcdUSB 0x0200, class unknown, EP0 max packet 64, 1 config */
-static const uint8_t usb_qualifier[10] = { 10, 6, 0x00, 0x02, 0xff, 0xff, 0xff, 64, 1, 0 };
+/*
+ * The device qualifier has to carry the same class triple as the device descriptor --
+ * USB 2.0 9.6.2 -- and it did not: this said 0xff/0xff/0xff while usb_dev_desc says
+ * 0/0/0.  Class 0 is the correct one here ("specified at the interface level"), because
+ * the configuration descriptor declares 0xff/0x42/0x03 for the fastboot interface.  A host
+ * that validates the descriptor set as a whole can reject a set that contradicts itself,
+ * and that presents as silence rather than as an error.
+ *
+ * bcdUSB 0x0200, bMaxPacketSize0 64 and bNumConfigurations 1 already agreed with the
+ * device descriptor; only the class triple did not.
+ */
+static const uint8_t usb_qualifier[10] = { 10, 6, 0x00, 0x02, 0x00, 0x00, 0x00, 64, 1, 0 };
 static const uint8_t usb_bos[42] = {
 	5, 0x0f, 42, 0, 3,
 	7, 0x10, 0x02, 0x06, 0, 0, 0,
@@ -6506,7 +6510,13 @@ usb_start(void)
 {
 	static const efi_guid usb_guid = QCOM_USB_DEVICE_GUID;
 	static const efi_guid init_guid = QCOM_USB_INIT_EVENT_GUID;
-	static const void *cfg = usb_cfg_desc, *ss_cfg = usb_ss_cfg_desc;
+	/*
+	 * Only the USB2 descriptor set is passed.  chiron is micro-USB with a USB2-only
+	 * QUSB2 phy: bcdUSB reads 0x0200 and there is no BOS, so the SuperSpeed descriptor
+	 * set and its device qualifier are written out as NULL further down.  The old
+	 * ss_cfg pointer here was never referenced -- a remnant of the USB3 path.
+	 */
+	static const void *cfg = usb_cfg_desc;
 	static const void *strings[5] = { usb_str0, usb_str_mfr, usb_str_prod, usb_str_serial, usb_str_iface };
 	static usb_device_descriptor_set set;
 	void *event;

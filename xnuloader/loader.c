@@ -4124,6 +4124,8 @@ static int usb_hk6_only_mode;
 static int usb_diag_mode;
 /* usb_no_epcfg=1: let UsbDeviceDxe configure endpoints, do not do it first. */
 static int usb_no_epcfg_mode;
+/* usb_extra_start=1: also call UsbFnIo::StartController ourselves. */
+static int usb_extra_start_mode;
 /* the USB Config handle chiron_pick_usb_device() selected */
 static efi_handle usb_dev_handle;
 
@@ -6234,13 +6236,29 @@ chiron_usbfn_endpoints(void)
 	print("%x", (uint64_t)se);
 	print("\n", 0);
 
-	if (fn->start_controller != NULL) {
-		ss = fn->start_controller(fn);
-		print("usbfn: start_controller ", 0);
-		print("%x", (uint64_t)ss);
-		print("\n", 0);
+	/*
+	 * CHIRON_DO_NOT_DOUBLE_START
+	 *
+	 * StartEx starts this controller itself -- UsbDeviceDxe.efi carries "Failed to Start
+	 * USB Controller" in its StartEx error sequence -- so calling StartController here
+	 * as well starts the same controller twice, with the endpoint configuration only
+	 * half done at the time, because this function runs before start_ex.
+	 *
+	 * UsbfnDwc3Dxe's "physical endpoint %d is in invalid state %d" is what that
+	 * produces.  Off by default; usb_extra_start=1 restores the old behaviour so a
+	 * comparison run can show what the extra start costs.
+	 */
+	if (usb_extra_start_mode) {
+		if (fn->start_controller != NULL) {
+			ss = fn->start_controller(fn);
+			print("usbfn: start_controller (extra, requested) ", 0);
+			print("%x", (uint64_t)ss);
+			print("\n", 0);
+		} else {
+			print("usbfn: no start_controller\n");
+		}
 	} else {
-		print("usbfn: no start_controller\n");
+		print("usbfn: start_controller left to start_ex\n");
 	}
 	return !EFI_ERROR(se);
 }
@@ -6536,6 +6554,7 @@ usb_start(void)
 	usb_hk6_only_mode = 0;
 	usb_diag_mode = 0;
 	usb_no_epcfg_mode = 0;
+	usb_extra_start_mode = 0;
 	{
 		struct payload_info npi;
 
@@ -6584,6 +6603,11 @@ usb_start(void)
 				if (starts_with(c, "usb_no_epcfg=1") &&
 				    (c[14] == 0 || c[14] == ' ')) {
 					usb_no_epcfg_mode = 1;
+				}
+				/* "usb_extra_start=1" is 17 characters */
+				if (starts_with(c, "usb_extra_start=1") &&
+				    (c[17] == 0 || c[17] == ' ')) {
+					usb_extra_start_mode = 1;
 				}
 			}
 		}

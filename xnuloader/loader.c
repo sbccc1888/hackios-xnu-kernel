@@ -6998,39 +6998,47 @@ usb_poll_command(void)
 	}
 
 	/*
-	 * CHIRON_POLL_GATED
+	 * CHIRON_PUMP_EVERY_PASS
 	 *
-	 * This runs once per pass of the kernel-watch loop, and handle_event does not
-	 * return when nothing is pending -- the same trap that lost the phone earlier
-	 * in this session.  usb_wait() was given a budget for it; this path never was.
+	 * UsbDeviceDxe is this device's class driver -- its binary carries
+	 * UsbDeviceHandleEvent, EfiUsbMsgSetupPacket, Dev_Common_SetupPkt and the UsbFnIo
+	 * GUID -- so it is what answers GET_DESCRIPTOR on EP0.  It only does that while
+	 * something pumps USB->handle_event().
 	 *
-	 * Ask the controller first: GEVNTCOUNT (0xC40C) says whether there is an event
-	 * to collect.  Zero pending means the call would block for nothing, so skip it
-	 * and leave the loop free.  A short time budget guards the case where events
-	 * keep arriving, so this loop can never be held here.
+	 * An earlier version of this loop gated the call on GEVNTCOUNT being non-zero.
+	 * That was wrong: GEVNTCOUNT counts the controller's event ring, while a setup
+	 * packet reaches the driver by its own path.  With the ring empty the gate
+	 * skipped the call, the setup packet was never collected, and the host got no
+	 * descriptor -- which matches the measurement exactly: link at U0 and high speed
+	 * (so the bus reset happened) with the device address still zero.
+	 *
+	 * So call in every pass.  The original hazard was that the call does not return
+	 * when nothing is pending; the answer is to bound it rather than to skip it, and
+	 * to keep the watchdog fed so the reset path stays reachable if it never returns.
 	 */
 	{
-		static uint64_t drained_began;
+		uint64_t t0 = READ_SYSREG(CNTVCT_EL0);
 		uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
-		uint64_t now = READ_SYSREG(CNTVCT_EL0);
-		unsigned passes;
 
-		if (drained_began == 0 || now - drained_began > freq) {
-			drained_began = now;
-		}
-		for (passes = 0; passes < 8; passes++) {
-			uint32_t pending = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C);
-			uint64_t t = READ_SYSREG(CNTVCT_EL0);
+		(void)freq;
+		USB->handle_event(&msg, &size, &data);
 
-			if ((pending & 0xfffc) == 0) {
-				return;                 /* nothing waiting: do not call in */
-			}
-			if (t - drained_began > freq / 100) {   /* 10 ms of draining at most */
-				return;
-			}
-			USB->handle_event(&msg, &size, &data);
-			if (msg != UsbDeviceEventNoEvent) {
-				break;
+		/*
+		 * If that call was slow, do not compound it; a single call per pass is
+		 * enough for the class driver to drain what is waiting, and the loop will
+		 * come back around immediately.
+		 */
+		{
+			uint64_t t1 = READ_SYSREG(CNTVCT_EL0);
+
+			if (t1 - t0 > READ_SYSREG(CNTFRQ_EL0) / 100) {
+				/* took longer than 10 ms: note it once and carry on */
+				static int said_slow;
+
+				if (!said_slow) {
+					said_slow = 1;
+					print("usb: handle_event slow (%d ticks)\n", t1 - t0);
+				}
 			}
 		}
 	}

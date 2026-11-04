@@ -7193,10 +7193,24 @@ usb_command_loop(void)
 
 		__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (freq));
 		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (began));
-		for (;;) {
+		/*
+		 * CHIRON_BUDGET_BEFORE_CALL (second site)
+		 *
+		 * The budget check belongs before handle_event, not after it.  The call does
+		 * not return when nothing is pending, so a check placed after it is
+		 * unreachable and one stalled call hangs the loop.  This is the fourth time
+		 * this shape has appeared in this session; a full audit of call sites found
+		 * it here after the same mistake had already been fixed twice elsewhere.
+		 */
+		while (pumped < 200000) {
 			uint32_t m = UsbDeviceEventNoEvent;
 			uint64_t sz = 0;
 			usb_device_event_data d;
+
+			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
+			if (now - began > freq) {           /* 1 s */
+				break;
+			}
 
 			memset(&d, 0, sizeof(d));
 			USB->handle_event(&m, &sz, &d);
@@ -7205,10 +7219,8 @@ usb_command_loop(void)
 			if (m == UsbDeviceEventDeviceStateChange) {
 				usb_connected = (d.device_state == UsbDeviceStateConnected);
 			}
-
-			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
-			if (now - began > freq) {
-				break;
+			if (pumped == 1 || (pumped % 50000) == 0) {
+				wdt_pet();
 			}
 		}
 		print("usb: pumped %d times during the first second\n", (uint64_t)pumped);

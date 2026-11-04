@@ -5632,6 +5632,8 @@ chiron_pick_usb_device(void)
 	uint64_t count = 0;
 	usb_device_protocol *chosen = NULL;
 
+	usb_dev_handle = NULL;          /* no stale handle from an earlier selection */
+
 	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &cfg_guid, NULL, &count,
 	    &handles))) {
 		print("pick: no config handles\n");
@@ -5688,13 +5690,32 @@ chiron_pick_usb_device(void)
 		 * Nothing advertised peripheral mode.  Fall back to the single-handle
 		 * lookup so behaviour is unchanged rather than broken, and say so.
 		 */
-		print("pick: no peripheral controller advertised; using first\n", 0);
+		print("pick: no peripheral controller advertised; using first (handle unknown)\n", 0);
+		usb_dev_handle = NULL;
 		if (!EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&chosen))) {
 			return chosen;
 		}
 		return NULL;
 	}
-	print("pick: chose a peripheral controller\n", 0);
+	/*
+	 * CHIRON_PICK_REPORT_FNIO
+	 *
+	 * Say here -- not later, and not by inference -- whether the controller that was
+	 * chosen by mode also carries UsbFnIo.  That is the question this whole selection
+	 * exists to answer: if it does, the two protocols are provably on the same
+	 * controller; if it does not, the fault is upstream of anything this loader does.
+	 */
+	{
+		static const efi_guid fnio_guid = QCOM_USBFN_IO_GUID;
+		void *fnio = NULL;
+		efi_status fs = BS->handle_protocol(usb_dev_handle, &fnio_guid, &fnio);
+
+		print("pick: chose a peripheral controller; fnio on it: ", 0);
+		print("%x", (uint64_t)fs);
+		print(" ptr ", 0);
+		print("%x", (uint64_t)(fnio != NULL));
+		print("\n", 0);
+	}
 	return chosen;
 }
 

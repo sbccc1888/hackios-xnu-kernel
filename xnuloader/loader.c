@@ -7092,13 +7092,11 @@ usb_command_loop(void)
 	if (usb_restore_mode) {
 		chiron_phy_restore();
 	}
-	chiron_env_snap("FINAL");
 	if (usb_sweep_mode) {
 		chiron_utmi_sweep();
 	}
 	chiron_fn_events("final");
 	chiron_event_probe("final");
-	chiron_phy_entry_snap("FINAL");
 	print("usb: command loop entered\n");
 	flush_log();
 
@@ -7108,17 +7106,41 @@ usb_command_loop(void)
 	 * A second after the loop starts, the driver has had its say.  Comparing this
 	 * with B says whether our RunStop write survives or the driver undoes it.
 	 */
+	/*
+	 * CHIRON_PUMP_AT_ENTRY
+	 *
+	 * This used to be a bare one-second spin.  The core is started a few statements
+	 * earlier, so the host begins resetting and asking for the device descriptor
+	 * within milliseconds -- and during a bare spin nothing calls handle_event(), so
+	 * the setup packet sits uncollected until the host gives up and never issues
+	 * SET_ADDRESS.  Pump the class driver while waiting instead.
+	 */
 	{
 		uint64_t freq = 0, began = 0, now = 0;
+		unsigned pumped = 0;
 
 		__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (freq));
 		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (began));
 		for (;;) {
+			uint32_t m = UsbDeviceEventNoEvent;
+			uint64_t sz = 0;
+			usb_device_event_data d;
+
+			memset(&d, 0, sizeof(d));
+			USB->handle_event(&m, &sz, &d);
+			pumped++;
+
+			if (m == UsbDeviceEventDeviceStateChange) {
+				usb_connected = (d.device_state == UsbDeviceStateConnected);
+			}
+
 			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
 			if (now - began > freq) {
 				break;
 			}
 		}
+		print("usb: pumped %d times during the first second\n", (uint64_t)pumped);
+		flush_log();
 	}
 	chiron_dwc3_snap("C-in-loop-1s");
 	/*

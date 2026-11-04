@@ -5395,14 +5395,26 @@ chiron_dwc3_highspeed(void)
 	/*
 	 * CHIRON_LPM_CONFIG
 	 *
-	 * gadget.c skips its entire USB2 LPM block when speed == SUPERSPEED, and
-	 * maximum_speed was forced to SUPER by core.c because the DTB's
-	 * "maximum-speed = high-speed" never reached this driver.  So DCFG.LPM_CAP was never
-	 * set and DCTL.HIRD_THRES was never written, even though chiron's DTB asks for
-	 * snps,hird-threshold = 0x10 and snps,has-lpm-erratum.
+	 * core.c:1220 forces maximum_speed to USB_SPEED_SUPER when it was UNKNOWN, because the
+	 * DTB's "maximum-speed = high-speed" never reaches this driver.  gadget.c:2993 then
+	 * takes the wrong branch on that value:
 	 *
-	 * Put back what the skipped block would have written.  L1_HIBER_EN is left alone: that
-	 * block does not touch it either, so changing it here would be inventing a value.
+	 *     if (speed != DWC3_DCFG_SUPERSPEED) { ...set LPM_CAP, HIRD_THRES... }
+	 *     else {
+	 *             reg = readl(DCTL);
+	 *             reg &= ~DWC3_DCTL_HIRD_THRES_MASK;    <-- explicitly clears it
+	 *             writel(DCTL, reg);
+	 *     }
+	 *
+	 * So DCFG.LPM_CAP is never set and DCTL.HIRD_THRES is actively cleared, while chiron's
+	 * DTB asks for snps,hird-threshold = [10] and snps,has-lpm-erratum.  Restoring both is
+	 * the correction.
+	 *
+	 * Timing: the driver's clear happens inside start_ex; this write lands after.  The
+	 * value therefore holds until the driver next runs that function -- on a reset, for
+	 * instance -- which is the same after-the-fact fragility as the DCFG correction below.
+	 * L1_HIBER_EN is left alone: neither branch touches it, and inventing a value would be
+	 * worse than leaving the reset one.
 	 */
 	{
 		uint32_t dcfg2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
@@ -5419,11 +5431,24 @@ chiron_dwc3_highspeed(void)
 		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl2;
 		__asm__ volatile ("dsb sy" ::: "memory");
 
-		print("dwc3: LPM cap %x hird %x | DCTL %x DCFG %x\n",
-		    (uint64_t)(((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700)) >> 22) & 1),
-		    (uint64_t)(((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704)) >> 24) & 0x1f),
-		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704),
-		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700));
+		{
+			uint32_t dcfg_rb = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+			uint32_t hird_rb = (*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) >> 24) & 0x1f;
+			uint32_t dctl_rb = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+
+			print("dwc3: LPM cap %x hird %x | DCTL %x DCFG %x\n",
+			    (uint64_t)((dcfg_rb >> 22) & 1), (uint64_t)hird_rb,
+			    (uint64_t)dctl_rb, (uint64_t)dcfg_rb);
+
+			/*
+			 * Read back so a driver-side clobber is visible rather than assumed
+			 * away: HIRD_THRES should still read 0x10 here.
+			 */
+			if (hird_rb != 0x10u) {
+				print("dwc3: HIRD did not stick (read %x, wanted 10)\n",
+				    (uint64_t)hird_rb);
+			}
+		}
 	}
 }
 

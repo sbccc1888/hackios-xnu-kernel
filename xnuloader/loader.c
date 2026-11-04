@@ -6725,7 +6725,21 @@ usb_start(void)
 	 * set and its device qualifier are written out as NULL further down.  The old
 	 * ss_cfg pointer here was never referenced -- a remnant of the USB3 path.
 	 */
-	static const void *cfg = usb_cfg_desc;
+	/*
+	 * CHIRON_DESC_ARRAY_TERMINATED
+	 *
+	 * USB_DEVICE_DESCRIPTOR_SET.Descriptors is VOID ** -- a NULL-terminated array of
+	 * configuration descriptor pointers, walked by the driver.  This used to be
+	 *
+	 *     static const void *cfg = usb_cfg_desc;
+	 *     set.descriptors = &cfg;
+	 *
+	 * which is the address of a single pointer with nothing after it.  A walk past the
+	 * end reads whatever .data holds next and treats it as another descriptor pointer.
+	 * The strings array below already has the right shape; this is the descriptor
+	 * equivalent of it.
+	 */
+	static const void *cfg[2] = { usb_cfg_desc, NULL };
 	static const void *strings[5] = { usb_str0, usb_str_mfr, usb_str_prod, usb_str_serial, usb_str_iface };
 	static usb_device_descriptor_set set;
 	void *event;
@@ -7037,7 +7051,7 @@ usb_start(void)
 	 * enumeration" even though the link comes up fine.
 	 */
 	set.device_descriptor = usb_dev_desc;
-	set.descriptors = &cfg;
+	set.descriptors = cfg;
 	set.ss_device_descriptor = NULL;
 	set.ss_descriptors = NULL;
 	set.device_qualifier = usb_qualifier;

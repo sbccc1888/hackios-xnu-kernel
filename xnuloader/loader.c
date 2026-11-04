@@ -4120,6 +4120,8 @@ static int usb_probe_mode;
 static int usb_sweep_mode;
 /* usb_hk6_only=1: drive UsbFnIo only, never call start_ex. */
 static int usb_hk6_only_mode;
+/* usb_diag=1: run the register map and write-path test on the boot path. */
+static int usb_diag_mode;
 
 /*
  * CHIRON_BCDUSB: 0x0200, not 0x0210.
@@ -6340,6 +6342,7 @@ usb_start(void)
 	usb_probe_mode = 0;
 	usb_sweep_mode = 0;
 	usb_hk6_only_mode = 0;
+	usb_diag_mode = 0;
 	{
 		struct payload_info npi;
 
@@ -6379,6 +6382,11 @@ usb_start(void)
 				    (c[15] == 0 || c[15] == ' ')) {
 					usb_hk6_only_mode = 1;
 				}
+				/* "usb_diag=1" is 10 characters */
+				if (starts_with(c, "usb_diag=1") &&
+				    (c[10] == 0 || c[10] == ' ')) {
+					usb_diag_mode = 1;
+				}
 			}
 		}
 	}
@@ -6415,8 +6423,18 @@ usb_start(void)
 		chiron_clocks_on();
 		chiron_gdsc_on();
 		chiron_gcc_bcr();
-		chiron_phy_map();
-		chiron_write_test();
+		/*
+		 * CHIRON_DIAG_OFF_PATH
+		 *
+		 * The register map and the write-path test both poke scratch registers, and
+		 * both now run between releasing the block resets and programming the PHY --
+		 * disturbing analogue settings in a block that has only just come out of
+		 * reset, for information already gathered.  Off unless asked for.
+		 */
+		if (usb_diag_mode) {
+			chiron_phy_map();
+			chiron_write_test();
+		}
 		chiron_qusb2_init();
 	}
 

@@ -4932,6 +4932,47 @@ chiron_clocks_on(void)
  *   TCSR clamp                      0x1FCB24C
  */
 
+/*
+ * CHIRON_EFUSE_TUNE1
+ *
+ * Fold the per-chip trim into tune1, as qusb_phy_get_tune1_param() does:
+ *
+ *     reg = tune1 & 0x0f;  reg |= (trim << 4);
+ *
+ * The working hardware reads tune1 = 0x45, and 0x45 is (0xa5 & 0x0f) | (4 << 4),
+ * so this chip's efuse trim is 4.  Reading it rather than hard-coding 4 keeps the
+ * port correct on a chip trimmed differently.
+ *
+ * The efuse register address comes from msm8998-v2.dtsi's third reg entry,
+ * 0x00784238, with bit-pos 16 and four bits.
+ */
+static void
+chiron_efuse_tune1(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+	const uint64_t efuse = 0x784238ULL;
+	uint32_t raw = *(volatile uint32_t *)(uintptr_t)efuse;
+	uint32_t trim = (raw >> 16) & 0xf;
+	uint8_t tune1 = *(volatile uint8_t *)(uintptr_t)(phy + 0x23C);
+
+	print("efuse: raw ", 0);
+	print("%x", (uint64_t)raw);
+	print(" trim ", 0);
+	print("%x", (uint64_t)trim);
+	print(" tune1 ", 0);
+	print("%x", (uint64_t)tune1);
+
+	if (trim != 0) {
+		uint8_t merged = (uint8_t)((tune1 & 0x0f) | (trim << 4));
+
+		*(volatile uint8_t *)(uintptr_t)(phy + 0x23C) = merged;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		print(" -> ", 0);
+		print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x23C));
+	}
+	print("\n", 0);
+}
+
 static void
 chiron_qusb2_init(void)
 {
@@ -4941,69 +4982,61 @@ chiron_qusb2_init(void)
 	 * misleading 0x80808080 readbacks came from.
 	 */
 	/*
-	 * CHIRON_DTB_INIT_SEQ
+	 * CHIRON_MEASURED_INIT_SEQ
 	 *
-	 * Straight from the device tree this phone actually boots with
-	 * (Mu-Silicium/Resources/DTBs/chiron.dtb, decompiled):
+	 * Values from msm8998-v2.dtsi, confirmed against the register map captured at
+	 * loader entry while fastboot still had this port working:
 	 *
-	 *   qcom,qusb-phy-init-seq = <0x80 0x00  0x13 0x04  0x7c 0x18c
-	 *                             0x80 0x2c  0x0a 0x184  0xf0 0x23c  0x0f 0x240>;
+	 *   0x184 = 0x0a   0x18c = 0x7c   0x240 = 0x09   0xb4 = 0x19   all match
+	 *   0x23c = 0x45, which is 0xa5 with the efuse trim folded in -- see below
 	 *
-	 * Seven value/offset pairs, and the 0x00 entry is part of it.  An earlier
-	 * revision replaced these with values read out of msm8998-v2.dtsi in the kernel
-	 * source tree; that is a different device tree variant and not the one this
-	 * phone is booted with.
+	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
+	 * what the hardware actually held.
 	 */
 	/*
-	 * CHIRON_DTB_INIT_SEQ
+	 * CHIRON_MEASURED_INIT_SEQ
 	 *
-	 * Straight from the device tree this phone actually boots with
-	 * (Mu-Silicium/Resources/DTBs/chiron.dtb, decompiled):
+	 * Values from msm8998-v2.dtsi, confirmed against the register map captured at
+	 * loader entry while fastboot still had this port working:
 	 *
-	 *   qcom,qusb-phy-init-seq = <0x80 0x00  0x13 0x04  0x7c 0x18c
-	 *                             0x80 0x2c  0x0a 0x184  0xf0 0x23c  0x0f 0x240>;
+	 *   0x184 = 0x0a   0x18c = 0x7c   0x240 = 0x09   0xb4 = 0x19   all match
+	 *   0x23c = 0x45, which is 0xa5 with the efuse trim folded in -- see below
 	 *
-	 * Seven value/offset pairs, and the 0x00 entry is part of it.  An earlier
-	 * revision replaced these with values read out of msm8998-v2.dtsi in the kernel
-	 * source tree; that is a different device tree variant and not the one this
-	 * phone is booted with.
+	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
+	 * what the hardware actually held.
 	 */
 	/*
-	 * CHIRON_DTB_INIT_SEQ
+	 * CHIRON_MEASURED_INIT_SEQ
 	 *
-	 * Straight from the device tree this phone actually boots with
-	 * (Mu-Silicium/Resources/DTBs/chiron.dtb, decompiled):
+	 * Values from msm8998-v2.dtsi, confirmed against the register map captured at
+	 * loader entry while fastboot still had this port working:
 	 *
-	 *   qcom,qusb-phy-init-seq = <0x80 0x00  0x13 0x04  0x7c 0x18c
-	 *                             0x80 0x2c  0x0a 0x184  0xf0 0x23c  0x0f 0x240>;
+	 *   0x184 = 0x0a   0x18c = 0x7c   0x240 = 0x09   0xb4 = 0x19   all match
+	 *   0x23c = 0x45, which is 0xa5 with the efuse trim folded in -- see below
 	 *
-	 * Seven value/offset pairs, and the 0x00 entry is part of it.  An earlier
-	 * revision replaced these with values read out of msm8998-v2.dtsi in the kernel
-	 * source tree; that is a different device tree variant and not the one this
-	 * phone is booted with.
+	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
+	 * what the hardware actually held.
 	 */
 	/*
-	 * CHIRON_DTB_INIT_SEQ
+	 * CHIRON_MEASURED_INIT_SEQ
 	 *
-	 * Straight from the device tree this phone actually boots with
-	 * (Mu-Silicium/Resources/DTBs/chiron.dtb, decompiled):
+	 * Values from msm8998-v2.dtsi, confirmed against the register map captured at
+	 * loader entry while fastboot still had this port working:
 	 *
-	 *   qcom,qusb-phy-init-seq = <0x80 0x00  0x13 0x04  0x7c 0x18c
-	 *                             0x80 0x2c  0x0a 0x184  0xf0 0x23c  0x0f 0x240>;
+	 *   0x184 = 0x0a   0x18c = 0x7c   0x240 = 0x09   0xb4 = 0x19   all match
+	 *   0x23c = 0x45, which is 0xa5 with the efuse trim folded in -- see below
 	 *
-	 * Seven value/offset pairs, and the 0x00 entry is part of it.  An earlier
-	 * revision replaced these with values read out of msm8998-v2.dtsi in the kernel
-	 * source tree; that is a different device tree variant and not the one this
-	 * phone is booted with.
+	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
+	 * what the hardware actually held.
 	 */
 	static const uint32_t seq[][2] = {
-		{0x80, 0x000},
-		{0x13, 0x004},
-		{0x7c, 0x18c},
-		{0x80, 0x02c},
-		{0x0a, 0x184},
-		{0xf0, 0x23c},
-		{0x0f, 0x240},
+		{0x13, 0x004},   /* analog_controls_two */
+		{0x7c, 0x18c},   /* pll_clock_inverter */
+		{0x80, 0x02c},   /* pll_cmode */
+		{0x0a, 0x184},   /* pll_lock_delay */
+		{0xa5, 0x23c},   /* tune1, efuse trim folded in afterwards */
+		{0x09, 0x240},   /* tune2 */
+		{0x19, 0x0b4},   /* digital_timers_two */
 	};
 	const uint64_t phy = 0xC012000ULL;
 	const uint64_t bcr = 0x112000ULL;
@@ -5032,6 +5065,8 @@ chiron_qusb2_init(void)
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 
+	/* fold the per-chip trim in, as the working hardware has it (0x45 from 0xa5) */
+	chiron_efuse_tune1();
 	/* CHIRON_QUSB2_PWRUP: 32-bit again, POWR_DOWN clear, CLAMP_N_EN set */
 	*(volatile uint32_t *)(uintptr_t)(phy + 0x210) =
 	    (*(volatile uint32_t *)(uintptr_t)(phy + 0x210) & ~1u) | 2u;
@@ -5157,12 +5192,18 @@ chiron_qusb2_resume(void)
 	 */
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x000) = 0x80;
 	/*
-	 * CHIRON_QUSB2_LINEDET: enable both single-ended detectors.  Writing 0 here
-	 * (as the suspend path does) switches them off and INTR_STAT then reads 0 for
-	 * ever, which is exactly what happened.
+	 * CHIRON_INTR_AS_FOUND
+	 *
+	 * INTR_CTRL (0x22C) is not touched.  This used to write 0x03 here on the
+	 * theory that INTR_STAT reading 0 meant the single-ended detectors were
+	 * disabled.  The register map captured while fastboot still had this port
+	 * working shows the opposite:
+	 *
+	 *     0x22c INTR_CTRL = 0x00      0x230 INTR_STAT = 0x00
+	 *
+	 * so zero is the working configuration, and arming the detectors here changes
+	 * the PHY's behaviour on the strength of a misreading.
 	 */
-	*(volatile uint8_t *)(uintptr_t)(phy + 0x22C) = 0x03;
-	__asm__ volatile ("dsb sy" ::: "memory");
 
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x24C) = 0x91;
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -5193,27 +5234,25 @@ static void
 chiron_qusb2_reassert(void)
 {
 		/*
-	 * CHIRON_DTB_INIT_SEQ
+	 * CHIRON_MEASURED_INIT_SEQ
 	 *
-	 * Straight from the device tree this phone actually boots with
-	 * (Mu-Silicium/Resources/DTBs/chiron.dtb, decompiled):
+	 * Values from msm8998-v2.dtsi, confirmed against the register map captured at
+	 * loader entry while fastboot still had this port working:
 	 *
-	 *   qcom,qusb-phy-init-seq = <0x80 0x00  0x13 0x04  0x7c 0x18c
-	 *                             0x80 0x2c  0x0a 0x184  0xf0 0x23c  0x0f 0x240>;
+	 *   0x184 = 0x0a   0x18c = 0x7c   0x240 = 0x09   0xb4 = 0x19   all match
+	 *   0x23c = 0x45, which is 0xa5 with the efuse trim folded in -- see below
 	 *
-	 * Seven value/offset pairs, and the 0x00 entry is part of it.  An earlier
-	 * revision replaced these with values read out of msm8998-v2.dtsi in the kernel
-	 * source tree; that is a different device tree variant and not the one this
-	 * phone is booted with.
+	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
+	 * what the hardware actually held.
 	 */
 	static const uint32_t seq[][2] = {
-		{0x80, 0x000},
-		{0x13, 0x004},
-		{0x7c, 0x18c},
-		{0x80, 0x02c},
-		{0x0a, 0x184},
-		{0xf0, 0x23c},
-		{0x0f, 0x240},
+		{0x13, 0x004},   /* analog_controls_two */
+		{0x7c, 0x18c},   /* pll_clock_inverter */
+		{0x80, 0x02c},   /* pll_cmode */
+		{0x0a, 0x184},   /* pll_lock_delay */
+		{0xa5, 0x23c},   /* tune1, efuse trim folded in afterwards */
+		{0x09, 0x240},   /* tune2 */
+		{0x19, 0x0b4},   /* digital_timers_two */
 	};
 	const uint64_t phy = 0xC012000ULL;
 
@@ -5222,9 +5261,14 @@ chiron_qusb2_reassert(void)
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 
-	/* keep the line detectors on, and let the PHY auto-resume the link */
-	*(volatile uint8_t *)(uintptr_t)(phy + 0x22C) = 0x03;
-	__asm__ volatile ("dsb sy" ::: "memory");
+	/*
+	 * CHIRON_INTR_LEFT_ALONE
+	 *
+	 * INTR_CTRL (0x22C) is left as the firmware left it.  The working port reads
+	 * 0x00 there and 0x00 in INTR_STAT; arming the single-ended detectors changes
+	 * PHY behaviour for readings that were never reliable anyway -- 0xF0 and 0xF4
+	 * are unimplemented on this part.
+	 */
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x24C) = 0x91;
 	__asm__ volatile ("dsb sy" ::: "memory");
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x24C) = 0x90;
@@ -5282,8 +5326,7 @@ chiron_qusb2_report_levels(void)
 	print("%x", (uint64_t)(((high_trig >> 1) & 1) ? 1 : (((low_trig >> 1) & 1) ? 0 : 2)));
 	print("  (Dp/Dm: 1=high 0=low 2=undriven)\n", 0);
 
-	/* leave them in the driver's own configuration */
-	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0x22C) = 0x03;
+	/* leave INTR_CTRL as found: the working port has it at 0x00 */
 }
 
 /*

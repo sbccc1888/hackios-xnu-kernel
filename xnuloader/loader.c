@@ -6726,20 +6726,23 @@ usb_start(void)
 	 * ss_cfg pointer here was never referenced -- a remnant of the USB3 path.
 	 */
 	/*
-	 * CHIRON_DESC_ARRAY_TERMINATED
+	 * CHIRON_DESC_ARRAY_SIZE
 	 *
-	 * USB_DEVICE_DESCRIPTOR_SET.Descriptors is VOID ** -- a NULL-terminated array of
-	 * configuration descriptor pointers, walked by the driver.  This used to be
+	 * USB_DEVICE_DESCRIPTOR_SET.Descriptors is sized by DeviceDescriptor->NumConfigurations,
+	 * not NULL-terminated -- confirmed by the doc block above the struct in
+	 * EFIUsbDevice.h.  bNumConfigurations is 1 here, so this is a one-element array.
 	 *
-	 *     static const void *cfg = usb_cfg_desc;
-	 *     set.descriptors = &cfg;
+	 * An earlier commit added a trailing NULL on the theory that the driver walks to a
+	 * terminator.  It does not; the count governs.  The NULL is harmless because the second
+	 * element is never read, but the reasoning behind it was wrong and the comment is worth
+	 * having right, because a reader who believes in a terminator will add one somewhere it
+	 * matters.
 	 *
-	 * which is the address of a single pointer with nothing after it.  A walk past the
-	 * end reads whatever .data holds next and treats it as another descriptor pointer.
-	 * The strings array below already has the right shape; this is the descriptor
-	 * equivalent of it.
+	 * The strings array below is the same story: StringDescritors is sized by
+	 * StringDescriptorCount, and is not terminated either.
 	 */
-	static const void *cfg[2] = { usb_cfg_desc, NULL };
+	static const void *cfg[1] = { usb_cfg_desc };
+	/* sized by string_count, not terminated -- see CHIRON_DESC_ARRAY_SIZE above */
 	static const void *strings[5] = { usb_str0, usb_str_mfr, usb_str_prod, usb_str_serial, usb_str_iface };
 	static usb_device_descriptor_set set;
 	void *event;

@@ -6818,6 +6818,24 @@ usb_start(void)
 		print("usb: incomplete Qualcomm USB interface\n");
 		return 0;
 	}
+	/*
+	 * CHIRON_ARM_BEFORE_START_EX
+	 *
+	 * DEVTEN has to be armed before start_ex is called, not after it.  StartEx invokes
+	 * StartController itself -- that is why this loader stopped doing so -- so the core
+	 * and the pull-up appear inside that call.  The host resets and asks for the device
+	 * descriptor milliseconds later.  Anything armed afterwards is armed after the
+	 * events it was meant to catch.
+	 *
+	 * This was already moved once, to just before late_run, at a time when late_run was
+	 * believed to be what started the core.  When the start moved into start_ex, the
+	 * arming was left behind again.  Arm it here, immediately in front of the call that
+	 * starts the controller, where it cannot drift out of order again without being
+	 * obviously in the wrong place.
+	 */
+	chiron_event_arm();
+	chiron_event_probe("armed-before-start_ex");
+
 	chiron_dwc3_snap("A-before-start_ex");
 	/*
 	 * CHIRON_SKIP_START_EX
@@ -6859,8 +6877,6 @@ usb_start(void)
 	 * DEVTEN is a controller register; it does not require a running core, so there is
 	 * no reason to arm it afterwards.
 	 */
-	chiron_event_arm();
-	chiron_event_probe("armed-before-start");
 
 	if (usb_pure_mode) {
 		/*

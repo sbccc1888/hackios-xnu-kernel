@@ -6006,10 +6006,6 @@ chiron_usbfn_endpoints(void)
 		print("usbfn: protocol absent\n");
 		return 0;
 	}
-	if (fn->configure_enable_endpoints == NULL) {
-		print("usbfn: no ConfigureEnableEndpoints\n");
-		return 0;
-	}
 
 	memcpy(&dev_desc, usb_dev_desc, sizeof(dev_desc));
 
@@ -6074,6 +6070,14 @@ chiron_usbfn_endpoints(void)
 		print("usbfn: no start_controller\n");
 	}
 
+	if (fn->configure_enable_endpoints == NULL) {
+		print("usbfn: no ConfigureEnableEndpoints\n");
+		return 0;
+	}
+	/* revision first: UsbfnDwc3Dxe checks endpoint state, so say which ABI we speak */
+	print("usbfn: revision ", 0);
+	print("%x", (uint64_t)fn->revision);
+	print("\n", 0);
 	se = fn->configure_enable_endpoints(fn, &dev_info);
 	print("usbfn: ConfigureEnableEndpoints ", 0);
 	print("%x", (uint64_t)se);

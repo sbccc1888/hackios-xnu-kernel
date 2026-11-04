@@ -6110,6 +6110,36 @@ chiron_usbfn_endpoints(void)
 	 * before the controller owning it had been initialised, and was then "started"
 	 * afterwards -- both returning success, nothing appearing on the wire.
 	 */
+
+	if (fn->configure_enable_endpoints == NULL) {
+		print("usbfn: no ConfigureEnableEndpoints\n");
+		return 0;
+	}
+	print("usbfn: revision ", 0);
+	print("%x", (uint64_t)fn->revision);
+	print("\n", 0);
+
+	/*
+	 * CHIRON_DRIVER_ORDER
+	 *
+	 * ConfigureEnableEndpoints before StartController, which is the order
+	 * UsbDeviceDxe's own StartEx path uses -- its error strings are emitted in
+	 * exactly that sequence:
+	 *
+	 *     UsbDevDescInitDescriptors
+	 *     configure and enable endpoints
+	 *     initialize state machine
+	 *     Start USB Controller
+	 *
+	 * An earlier commit had these two swapped, reasoning from the single method's
+	 * doc comment without looking at how the driver that owns the sequence orders
+	 * its own calls.  StartController is the last step, not the first.
+	 */
+	se = fn->configure_enable_endpoints(fn, &dev_info);
+	print("usbfn: ConfigureEnableEndpoints ", 0);
+	print("%x", (uint64_t)se);
+	print("\n", 0);
+
 	if (fn->start_controller != NULL) {
 		ss = fn->start_controller(fn);
 		print("usbfn: start_controller ", 0);
@@ -6118,20 +6148,6 @@ chiron_usbfn_endpoints(void)
 	} else {
 		print("usbfn: no start_controller\n");
 	}
-
-	if (fn->configure_enable_endpoints == NULL) {
-		print("usbfn: no ConfigureEnableEndpoints\n");
-		return 0;
-	}
-	/* revision first: UsbfnDwc3Dxe checks endpoint state, so say which ABI we speak */
-	print("usbfn: revision ", 0);
-	print("%x", (uint64_t)fn->revision);
-	print("\n", 0);
-	se = fn->configure_enable_endpoints(fn, &dev_info);
-	print("usbfn: ConfigureEnableEndpoints ", 0);
-	print("%x", (uint64_t)se);
-	print("\n", 0);
-
 	return !EFI_ERROR(se);
 }
 

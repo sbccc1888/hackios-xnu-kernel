@@ -4755,6 +4755,26 @@ chiron_udelay(uint64_t us)
  *
  * The DTS asks for core_reset by name; nothing in this loader had ever released it.
  */
+/*
+ * CHIRON_GCC_BCR
+ *
+ * Put the USB blocks through a full reset, the way drivers/clk/msm/reset.c does it:
+ *
+ *   msm_reset_assert    regval |=  BIT(bit);    set   = held in reset
+ *   msm_reset_deassert  regval &= ~BIT(bit);    clear = released
+ *   msm_reset           assert; udelay(1); deassert;
+ *
+ * Registers and bits from clock-gcc-8998.c's gcc_8998_resets[] table, which gives
+ * only a register per line, so bit is zero throughout:
+ *
+ *   USB_30_BCR        0x0f000    the controller's "core_reset" in the DTS
+ *   QUSB2PHY_PRIM_BCR 0x12000
+ *   QUSB2PHY_SEC_BCR  0x12004
+ *   USB3_PHY_BCR      0x50020
+ *
+ * Asserting first matters: a block left in some indeterminate state by the firmware
+ * is not put into a defined one by releasing a reset that was never asserted.
+ */
 static void
 chiron_gcc_bcr(void)
 {
@@ -4769,19 +4789,28 @@ chiron_gcc_bcr(void)
 	for (unsigned i = 0; i < sizeof(list) / sizeof(list[0]); i++) {
 		volatile uint32_t *bcr = (volatile uint32_t *)(uintptr_t)(gcc + list[i].off);
 		uint32_t before = *bcr;
+		uint32_t asserted;
 
-		if ((before & 1u) != 0) {
-			*bcr = before & ~1u;
-			__asm__ volatile ("dsb sy" ::: "memory");
-			chiron_udelay(1000);
-		}
+		/* assert: hold the block in reset */
+		*bcr = before | 1u;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		asserted = *bcr;
+		chiron_udelay(10);
+
+		/* deassert: release it into a defined state */
+		*bcr = (before | 1u) & ~1u;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		chiron_udelay(2000);
+
 		print("bcr: ", 0);
 		print((char *)list[i].name, 0);
 		print("%x ", 0);
 		print("%x", (uint64_t)list[i].off);
-		print(" ", 0);
+		print(" before ", 0);
 		print("%x", (uint64_t)before);
-		print(" -> ", 0);
+		print(" assert ", 0);
+		print("%x", (uint64_t)asserted);
+		print(" released ", 0);
 		print("%x", (uint64_t)*bcr);
 		print("\n", 0);
 	}

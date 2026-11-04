@@ -5269,6 +5269,83 @@ chiron_env_snap(const char *tag)
 }
 
 /*
+ * CHIRON_FN_EVENTS
+ *
+ * Poll EFI_USBFN_IO_PROTOCOL::EventHandler and report what comes back.
+ *
+ * This is the layer that sees the wire.  EfiUsbMsgBusEventAttach (5),
+ * BusEventReset (6) and SetupPacket (1) are the messages that prove the host found
+ * this device and started talking to it, and none of them exist in the upper
+ * USB_DEVICE_EVENT enum this port has been reading.
+ *
+ * Bounded on purpose: EventHandler is a poll, and a poll on a silent controller may
+ * never return.  Each call is preceded by its own budget check, and the whole sweep
+ * stops after fn_events_budget counters.
+ */
+static void
+chiron_fn_events(const char *tag)
+{
+	static const efi_guid usbfn_guid = QCOM_USBFN_IO_GUID;
+	efi_usbfn_io *fn = NULL;
+	uint64_t freq = 0, began = 0;
+	uint32_t seen[16];
+	unsigned distinct = 0;
+
+	if (EFI_ERROR(BS->locate_protocol(&usbfn_guid, NULL, (void **)&fn)) || fn == NULL ||
+	    fn->event_handler == NULL) {
+		print("fnev ", 0);
+		print((char *)tag, 0);
+		print(": no event_handler\n", 0);
+		return;
+	}
+
+	__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (freq));
+	__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (began));
+
+	for (unsigned i = 0; i < 400; i++) {
+		uint32_t msg = 0;
+		uint64_t size = sizeof(uint64_t) * 8;
+		uint64_t payload[8];
+		efi_status s;
+		uint64_t now = 0;
+		int known = 0;
+
+		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
+		if (now - began > freq) {          /* 1 s of polling is plenty */
+			break;
+		}
+
+		memset(payload, 0, sizeof(payload));
+		s = fn->event_handler(fn, &msg, &size, payload);
+		if (EFI_ERROR(s) || msg == 0) {    /* EfiUsbMsgNone */
+			continue;
+		}
+
+		for (unsigned k = 0; k < distinct; k++) {
+			if (seen[k] == msg) {
+				known = 1;
+				break;
+			}
+		}
+		if (!known && distinct < 16) {
+			seen[distinct++] = msg;
+			print("fnev ", 0);
+			print((char *)tag, 0);
+			print(": msg ", 0);
+			print("%x", (uint64_t)msg);
+			print("\n", 0);
+			flush_log();
+		}
+	}
+
+	print("fnev ", 0);
+	print((char *)tag, 0);
+	print(": done, ", 0);
+	print("%x", (uint64_t)distinct);
+	print(" distinct\n", 0);
+}
+
+/*
  * CHIRON_PICK_USB_DEVICE
  *
  * Choose the peripheral controller's UsbDevice protocol, not whatever handle
@@ -6209,6 +6286,7 @@ usb_start(void)
 		s = USB->start_ex(&set);
 	} else {
 		print("usb: start_ex skipped (usb_hk6_only)\n");
+		chiron_fn_events("after-hk6");
 	}
 	chiron_dwc3_snap("B-after-start_ex");
 	chiron_usb_probe_protos("poststart");
@@ -6641,6 +6719,7 @@ usb_command_loop(void)
 	if (usb_sweep_mode) {
 		chiron_utmi_sweep();
 	}
+	chiron_fn_events("final");
 	chiron_event_probe("final");
 	chiron_phy_entry_snap("FINAL");
 	print("usb: command loop entered\n");

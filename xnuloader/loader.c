@@ -5764,11 +5764,30 @@ static void
 chiron_event_arm(void)
 {
 	const uint64_t dwc = 0xA800000ULL;
-	uint32_t want = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 10);
+	/*
+	 * CHIRON_DEVTEN_READ_MODIFY_WRITE
+	 *
+	 * UsbfnDwc3Dxe owns this register.  Its binary carries DwcConfigureEventBuffer,
+	 * "Failed to get event count", "Failed to get next event" and UsmProcessEventWorker
+	 * -- it allocates the event ring, programs it, selects the events it wants and runs a
+	 * state machine over them.  This function used to assign DEVTEN outright, after the
+	 * driver had already configured it, replacing that selection with a hand-written
+	 * guess: clearing bits the driver had enabled, setting bits it may not expect.
+	 *
+	 * OR in only the bits that are certain to be wanted and keep the rest.  Report the
+	 * value before as well as after, so the log says what the driver chose -- which is
+	 * the useful number when the question is whether it is listening at all.
+	 */
+	uint32_t before = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC708);
+	uint32_t want = before | (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3);
 
 	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC708) = want;
 	__asm__ volatile ("dsb sy" ::: "memory");
 	chiron_udelay(2000);
+
+	print("evt: devten driver had ", 0);
+	print("%x", (uint64_t)before);
+	print("\n", 0);
 
 	/*
 	 * CHIRON_EVENT_RING

@@ -5269,6 +5269,46 @@ chiron_env_snap(const char *tag)
 }
 
 /*
+ * CHIRON_COUNT_PROTOS
+ *
+ * How many handles publish each of the three USB protocols this loader juggles.
+ *
+ *   UsbFnIo    the controller
+ *   UsbDevice  the upper Qualcomm device protocol
+ *   UsbConfig  the per-controller configuration table
+ *
+ * Every one of them is looked up with plain locate_protocol somewhere in this
+ * file, which silently takes the first match.  If any of the three counts is more
+ * than one, those lookups are picking blind and the choice has to be made
+ * explicitly instead of inherited from handle order.
+ */
+static void
+chiron_count_protos(const char *tag)
+{
+	static const efi_guid fn_guid = QCOM_USBFN_IO_GUID;
+	static const efi_guid dev_guid = QCOM_USB_DEVICE_GUID;
+	static const efi_guid cfg_guid = QCOM_USB_CONFIG_GUID;
+	static const efi_guid chg_guid = QCOM_USBFN_CHG_GUID;
+
+	for (unsigned i = 0; i < 4; i++) {
+		const efi_guid *g = (i == 0) ? &fn_guid : (i == 1) ? &dev_guid :
+		                    (i == 2) ? &cfg_guid : &chg_guid;
+		uint64_t n = 0;
+		efi_status s = BS->locate_handle_buffer(ByProtocol, (efi_guid *)g, NULL, &n, NULL);
+
+		print("cnt ", 0);
+		print((char *)tag, 0);
+		print(" ", 0);
+		print("%x", (uint64_t)i);
+		print(": st ", 0);
+		print("%x", (uint64_t)s);
+		print(" n ", 0);
+		print("%x", (uint64_t)n);
+		print("\n", 0);
+	}
+}
+
+/*
  * CHIRON_FN_EVENTS
  *
  * Poll EFI_USBFN_IO_PROTOCOL::EventHandler and report what comes back.
@@ -6161,9 +6201,11 @@ usb_start(void)
 	 * peripheral controller.
 	 */
 	if (!usb_manual_mode) {
+		chiron_count_protos("pre-hk6");
 		if (chiron_usb_hk6()) {
 			print("usb: HK6 gave us UsbFnIo\n");
 			chiron_usbfn_endpoints();
+			chiron_count_protos("post-hk6");
 		} else {
 			print("usb: HK6 did not reach UsbFnIo\n");
 		}

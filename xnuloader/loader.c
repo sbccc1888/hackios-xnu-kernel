@@ -6729,7 +6729,44 @@ usb_poll_command(void)
 	if (!usb_rx_queued && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
 		usb_rx_queued = 1;
 	}
-	USB->handle_event(&msg, &size, &data);
+
+	/*
+	 * CHIRON_POLL_GATED
+	 *
+	 * This runs once per pass of the kernel-watch loop, and handle_event does not
+	 * return when nothing is pending -- the same trap that lost the phone earlier
+	 * in this session.  usb_wait() was given a budget for it; this path never was.
+	 *
+	 * Ask the controller first: GEVNTCOUNT (0xC40C) says whether there is an event
+	 * to collect.  Zero pending means the call would block for nothing, so skip it
+	 * and leave the loop free.  A short time budget guards the case where events
+	 * keep arriving, so this loop can never be held here.
+	 */
+	{
+		static uint64_t drained_began;
+		uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
+		uint64_t now = READ_SYSREG(CNTVCT_EL0);
+		unsigned passes;
+
+		if (drained_began == 0 || now - drained_began > freq) {
+			drained_began = now;
+		}
+		for (passes = 0; passes < 8; passes++) {
+			uint32_t pending = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C);
+			uint64_t t = READ_SYSREG(CNTVCT_EL0);
+
+			if ((pending & 0xfffc) == 0) {
+				return;                 /* nothing waiting: do not call in */
+			}
+			if (t - drained_began > freq / 100) {   /* 10 ms of draining at most */
+				return;
+			}
+			USB->handle_event(&msg, &size, &data);
+			if (msg != UsbDeviceEventNoEvent) {
+				break;
+			}
+		}
+	}
 	if (msg == UsbDeviceEventDeviceStateChange) {
 		usb_connected = (data.device_state == UsbDeviceStateConnected);
 		usb_rx_queued = 0;

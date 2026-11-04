@@ -8351,7 +8351,24 @@ efi_main(efi_handle image, efi_system_table *st)
 	/* CHIRON_USB_FAIL_RESET: no gadget means nothing to drive and nothing to boot;
 	 * go back to Android rather than sit on a black screen for ever. */
 	if (have_payload && pi.usb_mode) {
+		/*
+		 * CHIRON_NO_WATCHDOG
+		 *
+		 * wdt_arm() only acts on platform_redwood: VIRT_WDT_* are Quest hypervisor calls
+		 * (0x86000005..08) and MSM8998 does not implement them, so on this phone
+		 * wdt_armed is always 0 and wdt_pet() does nothing.  Nothing recovers from a hang
+		 * inside a driver call, and a software deadline cannot preempt one.
+		 *
+		 * What can be done is make a hang attributable.  usb_start() is a sequence of
+		 * loader-owned phases, so mark the boundaries: whatever line is last in the log
+		 * is the phase that did not finish, on the panel and in the partition both.
+		 */
+		uint64_t usb_t0 = READ_SYSREG(CNTVCT_EL0);
+
+		print("usb: phase -1 entering usb_start\n", 0);
 		if (usb_start()) {
+			print("usb: phase -1 complete in ms %d\n",
+			    (uint64_t)((READ_SYSREG(CNTVCT_EL0) - usb_t0) / (READ_SYSREG(CNTFRQ_EL0) / 1000 + 1)));
 			flush_log();
 			/* CHIRON_USB_HANDLE_BOUNDED: a session with no host must end by itself */
 			usb_session_begin(usb_idle_seconds > 0 ? (uint64_t)usb_idle_seconds : 300);

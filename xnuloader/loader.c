@@ -4203,14 +4203,22 @@ usb_serial_fill(uint8_t *out, uint32_t cap, const char *tag)
 	uint32_t strtbl, n, i, o;
 	const char *serial = NULL;
 
-	out[0] = 2;
-	out[1] = 3;
-	if (cap < 4) {
+	/*
+	 * CHIRON_SMBIOS_SAFE
+	 *
+	 * Everything below dereferences memory named by the firmware: the configuration table
+	 * array, an entry point, then a structure table.  Each step has to be bounded before
+	 * the pointer is used, because a fault here takes the whole loader down and the only
+	 * recovery is holding the power button.
+	 */
+	if (out == NULL || cap < 4) {
 		return 0;
 	}
+	out[0] = 2;
+	out[1] = 3;
 
 	/* find the SMBIOS entry point among the configuration tables */
-	if (ST != NULL && ST->tables != NULL) {
+	if (ST != NULL && ST->tables != NULL && ST->nr_tables < 256) {
 		for (uint64_t i2 = 0; i2 < ST->nr_tables; i2++) {
 			if (memcmp(&ST->tables[i2].guid, &smbios_guid, sizeof(smbios_guid)) == 0) {
 				ep = (uint8_t *)(uintptr_t)ST->tables[i2].table;
@@ -4241,17 +4249,41 @@ usb_serial_fill(uint8_t *out, uint32_t cap, const char *tag)
 		print("serial: SMBIOS entry point has an unknown anchor\n", 0);
 		return 0;
 	}
-	if (strtbl == 0) {
-		print("serial: SMBIOS table address is zero\n", 0);
+	/*
+	 * A plausible SMBIOS structure table is in RAM, four-byte aligned, and not in the
+	 * first megabyte (which is not mapped for data on this part).  This is a coarse test
+	 * and it is deliberately coarse: its job is to reject an obviously bad pointer before
+	 * the first dereference, not to prove the pointer good.
+	 */
+	if (strtbl == 0 || (strtbl & 3) != 0 || strtbl < 0x40000000ULL || strtbl >= 0x200000000ULL) {
+		print("serial: SMBIOS table address implausible ", 0);
+		print("%x", (uint64_t)strtbl);
+		print("\n", 0);
 		return 0;
 	}
 
 	/* walk the structures looking for type 1 */
 	p8 = (uint8_t *)(uintptr_t)strtbl;
+	{
+	uint32_t walked = 0;
+
 	for (n = 0; n < 128; n++) {
 		uint8_t type = p8[0], len = p8[1];
 
-		if (len < 4) {
+		/*
+		 * Guard both the length and the running total.  A structure length below 4
+		 * cannot be right, and a length that is large enough to carry the walk past
+		 * the table is worse -- it would step into whatever follows and read it as
+		 * SMBIOS.  The running total catches the second case.
+		 */
+		if (len < 4 || len > 0x100) {
+			print("serial: SMBIOS structure length out of range ", 0);
+			print("%x", (uint64_t)len);
+			print("\n", 0);
+			break;
+		}
+		if (walked > 0x10000) {
+			print("serial: SMBIOS walk exceeded 64 KiB\n", 0);
 			break;
 		}
 		if (type == 127) {          /* end-of-table */
@@ -4289,7 +4321,10 @@ usb_serial_fill(uint8_t *out, uint32_t cap, const char *tag)
 				guard++;
 			}
 			p8 = strs + 2;
+			walked += len + guard + 2;
 		}
+	}
+
 	}
 
 	if (serial == NULL) {

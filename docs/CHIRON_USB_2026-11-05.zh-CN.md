@@ -159,6 +159,64 @@ PHY 写入的值现在与工作硬件逐项一致：
 
 ---
 
+## 6.5 诊断链的闭合（后续补充）
+
+重新解析 `prb.bin` 后，三件事被实测数据确认，且互相独立：
+
+### 6.5.1 VBUS 和物理层不是问题
+
+```
+vbus: hs_phy_ctrl 10000000 -> 10100000    bit20 VBUS_VALID, bit28 SW_SESSVLD_SEL 置位
+snap C-in-loop-1s  lkst 0 spd 0           U0 + 高速
+```
+
+U0 + 高速只在主机发出 bus reset 并完成 chirp 之后出现。**所以主机看到了设备、复位了它、
+完成了速度协商。** VBUS、D+ 上拉、PHY 收发器全部工作正常。
+
+PMIC/充电栈确实完全没初始化（`ChargerEx=0`、`QcomCharger=EFI_UNSUPPORTED`、
+`get_vbus_status=EFI_NOT_FOUND`），手写的 `HS_PHY_CTRL_REG` override 绕过了这一点，
+而且它是有效的。
+
+### 6.5.2 核心一直是停止的
+
+```
+snap A-before-start_ex   run 0 hlt 1
+snap B-after-start_ex    run 0 hlt 1
+late                     run 1 hlt 0    只有 loader 自己写 RunStop 之后
+```
+
+`ConfigureEnableEndpoints` 和 `start_ex` **都返回 EFI_SUCCESS**，而 `DCTL.RunStop` 从未置位、
+`DSTS.DEVCTRLHLT` 一直是 1。
+
+**停止的核心不会取任何包**，因此 `GET_DESCRIPTOR` 的 SETUP 包永远不被收集。
+
+### 6.5.3 枚举窗口在有人监听之前就关闭
+
+```
+late: run 1 hlt 0 lkst 0       核心启动, D+ 上拉
+usb: device presented
+usb: started
+env FINAL / phy FINAL           转储 + 满屏 console 输出
+usb: command loop entered
+[1 秒纯自旋, 不 pump handle_event]
+snap C-in-loop-1s
+```
+
+上拉一旦出现，主机在毫秒级内就会发 reset 和 `GET_DESCRIPTOR`。那 1 秒里没有
+`handle_event` 调用，SETUP 包无人取走，**主机超时后不会重试**。
+
+### 6.5.4 结论
+
+`DEVADDR = 0` 有三个叠加的原因，全部指向同一个事实：**主机的控制请求没有被应答。**
+
+| 原因 | 修复 |
+|---|---|
+| 厂商栈报告成功但核心停止 | `7a360d7` 重试 RunStop 直到 `DEVCTRLHLT` 清零 |
+| 事件泵被计数门控挡住 | `4735b86` 每轮 pump |
+| 枚举窗口被 1 秒空转跳过 | `537fb42` 入口即 pump |
+
+---
+
 ## 7. 下一步的判据
 
 一次运行看这一行：

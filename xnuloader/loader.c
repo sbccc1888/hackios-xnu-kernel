@@ -4122,6 +4122,8 @@ static int usb_sweep_mode;
 static int usb_hk6_only_mode;
 /* usb_diag=1: run the register map and write-path test on the boot path. */
 static int usb_diag_mode;
+/* usb_no_epcfg=1: let UsbDeviceDxe configure endpoints, do not do it first. */
+static int usb_no_epcfg_mode;
 
 /*
  * CHIRON_BCDUSB: 0x0200, not 0x0210.
@@ -6402,6 +6404,7 @@ usb_start(void)
 	usb_sweep_mode = 0;
 	usb_hk6_only_mode = 0;
 	usb_diag_mode = 0;
+	usb_no_epcfg_mode = 0;
 	{
 		struct payload_info npi;
 
@@ -6445,6 +6448,11 @@ usb_start(void)
 				if (starts_with(c, "usb_diag=1") &&
 				    (c[10] == 0 || c[10] == ' ')) {
 					usb_diag_mode = 1;
+				}
+				/* "usb_no_epcfg=1" is 14 characters */
+				if (starts_with(c, "usb_no_epcfg=1") &&
+				    (c[14] == 0 || c[14] == ' ')) {
+					usb_no_epcfg_mode = 1;
 				}
 			}
 		}
@@ -6501,7 +6509,21 @@ usb_start(void)
 		chiron_count_protos("pre-hk6");
 		if (chiron_usb_hk6()) {
 			print("usb: HK6 gave us UsbFnIo\n");
-			chiron_usbfn_endpoints();
+			/*
+			 * CHIRON_NO_EPCFG
+			 *
+			 * UsbDeviceDxe calls ConfigureEnableEndpoints itself on the StartEx
+			 * path -- its binary carries "Failed to configure and enable
+			 * endpoints" and the Configured-state handling.  Doing it here first
+			 * means the endpoints are configured twice, which is the state
+			 * UsbfnDwc3Dxe warns about with "physical endpoint %d already
+			 * configured".
+			 */
+			if (!usb_no_epcfg_mode) {
+				chiron_usbfn_endpoints();
+			} else {
+				print("usb: endpoint config left to UsbDeviceDxe\n");
+			}
 			chiron_count_protos("post-hk6");
 		} else {
 			print("usb: HK6 did not reach UsbFnIo\n");

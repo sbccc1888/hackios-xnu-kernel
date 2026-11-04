@@ -6379,14 +6379,15 @@ usb_start(void)
 				    (c[15] == 0 || c[15] == ' ')) {
 					usb_hk6_only_mode = 1;
 				}
-	/* CHIRON_PROBE_ENTRY: usb_probe=1 asks the transport before any write. */
-	if (usb_probe_mode) {
-		chiron_probe_entry();
-		flush_log();
-	}
 			}
 		}
 	}
+	/* CHIRON_PROBE_ENTRY: usb_probe=1 asks the transport before any write. */
+	if (usb_probe_mode) {
+	chiron_probe_entry();
+	flush_log();
+	}
+
 	print("usb: native ", 0);
 	print("%x", (uint64_t)usb_native_mode);
 	print(" manual ", 0);
@@ -6413,9 +6414,9 @@ usb_start(void)
 	if (!usb_pure_mode) {
 		chiron_clocks_on();
 		chiron_gdsc_on();
-	chiron_gcc_bcr();
+		chiron_gcc_bcr();
 		chiron_phy_map();
-	chiron_write_test();
+		chiron_write_test();
 		chiron_qusb2_init();
 	}
 

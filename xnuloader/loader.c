@@ -4845,14 +4845,27 @@ chiron_qusb2_init(void)
 	 * a 32-bit store at 0x00 spread 0x80 over four registers, which is where the
 	 * misleading 0x80808080 readbacks came from.
 	 */
+	/*
+	 * CHIRON_V2_INIT_SEQ
+	 *
+	 * chiron is msm8998-v2, whose device tree replaces this sequence outright
+	 * (msm8998-v2.dtsi:1128).  The v2 values differ from the v1 ones this port had
+	 * been using in two of the seven entries and add a third:
+	 *
+	 *   tune1   0xa5 (was 0xf0)
+	 *   tune2   0x09 (was 0x0f)
+	 *   0xb4     0x19 (never written)
+	 *
+	 * and there is no 0x00 entry in the v2 sequence at all.
+	 */
 	static const uint32_t seq[][2] = {
-		{0x80, 0x000},
-		{0x13, 0x004},
-		{0x7c, 0x18c},
-		{0x80, 0x02c},
-		{0x0a, 0x184},
-		{0xf0, 0x23c},
-		{0x0f, 0x240},
+		{0x13, 0x004},   /* analog_controls_two */
+		{0x7c, 0x18c},   /* pll_clock_inverter */
+		{0x80, 0x02c},   /* pll_cmode */
+		{0x0a, 0x184},   /* pll_lock_delay */
+		{0xa5, 0x23c},   /* tune1 */
+		{0x09, 0x240},   /* tune2 */
+		{0x19, 0x0b4},   /* digital_timers_two */
 	};
 	const uint64_t phy = 0xC012000ULL;
 	const uint64_t bcr = 0x112000ULL;
@@ -5041,14 +5054,19 @@ chiron_qusb2_resume(void)
 static void
 chiron_qusb2_reassert(void)
 {
+		/*
+	 * Same values as CHIRON_V2_INIT_SEQ: msm8998-v2.dtsi:1128.  This function runs
+	 * after the vendor drivers have had the port, so it is the copy that decides
+	 * what the PHY ends up holding.
+	 */
 	static const uint32_t seq[][2] = {
-		{0x80, 0x000},
-		{0x13, 0x004},
-		{0x7c, 0x18c},
-		{0x80, 0x02c},
-		{0x0a, 0x184},
-		{0xf0, 0x23c},
-		{0x0f, 0x240},
+		{0x13, 0x004},   /* analog_controls_two */
+		{0x7c, 0x18c},   /* pll_clock_inverter */
+		{0x80, 0x02c},   /* pll_cmode */
+		{0x0a, 0x184},   /* pll_lock_delay */
+		{0xa5, 0x23c},   /* tune1 */
+		{0x09, 0x240},   /* tune2 */
+		{0x19, 0x0b4},   /* digital_timers_two */
 	};
 	const uint64_t phy = 0xC012000ULL;
 
@@ -5602,7 +5620,7 @@ chiron_phy_restore(void)
 {
 	const uint64_t phy = 0xC012000ULL;
 
-	*(volatile uint8_t *)(uintptr_t)(phy + 0xB4) = 0x19;
+	*(volatile uint8_t *)(uintptr_t)(phy + 0xB4) = 0x19;   /* v2 digital_timers_two */
 	__asm__ volatile ("dsb sy" ::: "memory");
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = 0x23;
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -5771,8 +5789,12 @@ chiron_port_powerdown(void)
 	*(volatile uint8_t *)(uintptr_t)(phy + 0xC0) = 0x10;
 	__asm__ volatile ("dsb sy" ::: "memory");
 
-	/* and back up: clamp released, IO unfrozen, powered */
-	*(volatile uint8_t *)(uintptr_t)(phy + 0xB4) = 0x22;
+	/*
+	 * Leave 0xB4 alone: the msm8998-v2 device tree sets digital_timers_two to
+	 * 0x19 and that is what the entry snapshot shows the firmware had written.
+	 * Writing 0x22 here, as the v1 driver's return-to-normal path does, was
+	 * undoing the correct value.
+	 */
 	__asm__ volatile ("dsb sy" ::: "memory");
 	chiron_udelay(3000);
 

@@ -6281,64 +6281,73 @@ chiron_dwc3_run(void)
 	    (uint64_t)((dsts >> 24) & 1), (uint64_t)((dsts >> 18) & 0xf));
 }
 
+/*
+ * CHIRON_RUNSTOP_IS_REQUIRED
+ *
+ * This is not a workaround, it is the step the vendor stack leaves out.
+ *
+ * Measured, from the last full run:
+ *
+ *   snap A-before-start_ex  run 0 hlt 1    after HK6's StartController
+ *   snap B-after-start_ex   run 0 hlt 1    after ConfigureEnableEndpoints + start_ex
+ *   late                    run 1 hlt 0    only after this function wrote RunStop
+ *
+ * ConfigureEnableEndpoints and start_ex both returned EFI_SUCCESS and the core stayed
+ * halted.  A halted controller fetches nothing, so the GET_DESCRIPTOR setup packet is
+ * never collected and SET_ADDRESS never happens -- DEVADDR stays zero, which is the
+ * symptom this port has been chasing.
+ *
+ * Write RunStop, then read DSTS back and say whether the core actually came up.  If
+ * DCTL.RunStop does not stick, or DSTS.DEVCTRLHLT stays set, that is worth knowing
+ * explicitly rather than inferring from silence.
+ */
 static void
 chiron_dwc3_late_run(void)
 {
 	const uint64_t dwc = 0xA800000ULL;
 	uint32_t gusb2, dctl, dsts;
+	unsigned tries;
 
 	gusb2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
 	gusb2 &= ~((1u << 8) | (1u << 6));      /* ENBLSLPM | SUSPHY */
 	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC200) = gusb2;
 
-	/* 1. run the core */
-	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-	dctl &= ~(1u << 30);
-	dctl |= (1u << 31);                     /* RunStop */
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
-	chiron_udelay(10000);
+	for (tries = 0; tries < 10; tries++) {
+		dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+		dctl &= ~(1u << 30);
+		dctl |= (1u << 31);                 /* RunStop */
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		chiron_udelay(2000);
 
-	/*
-	 * 2. CHIRON_ULSTCHNG
-	 *
-	 * DWC3_DCTL_ULSTCHNGREQ_MASK = 0x0f << 5 -- bits 8:5, not bit 8 as this
-	 * loader assumed before.  A zero request means "no action", which is why the
-	 * link never moved.  Ask for U2 (value 2) the way dwc3 does, poll for the
-	 * connect, then drop the request back to no-action.
-	 */
-	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-	dctl &= ~(0x0fu << 5);
-	dctl |= (2u << 5);                      /* ULSTCHNGREQ_U2 */
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
-
-	{
-		uint64_t freq = 0, began = 0, now = 0;
-
-		__asm__ volatile ("mrs %0, CNTFRQ_EL0" : "=r" (freq));
-		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (began));
-		for (;;) {
-			dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
-			if (dsts & (1u << 24)) {        /* CONNSTAT */
-				break;
-			}
-			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
-			if (now - began > freq / 2) {
-				break;
-			}
+		dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+		if ((dsts & (1u << 22)) == 0) {     /* DEVCTRLHLT clear = not halted */
+			break;
 		}
 	}
 
-	/* 3. one-shot request: clear it again */
+	/* one ULStChngReq to nudge the link, then report */
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	dctl &= ~(0x0fu << 5);
+	dctl |= (2u << 5);                      /* U2 */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
+	chiron_udelay(5000);
+
 	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
 	dctl &= ~(0x0fu << 5);
 	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
 
+	/* leave 0xB4 as the working hardware has it */
+	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB4) = 0x19;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
 	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
 	dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
-	print("late: DCTL %x run %x ulst %x | DSTS %x conn %x lkst %x spd %x\n",
-	    (uint64_t)dctl, (uint64_t)((dctl >> 31) & 1), (uint64_t)((dctl >> 5) & 0xf),
-	    (uint64_t)dsts, (uint64_t)((dsts >> 24) & 1),
-	    (uint64_t)((dsts >> 18) & 0xf), (uint64_t)(dsts & 7));
+	print("late: DCTL %x run %x hlt %x lkst %x spd %x tries %x addr %x\n",
+	    (uint64_t)dctl, (uint64_t)((dctl >> 31) & 1),
+	    (uint64_t)((dsts >> 22) & 1), (uint64_t)((dsts >> 18) & 0xf),
+	    (uint64_t)(dsts & 7), (uint64_t)tries,
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) >> 3) & 0x7f));
 }
 
 static int

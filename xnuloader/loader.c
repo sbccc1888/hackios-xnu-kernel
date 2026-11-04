@@ -7507,8 +7507,40 @@ usb_wait(uint8_t endpoint)
 		if (READ_SYSREG(CNTVCT_EL0) - began > 3 * freq) {
 			return -1;
 		}
-		if (msg == UsbDeviceEventTransferNotification && data.transfer.endpoint_index == endpoint) {
-			return data.transfer.status == UsbDeviceTransferStatusCompleteOK ? (int64_t)data.transfer.bytes_completed : -1;
+		/*
+		 * CHIRON_EP_INDEX_EVIDENCE
+		 *
+		 * `endpoint` here is a raw address: USB_EP_IN 0x81, USB_EP_OUT 0x01.  If the
+		 * driver reports the bare endpoint number in endpoint_index instead, this
+		 * comparison never matches, every wait burns its 3 s budget and returns -1, and
+		 * the effect is indistinguishable from a host that never spoke.
+		 *
+		 * No log so far has shown endpoint_index, so record it the first time a transfer
+		 * notification arrives for anything that does not match, and the first time one
+		 * does.  One run settles which form the driver uses.
+		 */
+		if (msg == UsbDeviceEventTransferNotification) {
+			if (data.transfer.endpoint_index == endpoint) {
+				static int said_match;
+
+				if (!said_match) {
+					said_match = 1;
+					print("usb: ep match idx %x ep %x bytes %x\n",
+					    (uint64_t)data.transfer.endpoint_index, (uint64_t)endpoint,
+					    (uint64_t)data.transfer.bytes_completed);
+				}
+				return data.transfer.status == UsbDeviceTransferStatusCompleteOK
+				    ? (int64_t)data.transfer.bytes_completed : -1;
+			}
+			{
+				static int said_miss;
+
+				if (!said_miss) {
+					said_miss = 1;
+					print("usb: ep MISMATCH idx %x wanted %x\n",
+					    (uint64_t)data.transfer.endpoint_index, (uint64_t)endpoint);
+				}
+			}
 		}
 		if (READ_SYSREG(CNTVCT_EL0) - last_pet > freq) {
 			last_pet = READ_SYSREG(CNTVCT_EL0);

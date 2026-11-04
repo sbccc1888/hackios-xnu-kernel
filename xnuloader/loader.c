@@ -6419,6 +6419,27 @@ chiron_dwc3_late_run(void)
 	const uint64_t dwc = 0xA800000ULL;
 	uint32_t gusb2, dctl, dsts;
 	unsigned tries;
+	int driver_started_it;
+
+	/*
+	 * CHIRON_DID_THE_DRIVER_START_IT
+	 *
+	 * Read the core's state before touching it.  With endpoints now configured before
+	 * StartController -- the order UsbfnDwc3Dxe uses internally -- the driver may well
+	 * start the core itself.  If it does, forcing RunStop afterwards proves nothing and
+	 * hides whether the ordering fix worked.  So: look, say what was found, and only
+	 * take over when the driver left the core halted.
+	 */
+	dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	driver_started_it = ((dctl >> 31) & 1) != 0 && ((dsts >> 22) & 1) == 0;
+
+	if (driver_started_it) {
+		print("late: driver left the core RUNNING (run 1 hlt 0) -- ordering fix held\n");
+	} else {
+		print("late: driver left the core HALTED (run %x hlt %x) -- forcing\n",
+		    (uint64_t)((dctl >> 31) & 1), (uint64_t)((dsts >> 22) & 1));
+	}
 
 	gusb2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
 	gusb2 &= ~((1u << 8) | (1u << 6));      /* ENBLSLPM | SUSPHY */

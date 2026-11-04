@@ -6756,6 +6756,22 @@ usb_start(void)
 	 * mode: advertise HighSpeed, stay in device mode, wake the PHY's link and
 	 * line detectors, and finally run the core so D+ is driven.
 	 */
+	/*
+	 * CHIRON_ARM_BEFORE_START
+	 *
+	 * DEVTEN is armed here, before the core is started, not after.  late_run's whole
+	 * effect is that the core runs and D+ comes up, and the host resets and asks for the
+	 * device descriptor within milliseconds of that.  Arming two statements later means
+	 * the first attach, the reset and the setup packet all arrive while the controller
+	 * is not generating interrupts for them -- and then the loader pumps a driver that
+	 * was never told anything happened.
+	 *
+	 * DEVTEN is a controller register; it does not require a running core, so there is
+	 * no reason to arm it afterwards.
+	 */
+	chiron_event_arm();
+	chiron_event_probe("armed-before-start");
+
 	if (usb_pure_mode) {
 		/*
 		 * Even this mode has to start the core: the vendor path leaves RunStop
@@ -6785,8 +6801,6 @@ usb_start(void)
 			chiron_qusb2_report_levels();
 		}
 	}
-	chiron_event_arm();
-	chiron_event_probe("armed");
 
 	/*
 	 * CHIRON_PUMP_IN_USB_START

@@ -7069,7 +7069,33 @@ usb_start(void)
 	if (!usb_hk6_only_mode) {
 		s = USB->start_ex(&set);
 	} else {
-		print("usb: start_ex skipped (usb_hk6_only)\n");
+		/*
+		 * CHIRON_HK6_ONLY_STARTS_ITSELF
+		 *
+		 * This mode skips start_ex, and nothing else starts the controller any more:
+		 * chiron_usbfn_endpoints() stopped calling StartController in 1a5a240, and
+		 * chiron_dwc3_run() is manual-mode only.  Without this call the mode would
+		 * leave a halted core and its comparison would prove nothing.
+		 *
+		 * So start it here, through UsbFnIo, which is what HK6 was previously assumed
+		 * to have done.  The point of the mode is to see how far enumeration gets
+		 * without UsbDeviceDxe's StartEx, and that only means something if the
+		 * controller is running.
+		 */
+		efi_usbfn_io *fn = NULL;
+		static const efi_guid usbfn_guid = QCOM_USBFN_IO_GUID;
+
+		print("usb: start_ex skipped (usb_hk6_only); starting via UsbFnIo\n");
+		if (usb_dev_handle != NULL &&
+		    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &usbfn_guid, (void **)&fn)) &&
+		    fn != NULL && fn->start_controller != NULL) {
+			s = fn->start_controller(fn);
+			print("usb: UsbFnIo start_controller ", 0);
+			print("%x", (uint64_t)s);
+			print("\n", 0);
+		} else {
+			print("usb: no UsbFnIo start_controller available\n");
+		}
 		chiron_fn_events("after-hk6");
 	}
 	chiron_dwc3_snap("B-after-start_ex");

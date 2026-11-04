@@ -5334,16 +5334,42 @@ chiron_dwc3_highspeed(void)
 	uint32_t dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
 
 	/*
-	 * CHIRON_DCFG_REPORTS_ONLY
+	 * CHIRON_DCFG_MUST_BE_HIGHSPEED
 	 *
-	 * This used to force DCFG bits 2:0 to HighSpeed immediately after start_ex.  DCFG is
-	 * the driver's register: it derives the speed from the link negotiation, and
-	 * overwriting that right after it succeeded leaves the state machine describing a
-	 * speed the hardware no longer has.  Report what the driver chose instead -- every
-	 * log until now showed the value after this overwrite, never the driver's own.
+	 * This was briefly made report-only on the argument that DCFG belongs to the driver.
+	 * The measurement says otherwise.  The last real run logged
+	 *
+	 *     DCFG before 80804 speed 4     the driver left SuperSpeed
+	 *     DCFG after  80800 speed 0     forced to HighSpeed
+	 *
+	 * and speed 4 is SuperSpeed.  chiron is micro-USB with a USB2-only QUSB2 phy: no SS
+	 * lane, no SS phy, bcdUSB 0x0200, ss_descriptors NULL.  A controller told to run at
+	 * SuperSpeed on hardware that cannot will not enumerate -- and it will do so while
+	 * answering EFI_SUCCESS at every layer, which is the exact shape of this
+	 * investigation.
+	 *
+	 * So this is not a fight over register ownership.  It is correcting a speed the
+	 * driver derived from platform information that claims SuperSpeed support on a part
+	 * that does not have it.  The overwrite is the cheap place to correct it.
+	 *
+	 * GCTL below stays report-only: its measured value was already dir 2 (device), so
+	 * that write was genuinely inert rather than necessary.
 	 */
-	print("dwc3: DCFG %x speed %x (driver's choice, not overridden)\n",
+	print("dwc3: DCFG before %x speed %x\n",
 	    (uint64_t)dcfg, (uint64_t)(dcfg & 7));
+
+	if ((dcfg & 7u) != 0u) {
+		dcfg &= ~7u;                    /* DWC3_DCFG_SPEED_MASK */
+		dcfg |= 0u;                     /* DWC3_DCFG_HIGHSPEED */
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) = dcfg;
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+		print("dwc3: DCFG after  %x speed %x (was not HighSpeed)\n",
+		    (uint64_t)dcfg, (uint64_t)(dcfg & 7));
+	} else {
+		print("dwc3: DCFG already HighSpeed, left alone\n", 0);
+	}
 }
 
 /*

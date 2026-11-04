@@ -6679,11 +6679,23 @@ usb_start(void)
 		unsigned pumped = 0, changes = 0;
 		uint32_t last_msg = 0;
 
-		for (;;) {
+		/*
+		 * CHIRON_BUDGET_BEFORE_CALL
+		 *
+		 * The time check has to come BEFORE handle_event, not after.  The call does
+		 * not return when the controller is up and nothing is pending, so a check
+		 * that follows it is never reached -- that is precisely how the phone was
+		 * lost earlier in this session, and this loop had the same shape.
+		 */
+		while (pumped < 200000) {
 			uint32_t m = UsbDeviceEventNoEvent;
 			uint64_t sz = 0;
 			usb_device_event_data d;
-			uint64_t now;
+			uint64_t now = READ_SYSREG(CNTVCT_EL0);
+
+			if (now - began > freq / 4) {           /* 250 ms */
+				break;
+			}
 
 			memset(&d, 0, sizeof(d));
 			USB->handle_event(&m, &sz, &d);
@@ -6696,10 +6708,8 @@ usb_start(void)
 				changes++;
 				usb_connected = (d.device_state == UsbDeviceStateConnected);
 			}
-
-			now = READ_SYSREG(CNTVCT_EL0);
-			if (now - began > freq / 4) {           /* 250 ms */
-				break;
+			if (pumped == 1 || (pumped % 50000) == 0) {
+				wdt_pet();                      /* keep the reset path alive */
 			}
 		}
 		print("usb: pre-loop pumped %d changes %d last %x connected %d\n",

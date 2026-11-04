@@ -5770,9 +5770,35 @@ chiron_event_arm(void)
 	__asm__ volatile ("dsb sy" ::: "memory");
 	chiron_udelay(2000);
 
-	print("evt: armed devten now ", 0);
-	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC708));
-	print("\n", 0);
+	/*
+	 * CHIRON_EVENT_RING
+	 *
+	 * DEVTEN does nothing if the controller has nowhere to write an event.  This loader
+	 * never programs GEVNTADRLO (0xC400) or GEVNTSIZ (0xC408) -- they are only read --
+	 * so they hold whatever UsbfnDwc3Dxe's StartController left behind.  If they are
+	 * zero then every event is dropped and the class driver can never learn that the
+	 * host attached, no matter how often it is pumped.
+	 *
+	 * State the conclusion rather than leaving the numbers to be interpreted later.  No
+	 * attempt is made to allocate a ring here: it has to sit in memory the controller can
+	 * DMA to, and a guess would fail less visibly than this does.
+	 */
+	{
+		uint32_t adr = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC400);
+		uint32_t sz = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC408);
+
+		print("evt: armed devten now ", 0);
+		print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC708));
+		print(" ring adr ", 0);
+		print("%x", (uint64_t)adr);
+		print(" sz ", 0);
+		print("%x", (uint64_t)sz);
+		if (adr == 0 || sz == 0) {
+			print("  <-- NO EVENT RING: events cannot be latched\n", 0);
+		} else {
+			print("  ring present\n", 0);
+		}
+	}
 }
 
 /*

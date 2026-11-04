@@ -4837,6 +4837,45 @@ chiron_clocks_on(void)
  *   GCC_QUSB2PHY_PRIM_BCR           0x112000  (GCC 0x100000 + 0x12000), bit0 reset
  *   TCSR clamp                      0x1FCB24C
  */
+/*
+ * CHIRON_EFUSE_TUNE1
+ *
+ * Fold the per-chip tune1 trim out of the efuse into the DTS default, exactly as
+ * qusb_phy_get_tune1_param() does (phy-msm-qusb-v2.c:383-411):
+ *
+ *   efuse 0x784238, bits 19:16   (bit-pos 16, four bits, from msm8998-v2.dtsi)
+ *   tune1 = (tune1 & 0x0f) | (efuse_value << 4)
+ *
+ * If the efuse field reads zero the DTS value stands, which is what the driver does
+ * too ("if (qphy->tune_val)").
+ */
+static void
+chiron_efuse_tune1(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+	const uint64_t efuse = 0x784238ULL;      /* msm8998-v2 "efuse_addr" */
+	uint32_t raw = *(volatile uint32_t *)(uintptr_t)efuse;
+	uint32_t trim = (raw >> 16) & 0xf;
+	uint8_t tune1 = *(volatile uint8_t *)(uintptr_t)(phy + 0x23C);
+
+	print("efuse: raw ", 0);
+	print("%x", (uint64_t)raw);
+	print(" trim ", 0);
+	print("%x", (uint64_t)trim);
+	print(" tune1 ", 0);
+	print("%x", (uint64_t)tune1);
+
+	if (trim != 0) {
+		uint8_t merged = (uint8_t)((tune1 & 0x0f) | (trim << 4));
+
+		*(volatile uint8_t *)(uintptr_t)(phy + 0x23C) = merged;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		print(" -> ", 0);
+		print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x23C));
+	}
+	print("\n", 0);
+}
+
 static void
 chiron_qusb2_init(void)
 {
@@ -4894,6 +4933,7 @@ chiron_qusb2_init(void)
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 
+	chiron_efuse_tune1();
 	/* CHIRON_QUSB2_PWRUP: 32-bit again, POWR_DOWN clear, CLAMP_N_EN set */
 	*(volatile uint32_t *)(uintptr_t)(phy + 0x210) =
 	    (*(volatile uint32_t *)(uintptr_t)(phy + 0x210) & ~1u) | 2u;

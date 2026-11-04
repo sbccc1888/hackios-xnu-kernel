@@ -6376,7 +6376,18 @@ chiron_port_powerdown(void)
 	*(volatile uint8_t *)(uintptr_t)(phy + 0xB4) = 0x23;
 	__asm__ volatile ("dsb sy" ::: "memory");
 
-	/* PLL auto-programming: enable | reset_n | reset count 5 */
+	/*
+	 * CHIRON_PLL_AUTOPGM
+	 *
+	 * QUSB2PHY_PLL_AUTOPGM_CTL1 (0x1C): bit 7 AUTOPGM_EN, bit 4 PLL_RESET_N, bits 3:0 the
+	 * reset count.  The comment here used to claim "enable | reset_n | reset count 5",
+	 * which is 0x95; the code wrote 0x00; the vendor driver writes 0x05
+	 * (phy-msm-qusb.c:934).  Three different values described in one place.
+	 *
+	 * What the code does is clear AUTOPGM_EN and PLL_RESET_N, which is right for a helper
+	 * whose job is to put the PHY back into a powered-down state.  The comment now says
+	 * that.  chiron_pll_resume() restores the count before the core is started.
+	 */
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x1C) = 0x00;
 	__asm__ volatile ("dsb sy" ::: "memory");
 
@@ -6767,6 +6778,33 @@ chiron_dwc3_run(void)
  * DCTL.RunStop does not stick, or DSTS.DEVCTRLHLT stays set, that is worth knowing
  * explicitly rather than inferring from silence.
  */
+/*
+ * CHIRON_PLL_RESUME
+ *
+ * chiron_port_powerdown() clears PLL_AUTOPGM_CTL1 (0x1C) as part of putting the PHY back into
+ * a powered-down state, and the finish path calls it immediately before late_run() -- which is
+ * what starts the core.  So the PLL was configured for power-down and then asked to run.
+ *
+ * The vendor's power-up sequence (phy-msm-qusb.c:931-944) writes the reset count as its second
+ * step, before releasing the clamp and powering the PLL.  Restore that here so the value does
+ * not depend on which helper ran last.
+ *
+ * 0x05 is PLL_RESET_N_CNT_5 -- the reset count alone, exactly what the driver writes.
+ */
+static void
+chiron_pll_resume(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+	uint8_t before = *(volatile uint8_t *)(uintptr_t)(phy + 0x1C);
+
+	if (before != 0x05) {
+		*(volatile uint8_t *)(uintptr_t)(phy + 0x1C) = 0x05;
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+	print("qusb2: pll autopgm %x -> ", (uint64_t)before);
+	print("%x\n", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x1C));
+}
+
 /*
  * CHIRON_LATE_RUN_REPORTS_ONLY
  *
@@ -7269,6 +7307,7 @@ usb_start(void)
 		 * "clean" run that never had a chance of enumerating.
 		 */
 		chiron_vbus_override();
+		chiron_pll_resume();
 		chiron_dwc3_late_run();
 	} else {
 		chiron_dwc3_highspeed();
@@ -7286,6 +7325,7 @@ usb_start(void)
 		 * first -- that is the step that makes enumeration possible -- and keep the
 		 * probe behind usb_diag=1.
 		 */
+		chiron_pll_resume();
 		chiron_dwc3_late_run();
 		if (usb_diag_mode) {
 			chiron_qusb2_report_levels();

@@ -6611,74 +6611,49 @@ chiron_dwc3_run(void)
  * DCTL.RunStop does not stick, or DSTS.DEVCTRLHLT stays set, that is worth knowing
  * explicitly rather than inferring from silence.
  */
+/*
+ * CHIRON_LATE_RUN_REPORTS_ONLY
+ *
+ * This function used to write DCTL.RunStop by hand when the driver left the core halted.
+ * The measurement that motivated it was real -- run 0 hlt 1 twice in a row -- but writing
+ * the register directly is not a fix: UsbfnDwc3Dxe runs a state machine over this controller
+ * (UsmProcessEventWorker, "Control state machine failed to process reset event") and changing
+ * RunStop behind its back leaves that machine describing a halted core while the hardware
+ * runs.  Everything the driver does afterwards is then applied to a state it does not believe
+ * in, which is a good way to get a device that runs, reports success, and never answers a
+ * control request.  It also cleared ULSTCHNGREQ, the driver's own field for asking for a link
+ * state change.
+ *
+ * The premise has also weakened: endpoints are now configured before StartController
+ * (65e56a4) and the duplicate start is gone (1a5a240), so the core may well stay running on
+ * its own.  This function now only reports which happened.  If it reports HALTED, that is a
+ * finding to pursue through the driver -- StartController again, or whatever the state
+ * machine is actually waiting for -- rather than something to paper over at the register
+ * level.
+ */
 static void
 chiron_dwc3_late_run(void)
 {
 	const uint64_t dwc = 0xA800000ULL;
-	uint32_t gusb2, dctl, dsts;
-	unsigned tries;
-	int driver_started_it;
-
-	/*
-	 * CHIRON_DID_THE_DRIVER_START_IT
-	 *
-	 * Read the core's state before touching it.  With endpoints now configured before
-	 * StartController -- the order UsbfnDwc3Dxe uses internally -- the driver may well
-	 * start the core itself.  If it does, forcing RunStop afterwards proves nothing and
-	 * hides whether the ordering fix worked.  So: look, say what was found, and only
-	 * take over when the driver left the core halted.
-	 */
-	dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
-	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-	driver_started_it = ((dctl >> 31) & 1) != 0 && ((dsts >> 22) & 1) == 0;
-
-	if (driver_started_it) {
-		print("late: driver left the core RUNNING (run 1 hlt 0) -- ordering fix held\n");
-	} else {
-		print("late: driver left the core HALTED (run %x hlt %x) -- forcing\n",
-		    (uint64_t)((dctl >> 31) & 1), (uint64_t)((dsts >> 22) & 1));
-	}
-
-	gusb2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
-	gusb2 &= ~((1u << 8) | (1u << 6));      /* ENBLSLPM | SUSPHY */
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC200) = gusb2;
-
-	for (tries = 0; tries < 10; tries++) {
-		dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-		dctl &= ~(1u << 30);
-		dctl |= (1u << 31);                 /* RunStop */
-		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
-		__asm__ volatile ("dsb sy" ::: "memory");
-		chiron_udelay(2000);
-
-		dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
-		if ((dsts & (1u << 22)) == 0) {     /* DEVCTRLHLT clear = not halted */
-			break;
-		}
-	}
-
-	/* one ULStChngReq to nudge the link, then report */
-	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-	dctl &= ~(0x0fu << 5);
-	dctl |= (2u << 5);                      /* U2 */
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
-	chiron_udelay(5000);
-
-	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-	dctl &= ~(0x0fu << 5);
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
-
-	/* leave 0xB4 as the working hardware has it */
-	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB4) = 0x19;
-	__asm__ volatile ("dsb sy" ::: "memory");
+	uint32_t dctl, dsts, devten, evcnt;
+	int running;
 
 	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
 	dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
-	print("late: DCTL %x run %x hlt %x lkst %x spd %x tries %x addr %x\n",
-	    (uint64_t)dctl, (uint64_t)((dctl >> 31) & 1),
-	    (uint64_t)((dsts >> 22) & 1), (uint64_t)((dsts >> 18) & 0xf),
-	    (uint64_t)(dsts & 7), (uint64_t)tries,
-	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) >> 3) & 0x7f));
+	devten = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC708);
+	evcnt = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C);
+	running = ((dctl >> 31) & 1) != 0 && ((dsts >> 22) & 1) == 0;
+
+	print("late: %s  run %x hlt %x lkst %x spd %x addr %x devten %x evt %x\n",
+	    running ? "driver left the core RUNNING" : "driver left the core HALTED",
+	    (uint64_t)((dctl >> 31) & 1), (uint64_t)((dsts >> 22) & 1),
+	    (uint64_t)((dsts >> 18) & 0xf), (uint64_t)(dsts & 7),
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) >> 3) & 0x7f),
+	    (uint64_t)devten, (uint64_t)(evcnt & 0xfffc));
+
+	if (!running) {
+		print("late: not forcing it; the driver owns this controller\n");
+	}
 }
 
 static int

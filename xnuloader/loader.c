@@ -4743,6 +4743,51 @@ chiron_udelay(uint64_t us)
  * locked, and both D+ and D- reading low.
  */
 /*
+ * CHIRON_GCC_BCR
+ *
+ * Release the USB3 block resets.  Offsets from msm-clocks-hwio-8998.h, which the
+ * GCC driver itself includes: a BCR register holds its block in reset whenever
+ * bit0 is set.
+ *
+ *   GCC_USB_30_BCR        0x0F000   the controller's "core_reset" in the DTS
+ *   GCC_QUSB2PHY_PRIM_BCR 0x12000   QUSB2 primary phy
+ *   GCC_USB3_PHY_BCR      0x50020
+ *
+ * The DTS asks for core_reset by name; nothing in this loader had ever released it.
+ */
+static void
+chiron_gcc_bcr(void)
+{
+	static const struct { uint32_t off; const char *name; } list[] = {
+		{0x0F000, "usb30   "},
+		{0x12000, "qusb2p  "},
+		{0x12004, "qusb2s  "},
+		{0x50020, "usb3phy "},
+	};
+	const uint64_t gcc = 0x100000ULL;
+
+	for (unsigned i = 0; i < sizeof(list) / sizeof(list[0]); i++) {
+		volatile uint32_t *bcr = (volatile uint32_t *)(uintptr_t)(gcc + list[i].off);
+		uint32_t before = *bcr;
+
+		if ((before & 1u) != 0) {
+			*bcr = before & ~1u;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			chiron_udelay(1000);
+		}
+		print("bcr: ", 0);
+		print((char *)list[i].name, 0);
+		print("%x ", 0);
+		print("%x", (uint64_t)list[i].off);
+		print(" ", 0);
+		print("%x", (uint64_t)before);
+		print(" -> ", 0);
+		print("%x", (uint64_t)*bcr);
+		print("\n", 0);
+	}
+}
+
+/*
  * CHIRON_GDSC_USB30
  *
  * USB3's power domain, at the address the device tree gives it
@@ -6385,6 +6430,7 @@ usb_start(void)
 	if (!usb_pure_mode) {
 		chiron_clocks_on();
 		chiron_gdsc_on();
+	chiron_gcc_bcr();
 		chiron_phy_map();
 	chiron_write_test();
 		chiron_qusb2_init();

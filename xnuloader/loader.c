@@ -5213,42 +5213,6 @@ chiron_qusb2_init(void)
 	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
 	 * what the hardware actually held.
 	 */
-	/*
-	 * CHIRON_MEASURED_INIT_SEQ
-	 *
-	 * Values from msm8998-v2.dtsi, confirmed against the register map captured at
-	 * loader entry while fastboot still had this port working:
-	 *
-	 *   0x184 = 0x0a   0x18c = 0x7c   0x240 = 0x09   0xb4 = 0x19   all match
-	 *   0x23c = 0x45, which is 0xa5 with the efuse trim folded in -- see below
-	 *
-	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
-	 * what the hardware actually held.
-	 */
-	/*
-	 * CHIRON_MEASURED_INIT_SEQ
-	 *
-	 * Values from msm8998-v2.dtsi, confirmed against the register map captured at
-	 * loader entry while fastboot still had this port working:
-	 *
-	 *   0x184 = 0x0a   0x18c = 0x7c   0x240 = 0x09   0xb4 = 0x19   all match
-	 *   0x23c = 0x45, which is 0xa5 with the efuse trim folded in -- see below
-	 *
-	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
-	 * what the hardware actually held.
-	 */
-	/*
-	 * CHIRON_MEASURED_INIT_SEQ
-	 *
-	 * Values from msm8998-v2.dtsi, confirmed against the register map captured at
-	 * loader entry while fastboot still had this port working:
-	 *
-	 *   0x184 = 0x0a   0x18c = 0x7c   0x240 = 0x09   0xb4 = 0x19   all match
-	 *   0x23c = 0x45, which is 0xa5 with the efuse trim folded in -- see below
-	 *
-	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
-	 * what the hardware actually held.
-	 */
 	static const uint32_t seq[][2] = {
 		{0x13, 0x004},   /* analog_controls_two */
 		{0x7c, 0x18c},   /* pll_clock_inverter */
@@ -5300,6 +5264,30 @@ chiron_qusb2_init(void)
 		}
 		chiron_udelay(100);
 	}
+
+	/*
+	 * CHIRON_PHY_AUTO_RESUME
+	 *
+	 * PORT_TEST_CTRL (0xB8) holds the PHY's auto-resume enable.  Working hardware reads
+	 * 0x4e there; this loader never wrote the register.  The vendor driver sequences it
+	 * as 0x0C, barrier, 0x04 whenever the data lines are driven (phy-msm-qusb.c:1034),
+	 * and 0x4e satisfies both of those masks, so fastboot leaves it correctly set.
+	 *
+	 * Auto-resume is what lets the PHY come back from suspend on its own when the host
+	 * drives the bus.  With it off, the device can be visible on the wire and still
+	 * never deliver a packet -- close to the symptom being chased, and something the
+	 * register map has pointed at since the first capture.
+	 *
+	 * Written the same way the driver does, with the barrier between the two writes,
+	 * then read back so the log says whether it took.
+	 */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0xB8) = 0x0C;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint8_t *)(uintptr_t)(phy + 0xB8) = 0x04;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	print("qusb2: auto-resume 0xB8 now ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xB8));
+	print("\n", 0);
 
 	print("qusb2: PLL %x ready %x\n", (uint64_t)ready, (uint64_t)(ready & 1));
 	print("qusb2: r210 %x (pwrdn %x clamp %x)\n",
@@ -5453,19 +5441,7 @@ chiron_qusb2_resume(void)
 static void
 chiron_qusb2_reassert(void)
 {
-		/*
-	 * CHIRON_MEASURED_INIT_SEQ
-	 *
-	 * Values from msm8998-v2.dtsi, confirmed against the register map captured at
-	 * loader entry while fastboot still had this port working:
-	 *
-	 *   0x184 = 0x0a   0x18c = 0x7c   0x240 = 0x09   0xb4 = 0x19   all match
-	 *   0x23c = 0x45, which is 0xa5 with the efuse trim folded in -- see below
-	 *
-	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
-	 * what the hardware actually held.
-	 */
-	static const uint32_t seq[][2] = {
+		static const uint32_t seq[][2] = {
 		{0x13, 0x004},   /* analog_controls_two */
 		{0x7c, 0x18c},   /* pll_clock_inverter */
 		{0x80, 0x02c},   /* pll_cmode */

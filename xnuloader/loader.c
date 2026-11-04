@@ -7676,6 +7676,59 @@ fb_command(char *cmd)
  * something meanwhile, without waiting for it to. This is how a run can be asked to end, and
  * the screen and the log be had while it lasts.
  */
+/*
+ * CHIRON_REASSERT_SPEED
+ *
+ * maximum_speed is UNKNOWN in UEFI because no UEFI interface carries it -- only the device
+ * tree has "maximum-speed = high-speed" and this driver does not read device trees.  core.c
+ * therefore forces SUPER, DCFG is programmed with speed 4, and gadget.c clears
+ * DCTL.HIRD_THRES instead of setting it.
+ *
+ * The corrections applied after start_ex can be undone by the driver itself: it reprograms
+ * DCFG and DCTL whenever it restarts the gadget, and a host reset during enumeration is
+ * exactly such a moment.  A correction that survives only until the first bus reset does not
+ * survive the thing it was written for.
+ *
+ * Reapplied here, cheaply: three reads on the common path, a write only when a value has
+ * drifted.  Returns a bitmask of what it had to fix, or 0.
+ */
+#define CHIRON_FIX_SPEED  (1u << 0)
+#define CHIRON_FIX_LPMCAP (1u << 1)
+#define CHIRON_FIX_HIRD   (1u << 2)
+
+static unsigned
+chiron_reassert_speed(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t dcfg, dctl;
+	unsigned fixed = 0;
+
+	dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+	if ((dcfg & 7u) != 0u || (dcfg & (1u << 22)) == 0) {
+		if ((dcfg & 7u) != 0u) {
+			dcfg &= ~7u;                    /* HighSpeed */
+			fixed |= CHIRON_FIX_SPEED;
+		}
+		if ((dcfg & (1u << 22)) == 0) {
+			dcfg |= (1u << 22);             /* LPM_CAP */
+			fixed |= CHIRON_FIX_LPMCAP;
+		}
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) = dcfg;
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	if (((dctl >> 24) & 0x1fu) != 0x10u) {
+		dctl &= ~(0x1fu << 24);
+		dctl |= (0x10u << 24);                  /* snps,hird-threshold */
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		fixed |= CHIRON_FIX_HIRD;
+	}
+
+	return fixed;
+}
+
 static void
 usb_poll_command(void)
 {
@@ -7686,6 +7739,22 @@ usb_poll_command(void)
 
 	if (USB == NULL) {
 		return;         /* this run was not started over USB */
+	}
+
+	/*
+	 * CHIRON_REASSERT_CALL
+	 *
+	 * Report only when something had drifted, and only once per distinct combination, so
+	 * a driver that keeps reverting a value is visible in the log without spamming it.
+	 */
+	{
+		unsigned fixed = chiron_reassert_speed();
+		static unsigned said;
+
+		if (fixed != 0 && fixed != said) {
+			said = fixed;
+			print("usb: reasserted speed bits %x\n", (uint64_t)fixed);
+		}
 	}
 	if (!usb_rx_queued && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
 		usb_rx_queued = 1;

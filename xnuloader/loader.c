@@ -7542,6 +7542,37 @@ usb_tx(const uint8_t *data, uint64_t len)
 	return usb_wait(USB_EP_IN);
 }
 
+/*
+ * CHIRON_GETVAR_SERIALNO
+ *
+ * fastboot asks for getvar:serialno on connect, and `fastboot devices` prints the answer.  With
+ * no handler it falls through to an empty OKAY, which is legal but makes the one line that would
+ * say "the device enumerated and is answering" read as blank.
+ *
+ * usb_str_serial is a USB string descriptor filled from SMBIOS by usb_serial_fill(): length byte,
+ * type byte, then UTF-16LE.  Render it back to ASCII for the protocol reply.
+ */
+static const char *
+usb_serial_ascii(void)
+{
+	static char out[40];
+	uint32_t n = 0, i;
+
+	if (usb_str_serial[0] < 4 || usb_str_serial[1] != 3) {
+		return "xnuloader";             /* the fallback string, unchanged */
+	}
+	for (i = 2; i + 1 < usb_str_serial[0] && n < sizeof(out) - 1; i += 2) {
+		uint8_t ch = usb_str_serial[i];
+
+		if (ch < 0x20 || ch > 0x7e) {
+			break;
+		}
+		out[n++] = (char)ch;
+	}
+	out[n] = 0;
+	return n == 0 ? "xnuloader" : out;
+}
+
 static void
 fb_reply(const char *code, const char *text)
 {
@@ -7604,6 +7635,13 @@ fb_command(char *cmd)
 				fb_reply("OKAY", "xnuloader");
 			} else if (str_eq(var, "version")) {
 				fb_reply("OKAY", "0.5");
+			} else if (str_eq(var, "serialno")) {
+				/* what `fastboot devices` prints; blank here reads as ambiguous */
+				fb_reply("OKAY", usb_serial_ascii());
+			} else if (str_eq(var, "version-bootloader")) {
+				fb_reply("OKAY", "xnuloader-0.5");
+			} else if (str_eq(var, "secure")) {
+				fb_reply("OKAY", "no");
 			} else if (str_eq(var, "max-download-size")) {
 				fb_reply("OKAY", download_to_ramdisk ? "0xffffffff" : "0x03f00000");
 			} else if (str_eq(var, "result")) {

@@ -5358,6 +5358,27 @@ chiron_dwc3_highspeed(void)
 	print("dwc3: DCFG before %x speed %x\n",
 	    (uint64_t)dcfg, (uint64_t)(dcfg & 7));
 
+	/*
+	 * CHIRON_WHY_IT_IS_SUPERSPEED
+	 *
+	 * dwc3/gadget.c decides this value with a switch on dwc->maximum_speed whose default
+	 * arm is SuperSpeed:
+	 *
+	 *     case USB_SPEED_HIGH:    DWC3_DSTS_HIGHSPEED
+	 *     case USB_SPEED_SUPER:   fallthrough
+	 *     case USB_SPEED_UNKNOWN: fallthrough
+	 *     default:                DWC3_DSTS_SUPERSPEED
+	 *
+	 * The measured DCFG was 0x80804, bits 2:0 = 4 = DWC3_DCFG_SUPERSPEED, so the driver
+	 * took that default arm: maximum_speed was never set to HighSpeed on this part,
+	 * because whatever configured the controller did not know it has a USB2-only phy.
+	 *
+	 * maximum_speed lives inside the driver's own structure and is not exported, so a
+	 * loader cannot set it.  DCFG is only read at the moment it is programmed, though, and
+	 * the correction here has been observed to stick -- which makes the honest description
+	 * of this port: the driver defaults to SuperSpeed because nothing told it otherwise,
+	 * and the loader corrects it afterwards.
+	 */
 	if ((dcfg & 7u) != 0u) {
 		dcfg &= ~7u;                    /* DWC3_DCFG_SPEED_MASK */
 		dcfg |= 0u;                     /* DWC3_DCFG_HIGHSPEED */

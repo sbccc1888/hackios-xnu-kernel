@@ -5330,54 +5330,53 @@ chiron_qusb2_report_levels(void)
  */
 static void chiron_dwc3_snap(const char *where);
 
+/*
+ * CHIRON_PROBE_ENTRY
+ *
+ * What the controller thinks, before this loader writes anything.
+ *
+ * Registers only -- no driver calls.  An earlier version called
+ * USB->handle_event() here, which does not return when no event is pending, and the
+ * phone stopped responding with the reset path never reached.  Everything this probe
+ * needed to know is readable directly:
+ *
+ *   DCFG        0xC700  device address (bits 9:3) and speed (bits 2:0)
+ *   DSTS        0xC70C  link state (bits 21:18), device controller halted (22)
+ *   DEVTEN      0xC708  which device events are unmasked
+ *   GEVNTCOUNT  0xC40C  events pending in the ring
+ *   GCTL        0xC110  port capability (bits 13:12), 2 = device
+ *
+ * A non-zero device address is the one reading that proves the host reached
+ * SET_ADDRESS, i.e. that enumeration actually began.
+ */
 static void
 chiron_probe_entry(void)
 {
-	static const efi_guid usb_guid = QCOM_USB_DEVICE_GUID;
-	usb_device_protocol *udev = NULL;
-	efi_status s;
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t gctl  = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC110);
+	uint32_t dcfg  = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+	uint32_t dctl  = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	uint32_t devten = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC708);
+	uint32_t dsts  = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	uint32_t evcnt = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C);
 
-	print("prob: begin\n");
-
-	s = BS->locate_protocol(&usb_guid, NULL, (void **)&udev);
-	print("prob: UsbDevice ", 0);
-	print("%x", (uint64_t)s);
+	print("prob: cap ", 0);
+	print("%x", (uint64_t)((gctl >> 12) & 3));
+	print(" run ", 0);
+	print("%x", (uint64_t)((dctl >> 31) & 1));
+	print(" addr ", 0);
+	print("%x", (uint64_t)((dcfg >> 3) & 0x7f));
+	print(" spd ", 0);
+	print("%x", (uint64_t)(dcfg & 7));
+	print(" lkst ", 0);
+	print("%x", (uint64_t)((dsts >> 18) & 0xf));
+	print(" hlt ", 0);
+	print("%x", (uint64_t)((dsts >> 22) & 1));
+	print(" devten ", 0);
+	print("%x", (uint64_t)devten);
+	print(" evt ", 0);
+	print("%x", (uint64_t)(evcnt & 0xfffc));
 	print("\n", 0);
-	if (EFI_ERROR(s) || udev == NULL) {
-		return;
-	}
-
-	/* the controller as the firmware left it */
-	chiron_dwc3_snap("PROBE-pre");
-	flush_log();
-
-	/*
-	 * CHIRON_PROBE_SAFE
-	 *
-	 * One handle_event call, nothing else.  Earlier probe code called it eight
-	 * times in a row and the phone stopped responding -- that call does not
-	 * return when no event is pending.  If it hangs here, the log already holds
-	 * PROBE-pre, which is itself the answer: the transport is not serving events.
-	 */
-	if (udev->handle_event != NULL) {
-		uint32_t msg = UsbDeviceEventNoEvent;
-		uint64_t size = 0;
-		usb_device_event_data data;
-
-		memset(&data, 0, sizeof(data));
-		s = udev->handle_event(&msg, &size, &data);
-		print("prob: ev ", 0);
-		print("%x", (uint64_t)s);
-		print(" msg ", 0);
-		print("%x", (uint64_t)msg);
-		print(" state ", 0);
-		print("%x", (uint64_t)(data.device_state & 0xf));
-		print("\n", 0);
-	} else {
-		print("prob: no handle_event\n");
-	}
-
-	chiron_dwc3_snap("PROBE-post");
 	flush_log();
 }
 

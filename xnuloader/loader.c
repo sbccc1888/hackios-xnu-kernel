@@ -6661,6 +6661,52 @@ usb_start(void)
 	}
 	chiron_event_arm();
 	chiron_event_probe("armed");
+
+	/*
+	 * CHIRON_PUMP_IN_USB_START
+	 *
+	 * The core is running and D+ is up.  The host will reset us and ask for the
+	 * device descriptor within milliseconds, so the class driver has to be serviced
+	 * from right here -- not after this function returns, where flush_log() does a
+	 * storage write and read-back first, and not after usb_command_loop() has printed
+	 * its banner.  A host that times out on the descriptor does not ask again.
+	 *
+	 * Pump for a short window and report how many times the driver was serviced and
+	 * whether a state change arrived, so the log shows whether anything was caught.
+	 */
+	{
+		uint64_t freq = READ_SYSREG(CNTFRQ_EL0), began = READ_SYSREG(CNTVCT_EL0);
+		unsigned pumped = 0, changes = 0;
+		uint32_t last_msg = 0;
+
+		for (;;) {
+			uint32_t m = UsbDeviceEventNoEvent;
+			uint64_t sz = 0;
+			usb_device_event_data d;
+			uint64_t now;
+
+			memset(&d, 0, sizeof(d));
+			USB->handle_event(&m, &sz, &d);
+			pumped++;
+
+			if (m != UsbDeviceEventNoEvent) {
+				last_msg = m;
+			}
+			if (m == UsbDeviceEventDeviceStateChange) {
+				changes++;
+				usb_connected = (d.device_state == UsbDeviceStateConnected);
+			}
+
+			now = READ_SYSREG(CNTVCT_EL0);
+			if (now - began > freq / 4) {           /* 250 ms */
+				break;
+			}
+		}
+		print("usb: pre-loop pumped %d changes %d last %x connected %d\n",
+		    (uint64_t)pumped, (uint64_t)changes, (uint64_t)last_msg,
+		    (uint64_t)(usb_connected != 0));
+		flush_log();
+	}
 	if (EFI_ERROR(s)) {
 		print("usb: start failed %x\n", s);
 		return 0;

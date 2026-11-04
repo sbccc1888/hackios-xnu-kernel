@@ -4118,6 +4118,8 @@ static int usb_restore_mode;
 static int usb_probe_mode;
 /* usb_sweep=1: try each UTMI transceiver setting. */
 static int usb_sweep_mode;
+/* usb_hk6_only=1: drive UsbFnIo only, never call start_ex. */
+static int usb_hk6_only_mode;
 
 /*
  * CHIRON_BCDUSB: 0x0200, not 0x0210.
@@ -5383,6 +5385,11 @@ chiron_event_probe(const char *tag)
 	print("%x", (uint64_t)((cnt >> 31) & 1));
 	print(" dgcmd ", 0);
 	print("%x", (uint64_t)dgcmd);
+	/* CHIRON_EVTBUF: a controller with no event buffer cannot latch anything */
+	print(" evtadr ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400));
+	print(" evtsz ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408));
 	print("\n", 0);
 }
 
@@ -6013,6 +6020,7 @@ usb_start(void)
 	usb_restore_mode = 0;
 	usb_probe_mode = 0;
 	usb_sweep_mode = 0;
+	usb_hk6_only_mode = 0;
 	{
 		struct payload_info npi;
 
@@ -6046,6 +6054,11 @@ usb_start(void)
 				if (starts_with(c, "usb_sweep=1") &&
 				    (c[11] == 0 || c[11] == ' ')) {
 					usb_sweep_mode = 1;
+				}
+				/* "usb_hk6_only=1" is 15 characters */
+				if (starts_with(c, "usb_hk6_only=1") &&
+				    (c[15] == 0 || c[15] == ' ')) {
+					usb_hk6_only_mode = 1;
 				}
 	/* CHIRON_PROBE_ENTRY: usb_probe=1 asks the transport before any write. */
 	if (usb_probe_mode) {
@@ -6181,7 +6194,22 @@ usb_start(void)
 		return 0;
 	}
 	chiron_dwc3_snap("A-before-start_ex");
-	efi_status s = USB->start_ex(&set);
+	/*
+	 * CHIRON_SKIP_START_EX
+	 *
+	 * HK6 already started this controller, and chiron_usbfn_endpoints() configured
+	 * it through UsbFnIo.  Calling start_ex on top of that asks the same driver to
+	 * start again; it answers success and does nothing, which looks exactly like a
+	 * working start.  usb_hk6_only=1 leaves start_ex out entirely so the two can be
+	 * told apart.
+	 */
+	efi_status s = 0;   /* EFI_SUCCESS */
+
+	if (!usb_hk6_only_mode) {
+		s = USB->start_ex(&set);
+	} else {
+		print("usb: start_ex skipped (usb_hk6_only)\n");
+	}
 	chiron_dwc3_snap("B-after-start_ex");
 	chiron_usb_probe_protos("poststart");
 	/*

@@ -5333,16 +5333,16 @@ chiron_dwc3_highspeed(void)
 	const uint64_t dwc = 0xA800000ULL;
 	uint32_t dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
 
-	print("dwc3: DCFG before %x speed %x\n",
-	    (uint64_t)dcfg, (uint64_t)(dcfg & 7));
-
-	dcfg &= ~7u;                    /* DWC3_DCFG_SPEED_MASK */
-	dcfg |= 0u;                     /* DWC3_DCFG_HIGHSPEED */
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) = dcfg;
-	__asm__ volatile ("dsb sy" ::: "memory");
-
-	dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
-	print("dwc3: DCFG after %x speed %x\n",
+	/*
+	 * CHIRON_DCFG_REPORTS_ONLY
+	 *
+	 * This used to force DCFG bits 2:0 to HighSpeed immediately after start_ex.  DCFG is
+	 * the driver's register: it derives the speed from the link negotiation, and
+	 * overwriting that right after it succeeded leaves the state machine describing a
+	 * speed the hardware no longer has.  Report what the driver chose instead -- every
+	 * log until now showed the value after this overwrite, never the driver's own.
+	 */
+	print("dwc3: DCFG %x speed %x (driver's choice, not overridden)\n",
 	    (uint64_t)dcfg, (uint64_t)(dcfg & 7));
 }
 
@@ -5362,16 +5362,16 @@ chiron_dwc3_device_mode(void)
 	const uint64_t dwc = 0xA800000ULL;
 	uint32_t gctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC110);
 
-	print("dwc3: GCTL before %x dir %x\n",
-	    (uint64_t)gctl, (uint64_t)((gctl >> 12) & 3));
-
-	gctl &= ~(3u << 12);            /* clear PrtCapDir */
-	gctl |= (2u << 12);             /* DEVICE */
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC110) = gctl;
-	__asm__ volatile ("dsb sy" ::: "memory");
-
-	gctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC110);
-	print("dwc3: GCTL after %x dir %x\n",
+	/*
+	 * CHIRON_GCTL_REPORTS_ONLY
+	 *
+	 * Same reasoning as DCFG above.  GCTL.PrtCapDir is set by the driver from the mode it
+	 * was asked to run in; forcing it to device mode after start_ex succeeded tells us
+	 * nothing and may contradict the driver's own state.  This call originally existed
+	 * because every log showed GCTL in host mode -- but those logs were taken before HK6
+	 * assembled the protocol stack, and none since have shown what the driver leaves.
+	 */
+	print("dwc3: GCTL %x dir %x (driver's choice, not overridden)\n",
 	    (uint64_t)gctl, (uint64_t)((gctl >> 12) & 3));
 }
 

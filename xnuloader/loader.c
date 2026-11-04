@@ -4110,6 +4110,8 @@ static int usb_connected;
 static int usb_native_mode;
 /* usb_manual=1 runs only the manual register work. */
 static int usb_manual_mode;
+/* usb_pure=1: HK6 + VBUS only, no other PHY writes. */
+static int usb_pure_mode;
 
 static const uint8_t usb_dev_desc[18] = { 18, 1, 0x10, 0x02, 0, 0, 0, 64, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
 static const uint8_t usb_ss_dev_desc[18] = { 18, 1, 0x00, 0x03, 0, 0, 0, 9, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
@@ -5102,6 +5104,88 @@ chiron_qusb2_report_levels(void)
 }
 
 /*
+ * CHIRON_PORT_POWERDOWN
+ *
+ * Release the PHY's IO freeze.  QUSB2PHY_PORT_POWERDOWN (0xB4) is
+ *
+ *     BIT(5) CLAMP_N_EN   clamp released
+ *     BIT(1) FREEZIO_N    IO not frozen
+ *     BIT(0) POWER_DOWN   PHY off
+ *
+ * and the reference driver writes all three (0x22) when it wants the PHY *off*.
+ * For the transceiver to drive the wires, POWER_DOWN has to be clear and FREEZIO_N
+ * set.  This port had never written 0xB4 at all, so the block stayed frozen:
+ * powered, PLL locked, and neither data line driven -- exactly what was measured.
+ *
+ * UTMI_CTRL1 (0xC0) is set for device operation as well: TERM_SELECT and
+ * XCVR_SELECT_FS on, OP_MODE_NON_DRIVE off.
+ */
+/*
+ * CHIRON_PORT_NORMAL
+ *
+ * The reference driver's return-to-normal sequence (phy-msm-qusb.c:951-973):
+ * power the PHY down, program PLL auto-programming, select ULPI/UTMI, set
+ * TERM_SELECT, then power it up with the clamp released and the IO unfrozen.
+ *
+ * This port had two details wrong: UTMI_CTRL1 was left at 0x14 instead of plain
+ * TERM_SELECT (0x10), and PLL_AUTOPGM_CTL1 was never programmed.
+ *
+ * Afterwards the read-only status registers say what the wires are doing:
+ *   PORT_INT_STATUS  (0xF0)  bit0 DP, bit1 DM
+ *   PORT_UTMI_STATUS (0xF4)  UTMI line-state view
+ */
+static void
+chiron_port_powerdown(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+	uint8_t b4_before = *(volatile uint8_t *)(uintptr_t)(phy + 0xB4);
+	uint8_t c0_before = *(volatile uint8_t *)(uintptr_t)(phy + 0xC0);
+	uint8_t c4_before = *(volatile uint8_t *)(uintptr_t)(phy + 0xC4);
+	uint8_t st_f0, st_f4;
+
+	/* power down, clamp asserted, IO frozen */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0xB4) = 0x23;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	/* PLL auto-programming: enable | reset_n | reset count 5 */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x1C) = 0x00;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	/* UTMI/ULPI select, TERM_SELECT */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0xC4) = 0x80;
+	*(volatile uint8_t *)(uintptr_t)(phy + 0xC0) = 0x10;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	/* and back up: clamp released, IO unfrozen, powered */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0xB4) = 0x22;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(3000);
+
+	st_f0 = *(volatile uint8_t *)(uintptr_t)(phy + 0xF0);
+	st_f4 = *(volatile uint8_t *)(uintptr_t)(phy + 0xF4);
+
+	print("port: b4 ", 0);
+	print("%x", (uint64_t)b4_before);
+	print("->", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xB4));
+	print(" c0 ", 0);
+	print("%x", (uint64_t)c0_before);
+	print("->", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xC0));
+	print(" c4 ", 0);
+	print("%x", (uint64_t)c4_before);
+	print("->", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xC4));
+	print("\n", 0);
+	print("port: status f0 ", 0);
+	print("%x", (uint64_t)st_f0);
+	print(" f4 ", 0);
+	print("%x", (uint64_t)st_f4);
+	print("\n", 0);
+}
+
+
+/*
  * CHIRON_VBUS_OVERRIDE
  *
  * Convince the controller that VBUS is present.  DWC3 will not start a session,
@@ -5144,33 +5228,7 @@ chiron_vbus_override(void)
  * starts it again; that module cannot run in this build, so this loader does it,
  * after start_ex, and clears the auto-suspend bits the way dwc3-msm.c does.
  */
-static void
-chiron_dwc3_late_run(void)
-{
-	const uint64_t dwc = 0xA800000ULL;
-	uint32_t gusb2, dctl, dsts;
-
-	gusb2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
-	gusb2 &= ~((1u << 8) | (1u << 6));      /* ENBLSLPM | SUSPHY */
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC200) = gusb2;
-
-	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-	dctl &= ~(1u << 30);
-	dctl |= (1u << 31);                     /* RunStop */
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
-
-	chiron_udelay(200000);                  /* 200 ms for a host to answer */
-
-	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-	dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
-	gusb2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
-	print("late: DCTL %x run %x | DSTS %x conn %x link %x | CFG %x\n",
-	    (uint64_t)dctl, (uint64_t)((dctl >> 31) & 1),
-	    (uint64_t)dsts, (uint64_t)((dsts >> 24) & 1),
-	    (uint64_t)((dsts >> 18) & 0xf), (uint64_t)gusb2);
-}
-
-/* CHIRON_DWC3_SNAP: say where the controller stands, at a named point. */
+/* CHIRON_DWC3_SNAP: the controller's state at a named point. */
 static void
 chiron_dwc3_snap(const char *where)
 {
@@ -5186,7 +5244,6 @@ chiron_dwc3_snap(const char *where)
 
 	print("snap ", 0);
 	print((char *)where, 0);
-	/* PRTCAP(13:12)  RUN_STOP(31)  DEVCTRLHLT(22)  USBLNKST(21:18) */
 	print(" cap %x run %x hlt %x lkst %x spd %x | pll %x pw%x ln %x\n",
 	    (uint64_t)((gctl >> 12) & 3),
 	    (uint64_t)((dctl >> 31) & 1),
@@ -5196,29 +5253,58 @@ chiron_dwc3_snap(const char *where)
 	    (uint64_t)pll, (uint64_t)pwrc, (uint64_t)istat);
 }
 
+/*
+ * CHIRON_DWC3_RUN: start the core before HK6 has had its say.  Only used when the
+ * HK6 handshake is not in play; HK6 leaves the core halted and the late run below
+ * is what starts it in that case.
+ */
 static void
 chiron_dwc3_run(void)
 {
 	const uint64_t dwc = 0xA800000ULL;
-	uint32_t dctl, dsts, gusb2;
+	uint32_t dctl, dsts;
 
-	/* the PHY must not be in suspend */
-	gusb2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
-	print("dwc3: GUSB2PHYCFG0 %x\n", (uint64_t)gusb2);
-	if (gusb2 & (1u << 6)) {
-		gusb2 &= ~(1u << 6);
-		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC200) = gusb2;
-		print("dwc3: cleared SUSPENDUSB2 -> %x\n", (uint64_t)gusb2);
-	}
-
-	/* run the core */
 	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
 	dctl &= ~(1u << 30);
 	dctl |= (1u << 31);
 	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
+	chiron_udelay(2000);
 
-	/* and ask the link to come out of suspend */
-	dctl |= (1u << 8);                      /* ULStChngReq */
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	print("dwc3: DCTL %x run %x | DSTS %x conn %x lkst %x\n",
+	    (uint64_t)dctl, (uint64_t)((dctl >> 31) & 1), (uint64_t)dsts,
+	    (uint64_t)((dsts >> 24) & 1), (uint64_t)((dsts >> 18) & 0xf));
+}
+
+static void
+chiron_dwc3_late_run(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t gusb2, dctl, dsts;
+
+	gusb2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
+	gusb2 &= ~((1u << 8) | (1u << 6));      /* ENBLSLPM | SUSPHY */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC200) = gusb2;
+
+	/* 1. run the core */
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	dctl &= ~(1u << 30);
+	dctl |= (1u << 31);                     /* RunStop */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
+	chiron_udelay(10000);
+
+	/*
+	 * 2. CHIRON_ULSTCHNG
+	 *
+	 * DWC3_DCTL_ULSTCHNGREQ_MASK = 0x0f << 5 -- bits 8:5, not bit 8 as this
+	 * loader assumed before.  A zero request means "no action", which is why the
+	 * link never moved.  Ask for U2 (value 2) the way dwc3 does, poll for the
+	 * connect, then drop the request back to no-action.
+	 */
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	dctl &= ~(0x0fu << 5);
+	dctl |= (2u << 5);                      /* ULSTCHNGREQ_U2 */
 	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
 
 	{
@@ -5228,18 +5314,27 @@ chiron_dwc3_run(void)
 		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (began));
 		for (;;) {
 			dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
-			if (dsts & (1u << 24)) break;
+			if (dsts & (1u << 24)) {        /* CONNSTAT */
+				break;
+			}
 			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
-			if (now - began > freq / 2) break;
+			if (now - began > freq / 2) {
+				break;
+			}
 		}
 	}
 
+	/* 3. one-shot request: clear it again */
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	dctl &= ~(0x0fu << 5);
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
+
 	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
 	dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
-	print("dwc3: DCTL %x runstop %x ulst %x\n",
-	    (uint64_t)dctl, (uint64_t)((dctl >> 31) & 1), (uint64_t)((dctl >> 8) & 1));
-	print("dwc3: DSTS %x conn %x link %x speed %x\n", (uint64_t)dsts,
-	    (uint64_t)((dsts >> 24) & 1), (uint64_t)((dsts >> 22) & 3), (uint64_t)(dsts & 7));
+	print("late: DCTL %x run %x ulst %x | DSTS %x conn %x lkst %x spd %x\n",
+	    (uint64_t)dctl, (uint64_t)((dctl >> 31) & 1), (uint64_t)((dctl >> 5) & 0xf),
+	    (uint64_t)dsts, (uint64_t)((dsts >> 24) & 1),
+	    (uint64_t)((dsts >> 18) & 0xf), (uint64_t)(dsts & 7));
 }
 
 static int
@@ -5286,6 +5381,7 @@ usb_start(void)
 	 */
 	usb_native_mode = 0;
 	usb_manual_mode = 0;
+	usb_pure_mode = 0;
 	{
 		struct payload_info npi;
 
@@ -5300,6 +5396,11 @@ usb_start(void)
 				    (c[12] == 0 || c[12] == ' ')) {
 					usb_manual_mode = 1;
 				}
+				/* "usb_pure=1" is 10 characters */
+				if (starts_with(c, "usb_pure=1") &&
+				    (c[10] == 0 || c[10] == ' ')) {
+					usb_pure_mode = 1;
+				}
 			}
 		}
 	}
@@ -5307,6 +5408,8 @@ usb_start(void)
 	print("%x", (uint64_t)usb_native_mode);
 	print(" manual ", 0);
 	print("%x", (uint64_t)usb_manual_mode);
+	print(" pure ", 0);
+	print("%x", (uint64_t)usb_pure_mode);
 	print("\n", 0);
 
 	/*
@@ -5336,9 +5439,11 @@ usb_start(void)
 	 * before it can carry a signal.  chiron_dwc3_run() is only useful when HK6
 	 * did not run, so it stays conditional.
 	 */
-	chiron_clocks_on();
-	chiron_gdsc_on();
-	chiron_qusb2_init();
+	if (!usb_pure_mode) {
+		chiron_clocks_on();
+		chiron_gdsc_on();
+		chiron_qusb2_init();
+	}
 	if (!usb_native_mode || usb_manual_mode) {
 		chiron_dwc3_run();
 	}
@@ -5382,13 +5487,19 @@ usb_start(void)
 	 * mode: advertise HighSpeed, stay in device mode, wake the PHY's link and
 	 * line detectors, and finally run the core so D+ is driven.
 	 */
-	chiron_dwc3_highspeed();
-	chiron_dwc3_device_mode();
-	chiron_qusb2_resume();
-	chiron_vbus_override();
-	chiron_qusb2_reassert();
-	chiron_qusb2_report_levels();
-	chiron_dwc3_late_run();
+	if (usb_pure_mode) {
+		/* only the one write that is known to help */
+		chiron_vbus_override();
+	} else {
+		chiron_dwc3_highspeed();
+		chiron_dwc3_device_mode();
+		chiron_qusb2_resume();
+		chiron_vbus_override();
+		chiron_qusb2_reassert();
+		chiron_port_powerdown();
+		chiron_qusb2_report_levels();
+		chiron_dwc3_late_run();
+	}
 	if (EFI_ERROR(s)) {
 		print("usb: start failed %x\n", s);
 		return 0;

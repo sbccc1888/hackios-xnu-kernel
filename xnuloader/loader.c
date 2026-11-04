@@ -5267,6 +5267,97 @@ chiron_env_snap(const char *tag)
 }
 
 /*
+ * CHIRON_PICK_USB_DEVICE
+ *
+ * Choose the peripheral controller's UsbDevice protocol, not whatever handle
+ * happens to come first.
+ *
+ * Each USB controller publishes both a UsbDevice protocol and a USB Config table.
+ * The Config table says which mode that controller is in (core_num / mode_type),
+ * so walk the Config handles, and for each one find the UsbDevice protocol on
+ * either that same handle or the controller it points at.
+ *
+ * Peripheral modes are UsbModePeripheral (0x02) and UsbModePeripheralAlt (0x04);
+ * UsbModeHost is 0x01 and must never be chosen -- installing device descriptors on
+ * a host controller is a no-op that reports success.
+ *
+ * Returns the UsbDevice protocol to use, or NULL.
+ */
+static usb_device_protocol *
+chiron_pick_usb_device(void)
+{
+	static const efi_guid usb_guid = QCOM_USB_DEVICE_GUID;
+	static const efi_guid cfg_guid = QCOM_USB_CONFIG_GUID;
+	efi_handle *handles = NULL;
+	uint64_t count = 0;
+	usb_device_protocol *chosen = NULL;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &cfg_guid, NULL, &count,
+	    &handles))) {
+		print("pick: no config handles\n");
+		return NULL;
+	}
+	print("pick: ", 0);
+	print("%x", (uint64_t)count);
+	print(" config handles\n", 0);
+
+	for (uint64_t i = 0; i < count; i++) {
+		efi_qcom_usb_config *cfg = NULL;
+		usb_device_protocol *dev = NULL;
+		uint32_t mode = 0xff;
+		uint32_t core = 0xff;
+		int is_peripheral;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &cfg_guid, (void **)&cfg)) ||
+		    cfg == NULL) {
+			continue;
+		}
+		if (cfg->revision == 0x10003) {
+			core = (uint32_t)cfg->core_num;
+			mode = cfg->mode_type;
+		}
+		is_peripheral = (mode == UsbModePeripheral || mode == UsbModePeripheralAlt);
+
+		/* the UsbDevice protocol usually sits on the same handle as the config */
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &usb_guid, (void **)&dev)) ||
+		    dev == NULL) {
+			dev = NULL;
+		}
+
+		print("pick ", 0);
+		print("%x", (uint64_t)i);
+		print(": core ", 0);
+		print("%x", (uint64_t)core);
+		print(" mode ", 0);
+		print("%x", (uint64_t)mode);
+		print(" dev ", 0);
+		print("%x", (uint64_t)(dev != NULL));
+		print("\n", 0);
+
+		if (dev != NULL && is_peripheral && chosen == NULL) {
+			chosen = dev;
+		}
+	}
+	if (handles != NULL) {
+		BS->free_pool(handles);
+	}
+
+	if (chosen == NULL) {
+		/*
+		 * Nothing advertised peripheral mode.  Fall back to the single-handle
+		 * lookup so behaviour is unchanged rather than broken, and say so.
+		 */
+		print("pick: no peripheral controller advertised; using first\n", 0);
+		if (!EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&chosen))) {
+			return chosen;
+		}
+		return NULL;
+	}
+	print("pick: chose a peripheral controller\n", 0);
+	return chosen;
+}
+
+/*
  * CHIRON_EVENT_PROBE
  *
  * Report the device event mask and how many events the controller has latched.
@@ -6049,9 +6140,18 @@ usb_start(void)
 		BS->close_event(event);
 	}
 	chiron_usb_probe_protos("postsignal");
-	if (EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&USB))) {
-		print("usb: device protocol not found\n");
-		return 0;
+	/*
+	 * CHIRON_PICK_USB_DEVICE: take the peripheral controller's protocol.  A plain
+	 * locate_protocol returns whichever handle comes first, which on a dual-role
+	 * controller can be the host one; installing device descriptors there reports
+	 * success and does nothing.
+	 */
+	USB = chiron_pick_usb_device();
+	if (USB == NULL) {
+		if (EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&USB))) {
+			print("usb: device protocol not found\n");
+			return 0;
+		}
 	}
 	/*
 	 * CHIRON_USB2_ONLY

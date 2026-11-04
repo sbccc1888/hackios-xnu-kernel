@@ -5978,10 +5978,14 @@ chiron_port_powerdown(void)
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x1C) = 0x00;
 	__asm__ volatile ("dsb sy" ::: "memory");
 
-	/* UTMI/ULPI select, TERM_SELECT */
-	*(volatile uint8_t *)(uintptr_t)(phy + 0xC4) = 0x80;
-	*(volatile uint8_t *)(uintptr_t)(phy + 0xC0) = 0x10;
-	__asm__ volatile ("dsb sy" ::: "memory");
+	/*
+	 * CHIRON_UTMI_UNTOUCHED
+	 *
+	 * UTMI_CTRL1 (0xC0) and UTMI_CTRL2 (0xC4) are left alone.  Working hardware
+	 * reads 0x00 in both: the controller drives these across the UTMI interface and
+	 * the firmware never writes them.  Setting TERM_SELECT / XCVR_SELECT_FS /
+	 * UTMI_ULPI_SEL by hand overrides the controller's own selection.
+	 */
 
 	/*
 	 * Leave 0xB4 alone: the msm8998-v2 device tree sets digital_timers_two to

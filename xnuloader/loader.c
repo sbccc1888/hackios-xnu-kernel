@@ -4167,7 +4167,156 @@ static const uint8_t usb_bos[42] = {
 static const uint8_t usb_str0[4] = { 4, 3, 0x09, 0x04 };
 static const uint8_t usb_str_mfr[8] = { 8, 3, 'X', 0, 'N', 0, 'U', 0 };
 static const uint8_t usb_str_prod[20] = { 20, 3, 'x', 0, 'n', 0, 'u', 0, 'l', 0, 'o', 0, 'a', 0, 'd', 0, 'e', 0, 'r', 0 };
-static const uint8_t usb_str_serial[20] = { 20, 3, 'x', 0, 'n', 0, 'u', 0, 'l', 0, 'o', 0, 'a', 0, 'd', 0, 'e', 0, 'r', 0 };
+/*
+ * CHIRON_SERIAL_FROM_SMBIOS
+ *
+ * This used to be the product string spelling "xnuloader" -- not a serial number at all,
+ * and identical to usb_str_prod.  fastboot identifies a device by its USB serial; the real
+ * chiron reports 41bc0f2d.  A fixed non-unique string is legal USB but defeats the purpose,
+ * and on Windows the serial is what keys the device instance and driver binding.
+ *
+ * usb_serial_fill() below overwrites this buffer with the platform's SMBIOS serial number
+ * when the firmware configuration table has one -- which it does, because the bootloader
+ * that got us here filled those tables in.  This array is only the fallback, and the log
+ * says when it is used.
+ */
+static uint8_t usb_str_serial[64] = { 20, 3, 'x', 0, 'n', 0, 'u', 0, 'l', 0, 'o', 0, 'a', 0, 'd', 0, 'e', 0, 'r', 0 };
+
+/*
+ * Copy the platform serial number into a USB string descriptor.
+ *
+ * SMBIOS strings are NUL-terminated ASCII, indexed from 1 within the table's string block.
+ * A USB string descriptor is bLength, bDescriptorType 3, then UTF-16LE -- so each ASCII
+ * byte becomes two, and the odd bytes are zero.  Anything that is not printable is skipped
+ * rather than copied, because a control character in a descriptor is a protocol violation
+ * and some hosts reject the whole set for it.
+ *
+ * Returns 1 if a usable string was found.
+ */
+static int
+usb_serial_fill(uint8_t *out, uint32_t cap, const char *tag)
+{
+	static const efi_guid smbios_guid =
+	    { 0xeb9d2d31, 0x2d88, 0x11d3, { 0x9a, 0x16, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d } };
+	uint8_t *ep = NULL;
+	uint8_t *p8, *strs;
+	uint32_t strtbl, n, i, o;
+	const char *serial = NULL;
+
+	out[0] = 2;
+	out[1] = 3;
+	if (cap < 4) {
+		return 0;
+	}
+
+	/* find the SMBIOS entry point among the configuration tables */
+	if (ST != NULL && ST->tables != NULL) {
+		for (uint64_t i2 = 0; i2 < ST->nr_tables; i2++) {
+			if (memcmp(&ST->tables[i2].guid, &smbios_guid, sizeof(smbios_guid)) == 0) {
+				ep = (uint8_t *)(uintptr_t)ST->tables[i2].table;
+				break;
+			}
+		}
+	}
+	if (ep == NULL) {
+		print("serial: no SMBIOS table in the configuration table list\n", 0);
+		return 0;
+	}
+
+	/*
+	 * 32-bit entry point ('_SM_'): 0x00 anchor, 0x18 table address.
+	 * 64-bit entry point ('_SM3_'): 0x00 anchor, 0x10 table address.
+	 */
+	if (ep[0] == '_' && ep[1] == 'S' && ep[2] == 'M' && ep[3] == '3') {
+		strtbl = 0;
+		for (o = 0; o < 8; o++) {
+			strtbl |= (uint32_t)ep[0x10 + o] << (8 * o);
+		}
+	} else if (ep[0] == '_' && ep[1] == 'S' && ep[2] == 'M') {
+		strtbl = 0;
+		for (o = 0; o < 4; o++) {
+			strtbl |= (uint32_t)ep[0x18 + o] << (8 * o);
+		}
+	} else {
+		print("serial: SMBIOS entry point has an unknown anchor\n", 0);
+		return 0;
+	}
+	if (strtbl == 0) {
+		print("serial: SMBIOS table address is zero\n", 0);
+		return 0;
+	}
+
+	/* walk the structures looking for type 1 */
+	p8 = (uint8_t *)(uintptr_t)strtbl;
+	for (n = 0; n < 128; n++) {
+		uint8_t type = p8[0], len = p8[1];
+
+		if (len < 4) {
+			break;
+		}
+		if (type == 127) {          /* end-of-table */
+			break;
+		}
+
+		/* string block starts right after the formatted area */
+		strs = p8 + len;
+
+		if (type == 1 && len > 0x07) {
+			uint8_t idx = p8[0x07];
+
+			if (idx != 0) {
+				const char *s = (const char *)strs;
+
+				for (uint32_t k = 1; k < idx; k++) {
+					while (*s != 0) {
+						s++;
+					}
+					s++;
+				}
+				if (*s != 0) {
+					serial = s;
+				}
+			}
+			break;
+		}
+
+		/* skip the string block: two consecutive NULs terminate it */
+		{
+			uint32_t guard = 0;
+
+			while ((strs[0] != 0 || strs[1] != 0) && guard < 4096) {
+				strs++;
+				guard++;
+			}
+			p8 = strs + 2;
+		}
+	}
+
+	if (serial == NULL) {
+		print("serial: SMBIOS has no type 1 serial number\n", 0);
+		return 0;
+	}
+
+	/* ASCII -> UTF-16LE, skipping anything not printable */
+	i = 0;
+	while (serial[i] != 0 && i < 30) {
+		uint8_t ch = (uint8_t)serial[i];
+
+		if (ch < 0x20 || ch > 0x7e) {
+			break;
+		}
+		out[2 + i * 2] = ch;
+		out[3 + i * 2] = 0;
+		i++;
+	}
+	out[0] = (uint8_t)(2 + i * 2);
+	print("serial: from SMBIOS, ", 0);
+	print((char *)serial, 0);
+	print(" len ", 0);
+	print("%x", (uint64_t)i);
+	print("\n", 0);
+	return i != 0;
+}
 static const uint8_t usb_str_iface[18] = { 18, 3, 'f', 0, 'a', 0, 's', 0, 't', 0, 'b', 0, 'o', 0, 'o', 0, 't', 0 };
 
 static void EFIAPI
@@ -6510,6 +6659,15 @@ usb_start(void)
 {
 	static const efi_guid usb_guid = QCOM_USB_DEVICE_GUID;
 	static const efi_guid init_guid = QCOM_USB_INIT_EVENT_GUID;
+
+	/*
+	 * CHIRON_SERIAL_BEFORE_DESCRIPTORS
+	 *
+	 * Fill the serial string from the platform before the descriptor set is built, so
+	 * "fastboot devices" reports a unit serial instead of the fixed string that used to
+	 * be there.  A failure is not fatal: the fallback string stays and the log says so.
+	 */
+	(void)usb_serial_fill(usb_str_serial, sizeof(usb_str_serial), "usb_start");
 	/*
 	 * Only the USB2 descriptor set is passed.  chiron is micro-USB with a USB2-only
 	 * QUSB2 phy: bcdUSB reads 0x0200 and there is no BOS, so the SuperSpeed descriptor

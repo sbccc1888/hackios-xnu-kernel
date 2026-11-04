@@ -6015,6 +6015,22 @@ chiron_dwc3_snap(const char *where)
 	    (uint64_t)((dsts >> 18) & 0xf),
 	    (uint64_t)(dcfg & 7),
 	    (uint64_t)pll, (uint64_t)pwrc, (uint64_t)istat);
+
+	/*
+	 * CHIRON_DEVADDR
+	 *
+	 * DCFG bits 9:3 hold the address the host assigned.  Anything other than zero
+	 * proves the host reached SET_ADDRESS, i.e. enumeration actually started.
+	 * Zero after the core has been running means no enumeration traffic has ever
+	 * arrived, whatever the link state says.
+	 */
+	print("addr ", 0);
+	print((char *)where, 0);
+	print(": devaddr ", 0);
+	print("%x", (uint64_t)((dcfg >> 3) & 0x7f));
+	print(" lpmcap ", 0);
+	print("%x", (uint64_t)((dcfg >> 22) & 1));
+	print("\n", 0);
 }
 
 /*

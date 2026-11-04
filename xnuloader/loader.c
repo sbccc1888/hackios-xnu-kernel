@@ -4119,7 +4119,16 @@ static int usb_probe_mode;
 /* usb_sweep=1: try each UTMI transceiver setting. */
 static int usb_sweep_mode;
 
-static const uint8_t usb_dev_desc[18] = { 18, 1, 0x10, 0x02, 0, 0, 0, 64, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
+/*
+ * CHIRON_BCDUSB: 0x0200, not 0x0210.
+ *
+ * 0x0210 claims USB 2.0 with Link Power Management.  The phone's own gadget code
+ * only uses that value when the controller is SuperSpeed capable
+ * (composite.c:1681-1690); chiron is micro-USB with a USB2-only phy, so it must
+ * not advertise L1.  A host that believes the claim will try LPM entry against
+ * DCTL fields this port never programs.
+ */
+static const uint8_t usb_dev_desc[18] = { 18, 1, 0x00, 0x02, 0, 0, 0, 64, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
 static const uint8_t usb_ss_dev_desc[18] = { 18, 1, 0x00, 0x03, 0, 0, 0, 9, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
 static const uint8_t usb_cfg_desc[32] = {
 	9, 2, 32, 0, 1, 1, 0, 0x80, 0x50,
@@ -4133,6 +4142,7 @@ static const uint8_t usb_ss_cfg_desc[44] = {
 	7, 5, USB_EP_IN, 2, 0x00, 0x04, 0,   6, 0x30, 4, 0, 0, 0,
 	7, 5, USB_EP_OUT, 2, 0x00, 0x04, 0,  6, 0x30, 4, 0, 0, 0,
 };
+/* bcdUSB 0x0200, class unknown, EP0 max packet 64, 1 config */
 static const uint8_t usb_qualifier[10] = { 10, 6, 0x00, 0x02, 0xff, 0xff, 0xff, 64, 1, 0 };
 static const uint8_t usb_bos[42] = {
 	5, 0x0f, 42, 0, 3,
@@ -5992,12 +6002,23 @@ usb_start(void)
 		print("usb: device protocol not found\n");
 		return 0;
 	}
+	/*
+	 * CHIRON_USB2_ONLY
+	 *
+	 * chiron is micro-USB with a USB2-only QUSB2 phy.  Advertise only what the
+	 * hardware is: bcdUSB 0x0200, no BOS, no SuperSpeed descriptors, no LPM.
+	 *
+	 * Leaving usb_bos attached while bcdUSB reads 0x0200 makes the device
+	 * self-contradictory -- a BOS descriptor requires 2.1 or later -- and a host
+	 * that validates the set will refuse to configure it, which presents as "no
+	 * enumeration" even though the link comes up fine.
+	 */
 	set.device_descriptor = usb_dev_desc;
 	set.descriptors = &cfg;
-	set.ss_device_descriptor = usb_ss_dev_desc;
-	set.ss_descriptors = &ss_cfg;
+	set.ss_device_descriptor = NULL;
+	set.ss_descriptors = NULL;
 	set.device_qualifier = usb_qualifier;
-	set.bos = usb_bos;
+	set.bos = NULL;
 	set.string_count = 5;
 	set.strings = strings;
 	/* ios-party: say what the revision is and refuse a half-built interface, rather

@@ -6679,14 +6679,31 @@ chiron_dwc3_snap(const char *where)
 	uint8_t  pwrc = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
 	uint8_t  istat = *(volatile uint8_t *)(uintptr_t)(phy + 0x230);
 
+	/*
+	 * CHIRON_SNAP_CONNECTSPD
+	 *
+	 * "spd" here used to be dcfg & 7 -- the speed the driver asked for.  DSTS bits 2:0 are
+	 * DWC3_DSTS_CONNECTSPD, the speed the link is actually running at, and those are the
+	 * same field layout in two different registers.  For a session whose central question
+	 * is whether the controller is running at the wrong speed, the register that answers
+	 * it had never been printed.
+	 *
+	 * dcfg's speed is still worth seeing -- it is what the correction targets -- so both
+	 * are printed, labelled.  DSTS.RSS and DSTS.SSS (bits 25 and 24) are added too: on a
+	 * part being corrected away from SuperSpeed, whether the SS state machine is mid-reset
+	 * is directly relevant and nothing has ever looked at it.
+	 */
 	print("snap ", 0);
 	print((char *)where, 0);
-	print(" cap %x run %x hlt %x lkst %x spd %x | pll %x pw%x ln %x\n",
+	print(" cap %x run %x hlt %x lkst %x conn %x dcfgspd %x | rss %x sss %x | pll %x pw%x ln %x\n",
 	    (uint64_t)((gctl >> 12) & 3),
 	    (uint64_t)((dctl >> 31) & 1),
 	    (uint64_t)((dsts >> 22) & 1),
 	    (uint64_t)((dsts >> 18) & 0xf),
+	    (uint64_t)(dsts & 7),
 	    (uint64_t)(dcfg & 7),
+	    (uint64_t)((dsts >> 25) & 1),
+	    (uint64_t)((dsts >> 24) & 1),
 	    (uint64_t)pll, (uint64_t)pwrc, (uint64_t)istat);
 
 	/*

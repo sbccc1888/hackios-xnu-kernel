@@ -7741,21 +7741,7 @@ usb_poll_command(void)
 		return;         /* this run was not started over USB */
 	}
 
-	/*
-	 * CHIRON_REASSERT_CALL
-	 *
-	 * Report only when something had drifted, and only once per distinct combination, so
-	 * a driver that keeps reverting a value is visible in the log without spamming it.
-	 */
-	{
-		unsigned fixed = chiron_reassert_speed();
-		static unsigned said;
 
-		if (fixed != 0 && fixed != said) {
-			said = fixed;
-			print("usb: reasserted speed bits %x\n", (uint64_t)fixed);
-		}
-	}
 	if (!usb_rx_queued && usb_connected && !EFI_ERROR(USB->send(USB_EP_OUT, 511, usb_rx_buf))) {
 		usb_rx_queued = 1;
 	}
@@ -7976,6 +7962,26 @@ usb_command_loop(void)
 
 		int64_t n;
 		uint64_t idle_now = 0;
+
+		/*
+		 * CHIRON_REASSERT_HERE
+		 *
+		 * This belongs here, not in usb_poll_command(): that one only runs once a kernel
+		 * is executing on another core, and enumeration has long since succeeded or
+		 * failed by then.  A bus reset during enumeration happens while this loop is
+		 * what is running, so this is the loop that has to survive it.
+		 *
+		 * Report only when a value had drifted, and only once per distinct combination.
+		 */
+		{
+			unsigned fx = chiron_reassert_speed();
+			static unsigned said_fx;
+
+			if (fx != 0 && fx != said_fx) {
+				said_fx = fx;
+				print("usb: reasserted speed bits %x\n", (uint64_t)fx);
+			}
+		}
 
 		/* CHIRON_USB_NO_SPAM: checked first, every pass, cheaply */
 		__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (idle_now));

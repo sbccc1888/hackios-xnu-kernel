@@ -382,11 +382,19 @@ typedef struct {
 typedef struct efi_usbfn_io_protocol efi_usbfn_io;
 
 /* EFI_USBFN_ENDPOINT_TYPE */
+/*
+ * EFI_USB_ENDPOINT_TYPE, keeping the USB spec's bmAttributes numbering.
+ *
+ * UsbFunctionIo.h defines Control 0x00, Bulk 0x02, and comments out Isochronous 0x01
+ * and Interrupt 0x03 because this controller does not implement them.  An earlier
+ * version of this file renumbered the four contiguously, which put Bulk at 1 and told
+ * the driver an isochronous endpoint was a bulk one.
+ */
 enum {
-	UsbfnEndpointControl = 0,
-	UsbfnEndpointBulk = 1,
-	UsbfnEndpointInterrupt = 2,
-	UsbfnEndpointIsochronous = 3,
+	UsbfnEndpointControl = 0x00,
+	UsbfnEndpointIsochronous = 0x01,
+	UsbfnEndpointBulk = 0x02,
+	UsbfnEndpointInterrupt = 0x03,
 };
 
 /* EFI_USBFN_PORT_TYPE */

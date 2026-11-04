@@ -6570,6 +6570,22 @@ usb_start(void)
 		chiron_qusb2_init();
 	}
 
+	/*
+	 * CHIRON_PICK_BEFORE_HK6
+	 *
+	 * The controller has to be chosen before HK6 talks to it.  Previously the picker
+	 * ran at the very end of this function, so usb_dev_handle was still NULL when
+	 * chiron_usb_hk6() and chiron_usbfn_endpoints() looked at it -- and both silently
+	 * took the locate_protocol fallback, which returns whichever handle comes first.
+	 * Choosing here makes "the chosen controller" mean something.
+	 *
+	 * It is chosen again below, after the protocol signals, because HK6 installs fresh
+	 * protocol tables and the pointers have to be current.
+	 */
+	if (USB == NULL) {
+		USB = chiron_pick_usb_device();
+	}
+
 	if (!usb_manual_mode) {
 		chiron_count_protos("pre-hk6");
 		if (chiron_usb_hk6()) {
@@ -6655,11 +6671,34 @@ usb_start(void)
 	 * controller can be the host one; installing device descriptors there reports
 	 * success and does nothing.
 	 */
-	USB = chiron_pick_usb_device();
-	if (USB == NULL) {
-		if (EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&USB))) {
-			print("usb: device protocol not found\n");
-			return 0;
+	{
+		/*
+		 * CHIRON_PICK_AGAIN
+		 *
+		 * Chosen again because HK6 installs fresh protocol tables and the pointers must
+		 * be current.  Note that this overwrites usb_dev_handle: everything that needed
+		 * it -- chiron_usb_hk6() and chiron_usbfn_endpoints() -- has already run with
+		 * the handle chosen above.  Do not add another UsbFnIo call below this point
+		 * without re-reading this comment; it would be talking to a controller that was
+		 * selected after the controller was started.
+		 *
+		 * The two selections should name the same controller.  If they do not, HK6
+		 * started one and the descriptors are about to be installed on another, which
+		 * would explain a great deal -- so report it rather than letting it pass.
+		 */
+		usb_device_protocol *again = chiron_pick_usb_device();
+
+		if (again == NULL) {
+			if (EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&USB))) {
+				print("usb: device protocol not found\n");
+				return 0;
+			}
+			print("usb: second pick failed; fell back to first handle\n");
+		} else {
+			if (USB != NULL && again != USB) {
+				print("usb: DIFFERENT controller on the second pick\n");
+			}
+			USB = again;
 		}
 	}
 	/*

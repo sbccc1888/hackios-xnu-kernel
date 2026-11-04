@@ -4837,44 +4837,6 @@ chiron_clocks_on(void)
  *   GCC_QUSB2PHY_PRIM_BCR           0x112000  (GCC 0x100000 + 0x12000), bit0 reset
  *   TCSR clamp                      0x1FCB24C
  */
-/*
- * CHIRON_EFUSE_TUNE1
- *
- * Fold the per-chip tune1 trim out of the efuse into the DTS default, exactly as
- * qusb_phy_get_tune1_param() does (phy-msm-qusb-v2.c:383-411):
- *
- *   efuse 0x784238, bits 19:16   (bit-pos 16, four bits, from msm8998-v2.dtsi)
- *   tune1 = (tune1 & 0x0f) | (efuse_value << 4)
- *
- * If the efuse field reads zero the DTS value stands, which is what the driver does
- * too ("if (qphy->tune_val)").
- */
-static void
-chiron_efuse_tune1(void)
-{
-	const uint64_t phy = 0xC012000ULL;
-	const uint64_t efuse = 0x784238ULL;      /* msm8998-v2 "efuse_addr" */
-	uint32_t raw = *(volatile uint32_t *)(uintptr_t)efuse;
-	uint32_t trim = (raw >> 16) & 0xf;
-	uint8_t tune1 = *(volatile uint8_t *)(uintptr_t)(phy + 0x23C);
-
-	print("efuse: raw ", 0);
-	print("%x", (uint64_t)raw);
-	print(" trim ", 0);
-	print("%x", (uint64_t)trim);
-	print(" tune1 ", 0);
-	print("%x", (uint64_t)tune1);
-
-	if (trim != 0) {
-		uint8_t merged = (uint8_t)((tune1 & 0x0f) | (trim << 4));
-
-		*(volatile uint8_t *)(uintptr_t)(phy + 0x23C) = merged;
-		__asm__ volatile ("dsb sy" ::: "memory");
-		print(" -> ", 0);
-		print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x23C));
-	}
-	print("\n", 0);
-}
 
 static void
 chiron_qusb2_init(void)
@@ -4885,26 +4847,69 @@ chiron_qusb2_init(void)
 	 * misleading 0x80808080 readbacks came from.
 	 */
 	/*
-	 * CHIRON_V2_INIT_SEQ
+	 * CHIRON_DTB_INIT_SEQ
 	 *
-	 * chiron is msm8998-v2, whose device tree replaces this sequence outright
-	 * (msm8998-v2.dtsi:1128).  The v2 values differ from the v1 ones this port had
-	 * been using in two of the seven entries and add a third:
+	 * Straight from the device tree this phone actually boots with
+	 * (Mu-Silicium/Resources/DTBs/chiron.dtb, decompiled):
 	 *
-	 *   tune1   0xa5 (was 0xf0)
-	 *   tune2   0x09 (was 0x0f)
-	 *   0xb4     0x19 (never written)
+	 *   qcom,qusb-phy-init-seq = <0x80 0x00  0x13 0x04  0x7c 0x18c
+	 *                             0x80 0x2c  0x0a 0x184  0xf0 0x23c  0x0f 0x240>;
 	 *
-	 * and there is no 0x00 entry in the v2 sequence at all.
+	 * Seven value/offset pairs, and the 0x00 entry is part of it.  An earlier
+	 * revision replaced these with values read out of msm8998-v2.dtsi in the kernel
+	 * source tree; that is a different device tree variant and not the one this
+	 * phone is booted with.
+	 */
+	/*
+	 * CHIRON_DTB_INIT_SEQ
+	 *
+	 * Straight from the device tree this phone actually boots with
+	 * (Mu-Silicium/Resources/DTBs/chiron.dtb, decompiled):
+	 *
+	 *   qcom,qusb-phy-init-seq = <0x80 0x00  0x13 0x04  0x7c 0x18c
+	 *                             0x80 0x2c  0x0a 0x184  0xf0 0x23c  0x0f 0x240>;
+	 *
+	 * Seven value/offset pairs, and the 0x00 entry is part of it.  An earlier
+	 * revision replaced these with values read out of msm8998-v2.dtsi in the kernel
+	 * source tree; that is a different device tree variant and not the one this
+	 * phone is booted with.
+	 */
+	/*
+	 * CHIRON_DTB_INIT_SEQ
+	 *
+	 * Straight from the device tree this phone actually boots with
+	 * (Mu-Silicium/Resources/DTBs/chiron.dtb, decompiled):
+	 *
+	 *   qcom,qusb-phy-init-seq = <0x80 0x00  0x13 0x04  0x7c 0x18c
+	 *                             0x80 0x2c  0x0a 0x184  0xf0 0x23c  0x0f 0x240>;
+	 *
+	 * Seven value/offset pairs, and the 0x00 entry is part of it.  An earlier
+	 * revision replaced these with values read out of msm8998-v2.dtsi in the kernel
+	 * source tree; that is a different device tree variant and not the one this
+	 * phone is booted with.
+	 */
+	/*
+	 * CHIRON_DTB_INIT_SEQ
+	 *
+	 * Straight from the device tree this phone actually boots with
+	 * (Mu-Silicium/Resources/DTBs/chiron.dtb, decompiled):
+	 *
+	 *   qcom,qusb-phy-init-seq = <0x80 0x00  0x13 0x04  0x7c 0x18c
+	 *                             0x80 0x2c  0x0a 0x184  0xf0 0x23c  0x0f 0x240>;
+	 *
+	 * Seven value/offset pairs, and the 0x00 entry is part of it.  An earlier
+	 * revision replaced these with values read out of msm8998-v2.dtsi in the kernel
+	 * source tree; that is a different device tree variant and not the one this
+	 * phone is booted with.
 	 */
 	static const uint32_t seq[][2] = {
-		{0x13, 0x004},   /* analog_controls_two */
-		{0x7c, 0x18c},   /* pll_clock_inverter */
-		{0x80, 0x02c},   /* pll_cmode */
-		{0x0a, 0x184},   /* pll_lock_delay */
-		{0xa5, 0x23c},   /* tune1 */
-		{0x09, 0x240},   /* tune2 */
-		{0x19, 0x0b4},   /* digital_timers_two */
+		{0x80, 0x000},
+		{0x13, 0x004},
+		{0x7c, 0x18c},
+		{0x80, 0x02c},
+		{0x0a, 0x184},
+		{0xf0, 0x23c},
+		{0x0f, 0x240},
 	};
 	const uint64_t phy = 0xC012000ULL;
 	const uint64_t bcr = 0x112000ULL;
@@ -4933,7 +4938,6 @@ chiron_qusb2_init(void)
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 
-	chiron_efuse_tune1();
 	/* CHIRON_QUSB2_PWRUP: 32-bit again, POWR_DOWN clear, CLAMP_N_EN set */
 	*(volatile uint32_t *)(uintptr_t)(phy + 0x210) =
 	    (*(volatile uint32_t *)(uintptr_t)(phy + 0x210) & ~1u) | 2u;
@@ -5095,18 +5099,27 @@ static void
 chiron_qusb2_reassert(void)
 {
 		/*
-	 * Same values as CHIRON_V2_INIT_SEQ: msm8998-v2.dtsi:1128.  This function runs
-	 * after the vendor drivers have had the port, so it is the copy that decides
-	 * what the PHY ends up holding.
+	 * CHIRON_DTB_INIT_SEQ
+	 *
+	 * Straight from the device tree this phone actually boots with
+	 * (Mu-Silicium/Resources/DTBs/chiron.dtb, decompiled):
+	 *
+	 *   qcom,qusb-phy-init-seq = <0x80 0x00  0x13 0x04  0x7c 0x18c
+	 *                             0x80 0x2c  0x0a 0x184  0xf0 0x23c  0x0f 0x240>;
+	 *
+	 * Seven value/offset pairs, and the 0x00 entry is part of it.  An earlier
+	 * revision replaced these with values read out of msm8998-v2.dtsi in the kernel
+	 * source tree; that is a different device tree variant and not the one this
+	 * phone is booted with.
 	 */
 	static const uint32_t seq[][2] = {
-		{0x13, 0x004},   /* analog_controls_two */
-		{0x7c, 0x18c},   /* pll_clock_inverter */
-		{0x80, 0x02c},   /* pll_cmode */
-		{0x0a, 0x184},   /* pll_lock_delay */
-		{0xa5, 0x23c},   /* tune1 */
-		{0x09, 0x240},   /* tune2 */
-		{0x19, 0x0b4},   /* digital_timers_two */
+		{0x80, 0x000},
+		{0x13, 0x004},
+		{0x7c, 0x18c},
+		{0x80, 0x02c},
+		{0x0a, 0x184},
+		{0xf0, 0x23c},
+		{0x0f, 0x240},
 	};
 	const uint64_t phy = 0xC012000ULL;
 
@@ -5647,7 +5660,7 @@ chiron_utmi_sweep(void)
  * Put the PHY back to the values measured at loader entry, which is the state in
  * which the firmware's own fastboot was driving this port successfully:
  *
- *   0xB4  = 0x19   powered down, clamp asserted, IO frozen
+ *   0xB4  = 0x19   as the firmware left it (not overridden)
  *   0x210 = 0x23   PWR_CTRL1 POWR_DOWN=1, CLAMP_N_EN=1
  *
  * and leave 0x1A0 (PLL status) alone -- at entry it read 0x64, unlocked, because a
@@ -5660,7 +5673,12 @@ chiron_phy_restore(void)
 {
 	const uint64_t phy = 0xC012000ULL;
 
-	*(volatile uint8_t *)(uintptr_t)(phy + 0xB4) = 0x19;   /* v2 digital_timers_two */
+	/*
+	 * 0xB4 is left exactly as the firmware left it.  chiron.dtb does not set
+	 * digital_timers_two, so there is no documented value to restore it to --
+	 * the earlier 0x19 here came from msm8998-v2.dtsi, which is not this
+	 * phone's device tree.
+	 */
 	__asm__ volatile ("dsb sy" ::: "memory");
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = 0x23;
 	__asm__ volatile ("dsb sy" ::: "memory");

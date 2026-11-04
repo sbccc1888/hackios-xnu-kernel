@@ -5236,12 +5236,30 @@ chiron_qusb2_init(void)
 	chiron_udelay(50);
 
 	/*
-	 * CHIRON_QUSB2_PWRDOWN: PWR_CTRL1 is a 32-bit word (the driver uses
-	 * readl/writel), so touch it as one: bit0 POWR_DOWN set, bit1 CLAMP_N_EN
-	 * kept set so the clamp stays released.
+	 * CHIRON_QUSB2_PWRDOWN (byte access)
+	 *
+	 * This used to touch PWR_CTRL1 as a 32-bit word, on a comment saying the driver uses
+	 * readl/writel so it must be one.  The measurement disagrees: the last real run logged
+	 *
+	 *     qusb2: r210 22222222
+	 *
+	 * -- the same byte in all four lanes, which is this PHY's signature for a byte-wide
+	 * register, the same thing the write test showed at 0x90 (0x30303030).  So the 32-bit
+	 * read returns one byte replicated, and the 32-bit write writes four copies of what was
+	 * composed.
+	 *
+	 * It happens to be harmless today because POWR_DOWN=0 and CLAMP_N_EN=1 compose to the
+	 * same byte.  It is still writing the upper lanes with content nothing chose, on the
+	 * strength of a comment.  Byte access, like every other register in this file.
+	 *
+	 * bit0 POWR_DOWN set, bit1 CLAMP_N_EN kept set so the clamp stays released.
 	 */
-	*(volatile uint32_t *)(uintptr_t)(phy + 0x210) =
-	    (*(volatile uint32_t *)(uintptr_t)(phy + 0x210) | 1u) | 2u;
+	{
+		uint8_t pw = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
+
+		pw = (uint8_t)((pw | 1u) | 2u);
+		*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = pw;
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 
 	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
@@ -5251,9 +5269,13 @@ chiron_qusb2_init(void)
 
 	/* fold the per-chip trim in, as the working hardware has it (0x45 from 0xa5) */
 	chiron_efuse_tune1();
-	/* CHIRON_QUSB2_PWRUP: 32-bit again, POWR_DOWN clear, CLAMP_N_EN set */
-	*(volatile uint32_t *)(uintptr_t)(phy + 0x210) =
-	    (*(volatile uint32_t *)(uintptr_t)(phy + 0x210) & ~1u) | 2u;
+	/* CHIRON_QUSB2_PWRUP (byte access, same reason): POWR_DOWN clear, CLAMP_N_EN set */
+	{
+		uint8_t pw = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
+
+		pw = (uint8_t)((pw & ~1u) | 2u);
+		*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = pw;
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 	chiron_udelay(200);
 
@@ -5290,10 +5312,14 @@ chiron_qusb2_init(void)
 	print("\n", 0);
 
 	print("qusb2: PLL %x ready %x\n", (uint64_t)ready, (uint64_t)(ready & 1));
-	print("qusb2: r210 %x (pwrdn %x clamp %x)\n",
-	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(phy + 0x210),
-	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(phy + 0x210) & 1),
-	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(phy + 0x210) >> 1) & 1));
+	{
+		uint32_t r210w = *(volatile uint32_t *)(uintptr_t)(phy + 0x210);
+		uint8_t r210b = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
+
+		print("qusb2: r210 %x byte %x (pwrdn %x clamp %x)\n",
+		    (uint64_t)r210w, (uint64_t)r210b,
+		    (uint64_t)(r210b & 1), (uint64_t)((r210b >> 1) & 1));
+	}
 	print("qusb2: r00 %x r04 %x r2c %x r18c %x\n",
 	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x000),
 	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x004),

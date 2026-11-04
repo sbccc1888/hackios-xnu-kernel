@@ -6947,8 +6947,23 @@ usb_start(void)
 	 * before it can carry a signal.  chiron_dwc3_run() is only useful when HK6
 	 * did not run, so it stays conditional.
 	 */
-	if (!usb_native_mode || usb_manual_mode) {
+	/*
+	 * CHIRON_MANUAL_ONLY
+	 *
+	 * The comment above says this call is "only useful when HK6 did not run", and the
+	 * guard did not say that: `!usb_native_mode || usb_manual_mode` is true in default
+	 * mode, where HK6 *did* run.  So the core was being started here, before start_ex,
+	 * and then start_ex was asked to configure a controller that was already running.
+	 *
+	 * That is the same mistake as the StartController call that used to live in
+	 * chiron_usbfn_endpoints(): driving the controller into a state the vendor stack
+	 * never creates.  usb_manual=1 is the mode that exists for doing it by hand, so this
+	 * belongs there and nowhere else.
+	 */
+	if (usb_manual_mode) {
 		chiron_dwc3_run();
+	} else {
+		print("usb: manual core start skipped; left to start_ex\n");
 	}
 	flush_log();
 	/* Ask the platform to bring the controller up in peripheral mode (as the stock fastboot does). */

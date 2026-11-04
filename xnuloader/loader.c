@@ -5267,6 +5267,57 @@ chiron_env_snap(const char *tag)
 }
 
 /*
+ * CHIRON_EVENT_PROBE
+ *
+ * Report the device event mask and how many events the controller has latched.
+ * If GEVNTCOUNT stays zero after the core has been running, the host never spoke
+ * to this device; if DEVTEN is zero, the controller was not listening and the
+ * reading proves nothing either way.
+ */
+static void
+chiron_event_probe(const char *tag)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t devten = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC708);
+	uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C);
+	uint32_t dgcmd = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+
+	print("evt ", 0);
+	print((char *)tag, 0);
+	print(": devten ", 0);
+	print("%x", (uint64_t)devten);
+	print(" pending ", 0);
+	print("%x", (uint64_t)(cnt & 0xfffc));
+	print(" ehb ", 0);
+	print("%x", (uint64_t)((cnt >> 31) & 1));
+	print(" dgcmd ", 0);
+	print("%x", (uint64_t)dgcmd);
+	print("\n", 0);
+}
+
+/*
+ * CHIRON_EVENT_ARM
+ *
+ * Enable the device events that matter, so the controller can report a reset, a
+ * disconnect or a completed control command.  Without this the controller is
+ * mute and "nothing happened" means nothing.
+ */
+static void
+chiron_event_arm(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t want = (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 10);
+
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC708) = want;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(2000);
+
+	print("evt: armed devten now ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC708));
+	print("\n", 0);
+}
+
+/*
  * CHIRON_UTMI_SWEEP
  *
  * Try each UTMI transceiver setting and report DSTS after it.  One boot answers
@@ -6044,6 +6095,8 @@ usb_start(void)
 	if (usb_pure_mode) {
 		/* only the one write that is known to help */
 		chiron_vbus_override();
+	chiron_event_arm();
+	chiron_event_probe("armed");
 	} else {
 		chiron_dwc3_highspeed();
 		chiron_dwc3_device_mode();
@@ -6111,6 +6164,25 @@ usb_wait(uint8_t endpoint)
 		 * the wall clock (3 s) and a hard pass count.
 		 */
 		if (++polls > poll_limit) {
+			/*
+			 * CHIRON_POLL_EXHAUSTED
+			 *
+			 * Say it once.  Nothing so far has distinguished "the host never
+			 * attached" from "event service stopped before the host got going",
+			 * and this is the only place that can tell them apart.
+			 */
+			static int said_exhausted;
+
+			if (!said_exhausted) {
+				uint32_t devten = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC708);
+				uint32_t pending = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C);
+
+				said_exhausted = 1;
+				print("poll: budget spent connected=%d devten=%x pending=%x\n",
+				    (uint64_t)(usb_connected != 0),
+				    (uint64_t)devten, (uint64_t)(pending & 0xfffc));
+				flush_log();
+			}
 			return -1;
 		}
 		USB->handle_event(&msg, &size, &data);
@@ -6441,6 +6513,7 @@ usb_command_loop(void)
 	if (usb_sweep_mode) {
 		chiron_utmi_sweep();
 	}
+	chiron_event_probe("final");
 	chiron_phy_entry_snap("FINAL");
 	print("usb: command loop entered\n");
 	flush_log();

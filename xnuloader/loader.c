@@ -1085,6 +1085,16 @@ dump_partitions(void)
 
 /* CHIRON_AUTO_REBOOT: boot-arg reboot=1 hands the phone back to Android when a run ends. */
 static int auto_reboot;
+/*
+ * CHIRON_HALT_OPT_IN
+ *
+ * The final exit path used to halt in an empty loop.  From the host that is indistinguishable
+ * from a dead phone: no USB, no reboot, nothing.  It is now a reset unless the run asks for a
+ * halt with halt=1, because flush_log() has already put the log in a partition and that
+ * partition can only be read over adb -- which needs Android up.  Halting loses the screen and
+ * the log both.
+ */
+static int halt_instead;
 /* CHIRON_USB_IDLE_RESET: seconds a USB session may sit with no command (usb_idle=N) */
 static int usb_idle_seconds;
 
@@ -1103,12 +1113,18 @@ reboot(void)
 	 * Then the log is already in the partition, Android starts, and the host can read it
 	 * without anyone touching the phone -- which is what makes a run repeatable.
 	 */
-	if (auto_reboot) {
-		print("\n== REBOOTING to Android (reboot=1); the log is in the partition ==\n");
+	/*
+	 * CHIRON_HALT_OPT_IN applies here: unless the run asked to halt, reset.  The old
+	 * behaviour was to halt whenever auto_reboot was clear, and the final exit path never
+	 * set it -- so an image that failed early left the phone in an empty loop with no USB
+	 * and no reboot, which reads as a dead phone.
+	 */
+	if (auto_reboot || !halt_instead) {
+		print("\n== REBOOTING to Android; the log is in the partition ==\n");
 		BS->stall(500000);
 		ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
 	}
-	print("\n== HALTED (no reboot) ==\n");
+	print("\n== HALTED (halt=1) ==\n");
 	for (;;) {
 	}
 }
@@ -3494,6 +3510,8 @@ run_kernel(int have_checkpoint, uint64_t checkpoint)
 		if (starts_with(c, "bootcpu=") && (c == pi.cmdline || c[-1] == ' ') && c[8] >= '0' && c[8] <= '7') {
 			kernel_mpidr = core_to_mpidr(PLAT, c[8] - '0');
 		}
+		halt_instead |= starts_with(c, "halt=1") && (c == pi.cmdline || c[-1] == ' ') &&
+		    (c[6] == '\0' || c[6] == ' ');
 		auto_reboot |= starts_with(c, "reboot=1") && (c == pi.cmdline || c[-1] == ' ') &&
 		    (c[8] == 0 || c[8] == ' ');
 		more_cores |= (starts_with(c, "cpus=") || starts_with(c, "cpumask=")) && (c == pi.cmdline || c[-1] == ' ');

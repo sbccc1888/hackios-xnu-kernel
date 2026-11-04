@@ -4332,9 +4332,23 @@ usb_serial_fill(uint8_t *out, uint32_t cap, const char *tag)
 		return 0;
 	}
 
-	/* ASCII -> UTF-16LE, skipping anything not printable */
+	/*
+	 * ASCII -> UTF-16LE, stopping at anything not printable.
+	 *
+	 * The character limit comes from cap, not from a literal: a USB string descriptor is
+	 * bLength, bType, then UTF-16LE pairs, so (cap - 2) / 2 characters fit.  The extra
+	 * clamp at 30 keeps a pathological SMBIOS string from producing an unwieldy
+	 * descriptor.  Before this, the loop used the literal 30 and ignored cap entirely --
+	 * correct only for the 64-byte caller that exists today.
+	 */
+	{
+	uint32_t limit = (cap - 2) / 2;
+
+	if (limit > 30) {
+		limit = 30;
+	}
 	i = 0;
-	while (serial[i] != 0 && i < 30) {
+	while (serial[i] != 0 && i < limit) {
 		uint8_t ch = (uint8_t)serial[i];
 
 		if (ch < 0x20 || ch > 0x7e) {
@@ -4344,6 +4358,8 @@ usb_serial_fill(uint8_t *out, uint32_t cap, const char *tag)
 		out[3 + i * 2] = 0;
 		i++;
 	}
+	}
+
 	out[0] = (uint8_t)(2 + i * 2);
 	print("serial: from SMBIOS, ", 0);
 	print((char *)serial, 0);

@@ -6631,10 +6631,13 @@ usb_start(void)
 	 * line detectors, and finally run the core so D+ is driven.
 	 */
 	if (usb_pure_mode) {
-		/* only the one write that is known to help */
+		/*
+		 * Even this mode has to start the core: the vendor path leaves RunStop
+		 * clear, and a halted core fetches nothing.  Skipping it here would make a
+		 * "clean" run that never had a chance of enumerating.
+		 */
 		chiron_vbus_override();
-	chiron_event_arm();
-	chiron_event_probe("armed");
+		chiron_dwc3_late_run();
 	} else {
 		chiron_dwc3_highspeed();
 		chiron_dwc3_device_mode();
@@ -6642,9 +6645,22 @@ usb_start(void)
 		chiron_vbus_override();
 		chiron_qusb2_reassert();
 		chiron_port_powerdown();
-		chiron_qusb2_report_levels();
+		/*
+		 * CHIRON_START_THEN_REPORT
+		 *
+		 * The line-level probe used to run just before this, while the core was
+		 * still halted.  It reads INTR_STAT, which is not meaningful on this part,
+		 * and writes 0x22C, which working hardware leaves at zero.  Start the core
+		 * first -- that is the step that makes enumeration possible -- and keep the
+		 * probe behind usb_diag=1.
+		 */
 		chiron_dwc3_late_run();
+		if (usb_diag_mode) {
+			chiron_qusb2_report_levels();
+		}
 	}
+	chiron_event_arm();
+	chiron_event_probe("armed");
 	if (EFI_ERROR(s)) {
 		print("usb: start failed %x\n", s);
 		return 0;

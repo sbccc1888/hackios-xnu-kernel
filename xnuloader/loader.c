@@ -6402,6 +6402,23 @@ usb_start(void)
 	 * peripheral ConnectController; this handshake is what actually assembles a
 	 * peripheral controller.
 	 */
+	/*
+	 * CHIRON_POWER_FIRST
+	 *
+	 * Clocks, power domain, block resets and the PHY all have to be up before
+	 * any driver is asked to start the controller.  HK6 used to run first, on a
+	 * block with no clocks, no power and held in reset -- which ignores its
+	 * register writes, so StartController answered success and nothing happened.
+	 */
+	if (!usb_pure_mode) {
+		chiron_clocks_on();
+		chiron_gdsc_on();
+	chiron_gcc_bcr();
+		chiron_phy_map();
+	chiron_write_test();
+		chiron_qusb2_init();
+	}
+
 	if (!usb_manual_mode) {
 		chiron_count_protos("pre-hk6");
 		if (chiron_usb_hk6()) {
@@ -6456,14 +6473,6 @@ usb_start(void)
 	 * before it can carry a signal.  chiron_dwc3_run() is only useful when HK6
 	 * did not run, so it stays conditional.
 	 */
-	if (!usb_pure_mode) {
-		chiron_clocks_on();
-		chiron_gdsc_on();
-	chiron_gcc_bcr();
-		chiron_phy_map();
-	chiron_write_test();
-		chiron_qusb2_init();
-	}
 	if (!usb_native_mode || usb_manual_mode) {
 		chiron_dwc3_run();
 	}

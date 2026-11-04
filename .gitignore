@@ -52,6 +52,7 @@ __pycache__/
 !/xnuloader/loader.c
 !/xnuloader/verify_image.py
 !/xnuloader/reg_diff.py
+!/xnuloader/probe_audit.py
 !/xnuloader/build_three.sh
 !/xnuloader/mkidentity.py
 !/xnuloader/mkpayload.py

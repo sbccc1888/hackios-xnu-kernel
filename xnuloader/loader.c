@@ -4124,6 +4124,8 @@ static int usb_hk6_only_mode;
 static int usb_diag_mode;
 /* usb_no_epcfg=1: let UsbDeviceDxe configure endpoints, do not do it first. */
 static int usb_no_epcfg_mode;
+/* the USB Config handle chiron_pick_usb_device() selected */
+static efi_handle usb_dev_handle;
 
 /*
  * CHIRON_BCDUSB: 0x0200, not 0x0210.
@@ -4630,8 +4632,18 @@ chiron_usb_hk6(void)
 		s = init->start_controller(init, core.core_num, UsbModePeripheral);
 		print("hk6: start peripheral %x\n", (uint64_t)s);
 
+		/*
+		 * Prefer the controller handle that was selected by mode.  locate_protocol
+		 * returns whichever comes first, which is how this port could end up
+		 * talking to a different controller than the one it chose.
+		 */
+		if (usb_dev_handle != NULL &&
+		    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &QCOM_USBFN_GUID, &usbfn))) {
+			print("hk6: UsbFnIo after start (chosen handle)\n");
+			return 1;
+		}
 		if (!EFI_ERROR(BS->locate_protocol(&QCOM_USBFN_GUID, NULL, &usbfn))) {
-			print("hk6: UsbFnIo after start\n");
+			print("hk6: UsbFnIo after start (first handle)\n");
 			return 1;
 		}
 		print("hk6: still no UsbFnIo; cloning a peripheral handle\n");
@@ -5664,6 +5676,7 @@ chiron_pick_usb_device(void)
 
 		if (dev != NULL && is_peripheral && chosen == NULL) {
 			chosen = dev;
+			usb_dev_handle = handles[i];
 		}
 	}
 	if (handles != NULL) {
@@ -6051,7 +6064,22 @@ chiron_usbfn_endpoints(void)
 	static efi_usb_device_info dev_info;
 	efi_status se, ss;
 
-	if (EFI_ERROR(BS->locate_protocol(&usbfn_guid, NULL, (void **)&fn)) || fn == NULL) {
+	/*
+	 * CHIRON_FNIO_FROM_CHOSEN_HANDLE
+	 *
+	 * UsbFnIo is taken from the controller chiron_pick_usb_device() selected.  A plain
+	 * locate_protocol returns whichever handle comes first, which on a dual-role part
+	 * can be a different controller -- in which case every call succeeds and the
+	 * chosen controller is never started.
+	 */
+	if (usb_dev_handle != NULL &&
+	    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &usbfn_guid, (void **)&fn)) &&
+	    fn != NULL) {
+		print("usbfn: from chosen handle\n");
+	} else if (!EFI_ERROR(BS->locate_protocol(&usbfn_guid, NULL, (void **)&fn)) &&
+	           fn != NULL) {
+		print("usbfn: from first handle (chosen had none)\n");
+	} else {
 		print("usbfn: protocol absent\n");
 		return 0;
 	}

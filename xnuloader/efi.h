@@ -53,15 +53,25 @@ typedef struct {
 	efi_status (EFIAPI *signal_event)(void *event);
 	efi_status (EFIAPI *close_event)(void *event);
 	void *check_event;
-	void *install_protocol_interface, *reinstall_protocol_interface, *uninstall_protocol_interface;
+	efi_status (EFIAPI *install_protocol_interface)(efi_handle *handle, const efi_guid *guid,
+	    int type, void *iface);
+	void *reinstall_protocol_interface, *uninstall_protocol_interface;
 	efi_status (EFIAPI *handle_protocol)(efi_handle h, const efi_guid *guid, void **iface);
 	void *reserved, *register_protocol_notify, *locate_handle, *locate_device_path, *install_configuration_table;
-	void *load_image, *start_image, *exit, *unload_image;
+	efi_status (EFIAPI *load_image)(int boot_policy, efi_handle parent, void *path,
+	    void *src, uint64_t size, efi_handle *image);
+	efi_status (EFIAPI *start_image)(efi_handle image, uint64_t *exit_size, char16 **exit_data);
+	efi_status (EFIAPI *exit)(efi_handle image, efi_status status, uint64_t size, char16 *data);
+	void *unload_image;
 	efi_status (EFIAPI *exit_boot_services)(efi_handle image, uint64_t map_key);
 	void *get_next_monotonic_count;
 	efi_status (EFIAPI *stall)(uint64_t microseconds);
 	efi_status (EFIAPI *set_watchdog_timer)(uint64_t timeout, uint64_t code, uint64_t size, char16 *data);
-	void *connect_controller, *disconnect_controller, *open_protocol, *close_protocol, *open_protocol_information;
+	efi_status (EFIAPI *connect_controller)(efi_handle controller, efi_handle *drivers,
+	    void *remaining, int recursive);
+	void *disconnect_controller, *open_protocol, *close_protocol;
+	efi_status (EFIAPI *open_protocol_information)(efi_handle handle, const efi_guid *guid,
+	    void **entry_buffer, uint64_t *entry_count);
 	void *protocols_per_handle;
 	efi_status (EFIAPI *locate_handle_buffer)(int type, const efi_guid *guid, void *key, uint64_t *count, efi_handle **buf);
 	efi_status (EFIAPI *locate_protocol)(const efi_guid *guid, void *registration, void **iface);
@@ -181,6 +191,70 @@ struct efi_clock_protocol {
 	efi_status (EFIAPI *get_parent_count)(efi_clock_protocol *self, uint32_t id, uint32_t *n);
 	efi_status (EFIAPI *get_parents)(efi_clock_protocol *self, uint32_t id, void *list);
 };
+
+/* Standard DXE GUIDs used by the HK6 USB handshake. */
+static const efi_guid EFI_LOADED_IMAGE_GUID = {0x5b1b31a1, 0x9562, 0x11d2,
+    {0x8e, 0x3f, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b}};
+static const efi_guid EFI_DRIVER_BINDING_GUID = {0x18a031ab, 0xb443, 0x4d1a,
+    {0xa5, 0xc0, 0x0c, 0x09, 0x26, 0x1e, 0x9f, 0x71}};
+
+/*
+ * The pieces of DXE that ios-party's HK6 peripheral handshake needs.  Their
+ * analysis of the vendor UsbConfigDxe showed StartController() answering success
+ * while the core stays in host mode, because a private static-mode policy
+ * replaces the requested mode before the equality test.  The workaround is to
+ * install our own USB Config table with ModeType = 4 and let the vendor DWC3
+ * driver bind to it, which needs these structures.
+ */
+typedef struct efi_driver_binding efi_driver_binding;
+struct efi_driver_binding {
+	uint32_t version;
+	efi_handle image_handle;
+	efi_handle driver_binding_handle;
+	efi_status (EFIAPI *supported)(efi_driver_binding *self, efi_handle controller, void *remaining);
+	void *start, *stop;
+	uint32_t version2;
+};
+
+typedef struct {
+	uint32_t revision;
+	void *parent_handle;
+	void *system_table;
+	void *device_handle;
+	void *file_path;
+	void *reserved;
+	uint32_t load_options_size;
+	void *load_options;
+	void *image_base;
+	uint64_t image_size;
+	uint32_t image_code_type, image_data_type;
+	void *unload;
+} efi_loaded_image;
+
+typedef struct {
+	uint32_t revision;
+	efi_status (EFIAPI *query_core_count)(void *self, uint8_t *count);
+	efi_status (EFIAPI *query_core_info)(void *self, uint8_t *core, void *info);
+	efi_status (EFIAPI *start_controller)(void *self, uint8_t core, uint32_t mode);
+	efi_status (EFIAPI *stop_controller)(void *self, uint8_t core, uint32_t mode);
+} efi_qcom_usb_init;
+
+/* The vendor DWC3 Supported() reads CoreNum/ModeType at 0x88/0x8c. */
+typedef struct {
+	uint32_t revision;
+	void *methods[16];
+	uint32_t core_num;
+	uint32_t mode_type;
+	void *get_vbus_status;
+	void *enable_vbus;
+} efi_qcom_usb_config;
+
+typedef struct {
+	uint8_t core_num;
+	uint32_t mode_type;
+} efi_qcom_usb_core;
+
+enum { UsbModePeripheral = 0x02, UsbModePeripheralAlt = 0x04, UsbModeHost = 0x01 };
 
 /* Block I/O + Partition Info (used to persist the log on the phone) */
 typedef struct {

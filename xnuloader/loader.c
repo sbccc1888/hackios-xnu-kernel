@@ -4106,6 +4106,10 @@ static usb_device_protocol *USB;
 static int download_to_ramdisk;     /* set by "oem ramdisk" for the one download that follows */
 static uint8_t *usb_rx_buf, *usb_tx_buf;
 static int usb_connected;
+/* CHIRON_USB_NATIVE: usb_native=1 skips the manual PHY/DWC3 work. */
+static int usb_native_mode;
+/* usb_manual=1 runs only the manual register work. */
+static int usb_manual_mode;
 
 static const uint8_t usb_dev_desc[18] = { 18, 1, 0x10, 0x02, 0, 0, 0, 64, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
 static const uint8_t usb_ss_dev_desc[18] = { 18, 1, 0x00, 0x03, 0, 0, 0, 9, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
@@ -4338,6 +4342,352 @@ usb_session_check(void)
  *   EFI_USB_CONFIG_INFO    { ConfigDescriptor*, InterfaceInfoTable** }
  *   EFI_USB_INTERFACE_INFO { InterfaceDescriptor*, EndpointDescriptorTable** }
  */
+
+/*
+ * CHIRON_USB_HK6
+ *
+ * A port of ios-party's HK6 peripheral handshake.  Their disassembly of the
+ * vendor UsbConfigDxe shows why requesting a peripheral controller does nothing
+ * visible: StartController() rewrites the requested mode from a private static
+ * policy before comparing it, then returns success without running the
+ * peripheral ConnectController.  Our probes agree -- E722B03F and the USB
+ * Function IO protocol never appeared at any measured point.
+ *
+ * This does not touch the private policy.  It installs its own public USB Config
+ * table with ModeType 4 and lets the vendor DWC3 driver bind to that instead.
+ */
+static const efi_guid QCOM_USB_INIT_GUID = {0x2da15ac7, 0x4909, 0x4c4c,
+    {0xb8, 0xc3, 0xa7, 0x42, 0x19, 0x5e, 0xa4, 0x6e}};
+static const efi_guid QCOM_USB_INIT_FILE_GUID = {0x0a134f0e, 0x075e, 0x40b3,
+    {0x9c, 0x63, 0x3b, 0x39, 0x06, 0x80, 0x46, 0x63}};
+static const efi_guid QCOM_DWC3_FILE_GUID = {0x94f8a6a7, 0xdc34, 0x4101,
+    {0x88, 0xc1, 0x99, 0x17, 0x9c, 0xce, 0xae, 0x83}};
+static const efi_guid QCOM_USBFN_GUID = {0x32d2963a, 0xfe5d, 0x4f30,
+    {0xb6, 0x33, 0x6e, 0x5d, 0xc5, 0x58, 0x03, 0xcc}};
+static const efi_guid QCOM_USB_CONFIG_GUID = {0xe722b03f, 0xb250, 0x42ce,
+    {0x8e, 0xbd, 0x5b, 0xd5, 0x18, 0x12, 0xd0, 0x37}};
+static const efi_guid QCOM_USB_CONFIG_FILE_GUID = {0xcd823a4d, 0x7dec, 0x4531,
+    {0xae, 0x5d, 0x41, 0x34, 0xfa, 0x41, 0x27, 0xb8}};
+
+/*
+ * CHIRON_FIND_IMAGE_BY_SIG
+ *
+ * Loaded images here carry no firmware-volume node in their device path (all 45
+ * report "(no fv node)"), so they cannot be identified by path.  Identify them by
+ * content instead: walk the loaded images and let the caller test each one.
+ *
+ * ios-party's static analysis of the pinned MSM8998 binaries gives the marks:
+ *
+ *   UsbConfigDxe    image size 0x13000, and its public methods sit at
+ *                   base + 0x1440 (Methods[0]), +0x1514 (Methods[1]),
+ *                   +0x1750 (Methods[4])
+ *   UsbfnDwc3Dxe    DriverBinding->Supported at base + 0x1548
+ */
+typedef int (*chiron_image_test)(efi_handle handle, efi_loaded_image *li, uint64_t base);
+
+static efi_handle
+chiron_find_image_by_sig(chiron_image_test test, uint64_t *out_base)
+{
+	efi_handle *handles = NULL;
+	uint64_t count = 0;
+	efi_handle found = NULL;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &EFI_LOADED_IMAGE_GUID, NULL,
+	    &count, &handles))) {
+		return NULL;
+	}
+	for (uint64_t i = 0; i < count && found == NULL; i++) {
+		efi_loaded_image *li = NULL;
+		uint64_t base;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &EFI_LOADED_IMAGE_GUID,
+		    (void **)&li)) || li == NULL || li->image_base == NULL) {
+			continue;
+		}
+		base = (uint64_t)(uintptr_t)li->image_base;
+		if (test(handles[i], li, base)) {
+			found = handles[i];
+			if (out_base != NULL) {
+				*out_base = base;
+			}
+		}
+	}
+	if (handles != NULL) {
+		BS->free_pool(handles);
+	}
+	return found;
+}
+
+/* UsbConfigDxe: size and public-method RVAs are pinned by the HK6 handshake */
+static int
+chiron_is_usb_config(efi_handle handle, efi_loaded_image *li, uint64_t base)
+{
+	efi_qcom_usb_config *cfg = NULL;
+
+	if (li->image_size != 0x13000) {
+		return 0;
+	}
+	if (EFI_ERROR(BS->handle_protocol(handle, &QCOM_USB_CONFIG_GUID, (void **)&cfg)) ||
+	    cfg == NULL) {
+		return 0;
+	}
+	if (cfg->revision != 0x10003) {
+		return 0;
+	}
+	return (uint64_t)(uintptr_t)cfg->methods[0] == base + 0x1440 &&
+	       (uint64_t)(uintptr_t)cfg->methods[1] == base + 0x1514 &&
+	       (uint64_t)(uintptr_t)cfg->methods[4] == base + 0x1750;
+}
+
+/*
+ * UsbfnDwc3Dxe.
+ *
+ * Identified by image size: UsbfnDwc3Dxe.efi is 86016 bytes = 0x15000, and a
+ * scan of the loaded images shows exactly one of that size among 45.  The
+ * base-relative RVA that ios-party recorded (Supported at +0x1548) does not hold
+ * for this build, so the size is the reliable mark; the DriverBinding check just
+ * makes sure the image is the driver we think it is.
+ */
+static int
+chiron_is_dwc3(efi_handle handle, efi_loaded_image *li, uint64_t base)
+{
+	efi_driver_binding *b = NULL;
+
+	(void)base;
+	if (li->image_size != 0x15000) {
+		return 0;
+	}
+	if (EFI_ERROR(BS->handle_protocol(handle, &EFI_DRIVER_BINDING_GUID, (void **)&b)) ||
+	    b == NULL || b->supported == NULL) {
+		return 0;
+	}
+	return 1;
+}
+
+
+
+
+/*
+ * CHIRON_USB_HK6_CLONE
+ *
+ * Copy the public USB Config table, point it at the default core in peripheral
+ * mode, install it on a fresh handle, and let the vendor DWC3 driver bind.
+ * The copy keeps every vendor callback; only CoreNum and ModeType change.
+ */
+static int
+chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
+    efi_qcom_usb_config *original, uint8_t core)
+{
+	efi_qcom_usb_config *config;
+	efi_handle controller = NULL;
+	efi_handle drivers[2];
+	efi_handle cfg_image;
+	void *usbfn = NULL;
+	efi_status s;
+
+	if (init->stop_controller == NULL || original->revision != 0x10003) {
+		print("hk6: USB Config revision %x, cannot clone\n", (uint64_t)original->revision);
+		return 0;
+	}
+
+	/*
+	 * Only clone a table we recognise: the vendor module is 0x13000 bytes and its
+	 * first public callbacks sit at fixed offsets from its load base.  A different
+	 * build would make the copied table meaningless.
+	 */
+	cfg_image = chiron_find_image_by_sig(chiron_is_usb_config, NULL);
+	if (cfg_image == NULL) {
+		print("hk6: USB Config image signature not found\n");
+		return 0;
+	}
+	print("hk6: pinned USB Config API verified\n");
+
+	if (EFI_ERROR(BS->allocate_pool(EfiLoaderData, sizeof(efi_qcom_usb_config),
+	    (void **)&config)) || config == NULL) {
+		return 0;
+	}
+	memcpy(config, original, sizeof(efi_qcom_usb_config));
+	config->core_num = core;
+	config->mode_type = UsbModePeripheralAlt;        /* 4 = peripheral */
+
+	s = init->stop_controller(init, core, UsbModeHost);
+	print("hk6: stop host controller %x\n", (uint64_t)s);
+	if (EFI_ERROR(s)) {
+		BS->free_pool(config);
+		return 0;
+	}
+
+	s = BS->install_protocol_interface(&controller, &QCOM_USB_CONFIG_GUID, 0, config);
+	print("hk6: install peripheral USB Config %x\n", (uint64_t)s);
+	if (EFI_ERROR(s)) {
+		BS->free_pool(config);
+		return 0;
+	}
+
+	s = binding->supported(binding, controller, NULL);
+	print("hk6: DWC3 Supported -> %x\n", (uint64_t)s);
+	if (EFI_ERROR(s)) {
+		return 0;
+	}
+
+	drivers[0] = binding->image_handle;
+	drivers[1] = NULL;
+	s = BS->connect_controller(controller, drivers, NULL, 0);
+	print("hk6: connect DWC3 -> %x\n", (uint64_t)s);
+	if (EFI_ERROR(s)) {
+		return 0;
+	}
+
+	s = BS->handle_protocol(controller, &QCOM_USBFN_GUID, &usbfn);
+	print("hk6: cloned controller UsbFnIo %x\n", (uint64_t)s);
+	return !EFI_ERROR(s);
+}
+
+/*
+ * CHIRON_USB_HK6
+ *
+ * The whole handshake.  Returns 1 when USB Function IO exists afterwards.
+ */
+static int
+chiron_usb_hk6(void)
+{
+	efi_qcom_usb_init *init = NULL;
+	efi_driver_binding *binding = NULL;
+	efi_handle dwc3 = NULL;
+	efi_handle *handles = NULL;
+	uint64_t count = 0;
+	void *usbfn = NULL;
+	efi_status s;
+
+	print("hk6: begin\n");
+
+	/* already there?  then nothing to do */
+	if (!EFI_ERROR(BS->locate_protocol(&QCOM_USBFN_GUID, NULL, &usbfn))) {
+		print("hk6: UsbFnIo already present\n");
+		return 1;
+	}
+
+	s = BS->locate_protocol(&QCOM_USB_INIT_GUID, NULL, (void **)&init);
+	print("hk6: USB Init %x\n", (uint64_t)s);
+	if (EFI_ERROR(s) || init == NULL) {
+		return 0;
+	}
+	if (init->revision < 0x10000 || init->query_core_info == NULL ||
+	    init->start_controller == NULL) {
+		print("hk6: USB Init incomplete rev %x\n", (uint64_t)init->revision);
+		return 0;
+	}
+
+	dwc3 = chiron_find_image_by_sig(chiron_is_dwc3, NULL);
+	if (dwc3 == NULL) {
+		print("hk6: DWC3 image not resident\n");
+		return 0;
+	}
+	if (EFI_ERROR(BS->handle_protocol(dwc3, &EFI_DRIVER_BINDING_GUID, (void **)&binding)) ||
+	    binding == NULL || binding->supported == NULL) {
+		print("hk6: DWC3 driver binding missing\n");
+		return 0;
+	}
+	print("hk6: DWC3 driver binding ok\n");
+
+	/* the default core and what it can do */
+	{
+		efi_qcom_usb_core core;
+
+		memset(&core, 0, sizeof(core));
+		s = init->query_core_info(init, NULL, &core);
+		print("hk6: query core %x\n", (uint64_t)s);
+		if (EFI_ERROR(s)) {
+			return 0;
+		}
+		print("hk6: core %x modes %x\n", (uint64_t)core.core_num, (uint64_t)core.mode_type);
+
+		/* ask for peripheral */
+		s = init->start_controller(init, core.core_num, UsbModePeripheral);
+		print("hk6: start peripheral %x\n", (uint64_t)s);
+
+		if (!EFI_ERROR(BS->locate_protocol(&QCOM_USBFN_GUID, NULL, &usbfn))) {
+			print("hk6: UsbFnIo after start\n");
+			return 1;
+		}
+		print("hk6: still no UsbFnIo; cloning a peripheral handle\n");
+
+		/*
+		 * Walk the USB Config controllers, remember the host one on the default
+		 * core, and clone from it.  Any controller already in mode 4 that carries
+		 * UsbFnIo is good enough as is.
+		 */
+		if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &QCOM_USB_CONFIG_GUID, NULL,
+		    &count, &handles))) {
+			print("hk6: no USB Config controllers\n");
+			return 0;
+		}
+		{
+			efi_qcom_usb_config *host_cfg = NULL;
+
+			for (uint64_t i = 0; i < count; i++) {
+				efi_qcom_usb_config *cfg = NULL;
+
+				if (EFI_ERROR(BS->handle_protocol(handles[i], &QCOM_USB_CONFIG_GUID,
+				    (void **)&cfg)) || cfg == NULL) {
+					continue;
+				}
+				print("hk6: cfg ", 0);
+				print("%x rev %x core %x mode %x\n", (uint64_t)i,
+				    (uint64_t)cfg->revision, (uint64_t)cfg->core_num,
+				    (uint64_t)cfg->mode_type);
+				if (cfg->revision == 0x10003 && cfg->core_num == core.core_num &&
+				    cfg->mode_type == UsbModeHost) {
+					host_cfg = cfg;
+				}
+			}
+			BS->free_pool(handles);
+			if (host_cfg == NULL) {
+				print("hk6: no host config to clone on core %x\n",
+				    (uint64_t)core.core_num);
+				return 0;
+			}
+			return chiron_usb_clone_config(init, binding, host_cfg, core.core_num);
+		}
+	}
+}
+
+/*
+ * CHIRON_USB_NATIVE
+ *
+ * UsbConfigDxe installs E722B03F-B250-42CE-8EBD-5BD51812D037, which is what
+ * UsbInitDxe's depex waits for.  Until this build UsbInitDxe was absent, so
+ * nothing consumed the protocol and nothing called UsbInitStartController().
+ * With it back, the firmware can bring the gadget up on its own -- and the manual
+ * register writes below may be what has been preventing it.
+ *
+ * usb_native=1  skip all manual PHY/DWC3 work, just measure.
+ */
+static int usb_native_mode;
+static int usb_init_proto_present;
+
+static void
+chiron_usb_probe_protos(const char *when)
+{
+	static const efi_guid init_proto = {0xE722B03F, 0xB250, 0x42CE,
+	    {0x8E, 0xBD, 0x5B, 0xD5, 0x18, 0x12, 0xD0, 0x37}};
+	static const efi_guid cfg_proto = {0x9A4E9246, 0xD553, 0x11D5,
+	    {0x87, 0xE2, 0x00, 0x06, 0x29, 0x45, 0xC3, 0xB9}};
+	uint64_t n = 0;
+	efi_status s;
+
+	s = BS->locate_handle_buffer(ByProtocol, &init_proto, NULL, &n, NULL);
+	usb_init_proto_present = !EFI_ERROR(s) && n > 0;
+	print("proto ", 0);
+	print((char *)when, 0);
+	print(" Init st %x n %x\n", (uint64_t)s, (uint64_t)n);
+	n = 0;
+	s = BS->locate_handle_buffer(ByProtocol, &cfg_proto, NULL, &n, NULL);
+	print("proto ", 0);
+	print((char *)when, 0);
+	print(" Cfg st %x n %x\n", (uint64_t)s, (uint64_t)n);
+}
+
 /* CHIRON_UDELAY: the PHY's own timings are given in microseconds. */
 static void
 chiron_udelay(uint64_t us)
@@ -4354,6 +4704,54 @@ chiron_udelay(uint64_t us)
 	}
 }
 
+/*
+ * CHIRON_GDSC
+ *
+ * Android lists two power domains as enabled under the PHY:
+ *
+ *     gdsc_usb30            state=enabled
+ *     qusb@c012000          state=enabled
+ *
+ * and names the USB3 one 175004.qcom,gdsc -- GCC base 0x100000 plus 0x75004.
+ * The msm8998 GDSC layout is a control word and a status word 4 bytes on:
+ *
+ *     0x175000  POWER_CONTROL   bit0 SW_COLLAPSE (0 = on)
+ *     0x175004  POWER_STATUS    bit0 POWR_STS    (1 = on)
+ *
+ * A PHY whose power domain is off answers register reads but cannot drive the
+ * wires, which matches what this port kept seeing: correct configuration, PLL
+ * locked, and both D+ and D- reading low.
+ */
+static void
+chiron_gdsc_on(void)
+{
+	static const uint64_t domains[] = {
+		0x175000ULL,            /* usb30 gdsc: 175004.qcom,gdsc */
+		0x174000ULL,            /* neighbour in the same block; harmless if absent */
+	};
+
+	for (unsigned i = 0; i < sizeof(domains) / sizeof(domains[0]); i++) {
+		uint32_t ctl = *(volatile uint32_t *)(uintptr_t)domains[i];
+		uint32_t sts = *(volatile uint32_t *)(uintptr_t)(domains[i] + 4);
+
+		print("gdsc: ", 0);
+		print("%x", (uint64_t)domains[i]);
+		print(" ctl ", 0);
+		print("%x", (uint64_t)ctl);
+		print(" sts ", 0);
+		print("%x", (uint64_t)sts);
+
+		if ((ctl & 1u) != 0) {
+			*(volatile uint32_t *)(uintptr_t)domains[i] = ctl & ~1u;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			chiron_udelay(100);
+			sts = *(volatile uint32_t *)(uintptr_t)(domains[i] + 4);
+			print(" -> on, sts ", 0);
+			print("%x", (uint64_t)sts);
+		}
+		print("\n", 0);
+	}
+}
 /*
  * CHIRON_USB_CLOCKS
  *
@@ -4449,8 +4847,13 @@ chiron_qusb2_init(void)
 	*(volatile uint32_t *)(uintptr_t)bcr = 0;
 	chiron_udelay(50);
 
-	/* CHIRON_QUSB2_PWRDOWN: power down before programming, as the driver does */
-	*(volatile uint8_t *)(uintptr_t)(phy + 0x210) |= 1u;
+	/*
+	 * CHIRON_QUSB2_PWRDOWN: PWR_CTRL1 is a 32-bit word (the driver uses
+	 * readl/writel), so touch it as one: bit0 POWR_DOWN set, bit1 CLAMP_N_EN
+	 * kept set so the clamp stays released.
+	 */
+	*(volatile uint32_t *)(uintptr_t)(phy + 0x210) =
+	    (*(volatile uint32_t *)(uintptr_t)(phy + 0x210) | 1u) | 2u;
 	__asm__ volatile ("dsb sy" ::: "memory");
 
 	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
@@ -4458,8 +4861,9 @@ chiron_qusb2_init(void)
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 
-	/* CHIRON_QUSB2_PWRUP: power up, then wait for the PLL to lock */
-	*(volatile uint8_t *)(uintptr_t)(phy + 0x210) &= ~1u;
+	/* CHIRON_QUSB2_PWRUP: 32-bit again, POWR_DOWN clear, CLAMP_N_EN set */
+	*(volatile uint32_t *)(uintptr_t)(phy + 0x210) =
+	    (*(volatile uint32_t *)(uintptr_t)(phy + 0x210) & ~1u) | 2u;
 	__asm__ volatile ("dsb sy" ::: "memory");
 	chiron_udelay(200);
 
@@ -4472,9 +4876,10 @@ chiron_qusb2_init(void)
 	}
 
 	print("qusb2: PLL %x ready %x\n", (uint64_t)ready, (uint64_t)(ready & 1));
-	print("qusb2: r210 %x (pwrdn %x)\n",
-	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x210),
-	    (uint64_t)(*(volatile uint8_t *)(uintptr_t)(phy + 0x210) & 1));
+	print("qusb2: r210 %x (pwrdn %x clamp %x)\n",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(phy + 0x210),
+	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(phy + 0x210) & 1),
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(phy + 0x210) >> 1) & 1));
 	print("qusb2: r00 %x r04 %x r2c %x r18c %x\n",
 	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x000),
 	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x004),
@@ -4580,7 +4985,12 @@ chiron_qusb2_resume(void)
 	 * on suspend and writes the same value back on resume; it is not 0x8c.
 	 */
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x000) = 0x80;
-	*(volatile uint8_t *)(uintptr_t)(phy + 0x22C) = 0x00;
+	/*
+	 * CHIRON_QUSB2_LINEDET: enable both single-ended detectors.  Writing 0 here
+	 * (as the suspend path does) switches them off and INTR_STAT then reads 0 for
+	 * ever, which is exactly what happened.
+	 */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x22C) = 0x03;
 	__asm__ volatile ("dsb sy" ::: "memory");
 
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x24C) = 0x91;
@@ -4593,6 +5003,136 @@ chiron_qusb2_resume(void)
 	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x004),
 	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x22C),
 	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x24C));
+}
+
+/*
+ * CHIRON_QUSB2_REASSERT
+ *
+ * Put the port configuration back on the PHY after the vendor driver has had its
+ * turn.  The tune dump taken once UsbConfigDxe had run showed
+ *
+ *     PORT_TUNE1 (0x23C) = 0x45,  0x240 = 0x09
+ *
+ * where qcom,qusb-phy-init-seq asks for 0xF0 and 0x0F, and with those values the
+ * transceiver leaves D+ and D- both low.  Re-applying the sequence after HK6 and
+ * after start_ex makes the PHY carry the port setup this phone needs instead of
+ * the host-mode leftovers.
+ */
+static void
+chiron_qusb2_reassert(void)
+{
+	static const uint32_t seq[][2] = {
+		{0x80, 0x000},
+		{0x13, 0x004},
+		{0x7c, 0x18c},
+		{0x80, 0x02c},
+		{0x0a, 0x184},
+		{0xf0, 0x23c},
+		{0x0f, 0x240},
+	};
+	const uint64_t phy = 0xC012000ULL;
+
+	for (unsigned i = 0; i < sizeof(seq) / sizeof(seq[0]); i++) {
+		*(volatile uint8_t *)(uintptr_t)(phy + seq[i][1]) = (uint8_t)seq[i][0];
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	/* keep the line detectors on, and let the PHY auto-resume the link */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x22C) = 0x03;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x24C) = 0x91;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x24C) = 0x90;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("phy: reasserted, tune ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x23C));
+	print(" ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x240));
+	print("\n", 0);
+}
+
+/*
+ * CHIRON_QUSB2_LEVEL
+ *
+ * Read D+ and D- in both trigger polarities.  QUSB2PHY_INTR_CTRL (0x22C):
+ *   bit0 DPSE_INTR_EN  bit1 DMSE_INTR_EN
+ *   bit3 DPSE_INTR_HIGH_SEL   bit4 DMSE_INTR_HIGH_SEL
+ * QUSB2PHY_INTR_STAT (0x230): bit0 DPSE, bit1 DMSE.
+ *
+ * A detector only latches when its line matches the selected level, so running
+ * the pair once with low-trigger and once with high-trigger and comparing says
+ * what the line actually is:
+ *
+ *   low-trigger set, high-trigger clear -> the line is LOW
+ *   high-trigger set, low-trigger clear -> the line is HIGH
+ *   neither                             -> the pair is not being driven
+ */
+static uint8_t
+chiron_qusb2_level(uint8_t ctrl_bits)
+{
+	const uint64_t phy = 0xC012000ULL;
+
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x22C) = (uint8_t)(0x03 | ctrl_bits);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(2000);
+	return *(volatile uint8_t *)(uintptr_t)(phy + 0x230);
+}
+
+static void
+chiron_qusb2_report_levels(void)
+{
+	uint8_t low_trig = chiron_qusb2_level(0x00);      /* DPSE/DMSE low trigger */
+	uint8_t high_trig = chiron_qusb2_level(0x18);     /* both high trigger */
+
+	print("level: low ", 0);
+	print("%x", (uint64_t)low_trig);
+	print(" high ", 0);
+	print("%x", (uint64_t)high_trig);
+
+	/* decode: 1 = that line is at the level its detector latched */
+	print(" Dp=", 0);
+	print("%x", (uint64_t)((high_trig & 1) ? 1 : ((low_trig & 1) ? 0 : 2)));
+	print(" Dm=", 0);
+	print("%x", (uint64_t)(((high_trig >> 1) & 1) ? 1 : (((low_trig >> 1) & 1) ? 0 : 2)));
+	print("  (Dp/Dm: 1=high 0=low 2=undriven)\n", 0);
+
+	/* leave them in the driver's own configuration */
+	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0x22C) = 0x03;
+}
+
+/*
+ * CHIRON_VBUS_OVERRIDE
+ *
+ * Convince the controller that VBUS is present.  DWC3 will not start a session,
+ * and therefore will not report CONNSTAT, until it believes there is bus power;
+ * on chiron that belief normally arrives from the PMIC through extcon, which this
+ * firmware never brings up.
+ *
+ * Mainline solves it the same way (dwc3-msm.c, dwc3_override_vbus_status):
+ *
+ *   HS_PHY_CTRL_REG = QSCRATCH_REG_OFFSET + 0x10 = 0xF8810
+ *   UTMI_OTG_VBUS_VALID = BIT(20)   VBUS is valid
+ *   SW_SESSVLD_SEL      = BIT(28)   let software drive the session-valid input
+ *
+ * Both bits are set, so the controller's session-valid input comes from here
+ * rather than from a PMIC line that reads zero.
+ */
+static void
+chiron_vbus_override(void)
+{
+	const uint64_t ctrl = 0xA800000ULL + 0xF8810ULL;      /* HS_PHY_CTRL_REG */
+	uint32_t before = *(volatile uint32_t *)(uintptr_t)ctrl;
+	uint32_t value = before | (1u << 20) | (1u << 28);
+
+	*(volatile uint32_t *)(uintptr_t)ctrl = value;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("vbus: hs_phy_ctrl ", 0);
+	print("%x", (uint64_t)before);
+	print(" -> ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)ctrl);
+	print("\n", 0);
 }
 
 /*
@@ -4733,10 +5273,75 @@ usb_start(void)
 
 	charger_start();
 
+	/*
+	 * CHIRON_USB_NATIVE: usb_native=1 skips the manual PHY/DWC3 work so the
+	 * firmware's own drivers (UsbInitDxe + UsbConfigDxe) can be tested alone.
+	 */
+	/*
+	 * CHIRON_USB_HK6 selection
+	 *
+	 * usb_native=1  only the HK6 handshake
+	 * usb_manual=1  only the manual PHY/DWC3 register work
+	 * default       HK6 first, then the manual work if it did not help
+	 */
+	usb_native_mode = 0;
+	usb_manual_mode = 0;
+	{
+		struct payload_info npi;
+
+		if (parse_payload(&npi, 0) && npi.cmdline != NULL) {
+			for (const char *c = npi.cmdline; *c; c++) {
+				/* both names are 12 characters: terminator is c[12] */
+				if (starts_with(c, "usb_native=1") &&
+				    (c[12] == 0 || c[12] == ' ')) {
+					usb_native_mode = 1;
+				}
+				if (starts_with(c, "usb_manual=1") &&
+				    (c[12] == 0 || c[12] == ' ')) {
+					usb_manual_mode = 1;
+				}
+			}
+		}
+	}
+	print("usb: native ", 0);
+	print("%x", (uint64_t)usb_native_mode);
+	print(" manual ", 0);
+	print("%x", (uint64_t)usb_manual_mode);
+	print("\n", 0);
+
+	/*
+	 * Run the HK6 handshake first.  ios-party's disassembly of the vendor
+	 * UsbConfigDxe shows a private static-mode policy that makes a peripheral
+	 * request answer success while the core stays in host mode, skipping the
+	 * peripheral ConnectController; this handshake is what actually assembles a
+	 * peripheral controller.
+	 */
+	if (!usb_manual_mode) {
+		if (chiron_usb_hk6()) {
+			print("usb: HK6 gave us UsbFnIo\n");
+		} else {
+			print("usb: HK6 did not reach UsbFnIo\n");
+		}
+		flush_log();
+	}
+
 	chiron_depex_check();
+	chiron_usb_probe_protos("pre");
+	print("usb: native mode ", 0);
+	print("%x", (uint64_t)usb_native_mode);
+	print("\n", 0);
+	/*
+	 * The PHY must be programmed in every mode: HK6 drives the vendor stack,
+	 * but the block still needs its clocks, power domain and init sequence
+	 * before it can carry a signal.  chiron_dwc3_run() is only useful when HK6
+	 * did not run, so it stays conditional.
+	 */
 	chiron_clocks_on();
+	chiron_gdsc_on();
 	chiron_qusb2_init();
-	chiron_dwc3_run();
+	if (!usb_native_mode || usb_manual_mode) {
+		chiron_dwc3_run();
+	}
 	flush_log();
 	/* Ask the platform to bring the controller up in peripheral mode (as the stock fastboot does). */
 	if (!EFI_ERROR(BS->create_event_ex(0x200 /* EVT_NOTIFY_SIGNAL */, 8 /* TPL_CALLBACK */, usb_dummy_notify, NULL,
@@ -4744,6 +5349,7 @@ usb_start(void)
 		BS->signal_event(event);
 		BS->close_event(event);
 	}
+	chiron_usb_probe_protos("postsignal");
 	if (EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&USB))) {
 		print("usb: device protocol not found\n");
 		return 0;
@@ -4767,9 +5373,21 @@ usb_start(void)
 	chiron_dwc3_snap("A-before-start_ex");
 	efi_status s = USB->start_ex(&set);
 	chiron_dwc3_snap("B-after-start_ex");
+	chiron_usb_probe_protos("poststart");
+	/*
+	 * CHIRON_USB_FINISH
+	 *
+	 * HK6 assembles the protocol stack and leaves the core halted (run 0,
+	 * hlt 1), so these four steps are still needed afterwards regardless of
+	 * mode: advertise HighSpeed, stay in device mode, wake the PHY's link and
+	 * line detectors, and finally run the core so D+ is driven.
+	 */
 	chiron_dwc3_highspeed();
 	chiron_dwc3_device_mode();
 	chiron_qusb2_resume();
+	chiron_vbus_override();
+	chiron_qusb2_reassert();
+	chiron_qusb2_report_levels();
 	chiron_dwc3_late_run();
 	if (EFI_ERROR(s)) {
 		print("usb: start failed %x\n", s);
@@ -5173,6 +5791,32 @@ usb_command_loop(void)
 		}
 	}
 	chiron_dwc3_snap("C-in-loop-1s");
+	/*
+	 * CHIRON_QUSB2_LINES
+	 *
+	 * ln bits from QUSB2PHY_INTR_STAT (0x230): 1 = D+, 2 = D-.  Both high is the
+	 * undriven idle state; a device in full/high speed pulls D+ up and holds D-
+	 * low.  The PHY's own tuning registers are dumped alongside so the trim can be
+	 * compared with what the running kernel programs.
+	 */
+	{
+		const uint64_t phy = 0xC012000ULL;
+		uint8_t ctrl = *(volatile uint8_t *)(uintptr_t)(phy + 0x22C);
+		uint8_t stat = *(volatile uint8_t *)(uintptr_t)(phy + 0x230);
+
+		print("lines: ctrl %x stat %x Dp %x Dm %x\n",
+		    (uint64_t)ctrl, (uint64_t)stat,
+		    (uint64_t)(stat & 1), (uint64_t)((stat >> 1) & 1));
+		print("tune: 00 %x 04 %x 2c %x 184 %x 18c %x 23c %x 240 %x 24c %x\n",
+		    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x000),
+		    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x004),
+		    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x02C),
+		    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x184),
+		    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x18C),
+		    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x23C),
+		    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x240),
+		    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x24C));
+	}
 	/*
 	 * CHIRON_QUSB2_STAT: the PHY's own view of the wire.  INTR_STAT (0x230)
 	 * carries the single-ended D+/D- levels (DPSE / DMSE).

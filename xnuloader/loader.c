@@ -4742,35 +4742,53 @@ chiron_udelay(uint64_t us)
  * wires, which matches what this port kept seeing: correct configuration, PLL
  * locked, and both D+ and D- reading low.
  */
+/*
+ * CHIRON_GDSC_USB30
+ *
+ * USB3's power domain, at the address the device tree gives it
+ * (chiron.dtb, qcom,gdsc@10f004, regulator-name "gdsc_usb30", phandle 0x84):
+ *
+ *   ssusb@a800000 { USB3_GDSC-supply = <0x84>; }
+ *
+ * Register layout (drivers/clk/qcom/gdsc.c):
+ *   +0x00 control  bit0 BLOCK_RESET, poll until clear
+ *   +0x04 status   bit0 reads 1 when the domain is powered
+ *
+ * This loader had been writing 0x175000 and 0x174000 instead, with a comment
+ * admitting it was guessing; whatever those addresses are, they are not USB3's
+ * power domain, and nothing they did could have powered it.
+ */
 static void
 chiron_gdsc_on(void)
 {
-	static const uint64_t domains[] = {
-		0x175000ULL,            /* usb30 gdsc: 175004.qcom,gdsc */
-		0x174000ULL,            /* neighbour in the same block; harmless if absent */
-	};
+	const uint64_t gdsc = 0x10F004ULL;
+	uint32_t ctl = *(volatile uint32_t *)(uintptr_t)gdsc;
+	uint32_t sts = *(volatile uint32_t *)(uintptr_t)(gdsc + 4);
 
-	for (unsigned i = 0; i < sizeof(domains) / sizeof(domains[0]); i++) {
-		uint32_t ctl = *(volatile uint32_t *)(uintptr_t)domains[i];
-		uint32_t sts = *(volatile uint32_t *)(uintptr_t)(domains[i] + 4);
+	print("gdsc: 10f004 ctl ", 0);
+	print("%x", (uint64_t)ctl);
+	print(" sts ", 0);
+	print("%x", (uint64_t)sts);
 
-		print("gdsc: ", 0);
-		print("%x", (uint64_t)domains[i]);
-		print(" ctl ", 0);
-		print("%x", (uint64_t)ctl);
+	if ((ctl & 1u) != 0) {
+		/* release the block reset */
+		*(volatile uint32_t *)(uintptr_t)gdsc = ctl & ~1u;
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		/* and wait for the domain to report powered */
+		for (unsigned i = 0; i < 200; i++) {
+			chiron_udelay(100);
+			sts = *(volatile uint32_t *)(uintptr_t)(gdsc + 4);
+			if ((sts & 1u) != 0) {
+				break;
+			}
+		}
+		print(" -> ctl ", 0);
+		print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)gdsc);
 		print(" sts ", 0);
 		print("%x", (uint64_t)sts);
-
-		if ((ctl & 1u) != 0) {
-			*(volatile uint32_t *)(uintptr_t)domains[i] = ctl & ~1u;
-			__asm__ volatile ("dsb sy" ::: "memory");
-			chiron_udelay(100);
-			sts = *(volatile uint32_t *)(uintptr_t)(domains[i] + 4);
-			print(" -> on, sts ", 0);
-			print("%x", (uint64_t)sts);
-		}
-		print("\n", 0);
 	}
+	print("\n", 0);
 }
 /*
  * CHIRON_USB_CLOCKS

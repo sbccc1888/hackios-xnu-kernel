@@ -5391,6 +5391,40 @@ chiron_dwc3_highspeed(void)
 	} else {
 		print("dwc3: DCFG already HighSpeed, left alone\n", 0);
 	}
+
+	/*
+	 * CHIRON_LPM_CONFIG
+	 *
+	 * gadget.c skips its entire USB2 LPM block when speed == SUPERSPEED, and
+	 * maximum_speed was forced to SUPER by core.c because the DTB's
+	 * "maximum-speed = high-speed" never reached this driver.  So DCFG.LPM_CAP was never
+	 * set and DCTL.HIRD_THRES was never written, even though chiron's DTB asks for
+	 * snps,hird-threshold = 0x10 and snps,has-lpm-erratum.
+	 *
+	 * Put back what the skipped block would have written.  L1_HIBER_EN is left alone: that
+	 * block does not touch it either, so changing it here would be inventing a value.
+	 */
+	{
+		uint32_t dcfg2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+		uint32_t dctl2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+
+		if ((dcfg2 & (1u << 22)) == 0) {        /* DCFG.LPM_CAP */
+			dcfg2 |= (1u << 22);
+			*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) = dcfg2;
+			__asm__ volatile ("dsb sy" ::: "memory");
+		}
+
+		dctl2 &= ~(0x1fu << 24);                /* DCTL.HIRD_THRES_MASK */
+		dctl2 |= ((uint32_t)0x10 << 24);        /* snps,hird-threshold = [10] */
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl2;
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		print("dwc3: LPM cap %x hird %x | DCTL %x DCFG %x\n",
+		    (uint64_t)(((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700)) >> 22) & 1),
+		    (uint64_t)(((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704)) >> 24) & 0x1f),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700));
+	}
 }
 
 /*

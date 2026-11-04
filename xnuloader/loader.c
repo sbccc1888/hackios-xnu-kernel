@@ -5673,17 +5673,50 @@ chiron_env_snap(const char *tag)
 	print(" pipe ", 0);
 	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC2C0));
 	print("\n", 0);
-	print("env ", 0);
-	print((char *)tag, 0);
-	print(": hw0 ", 0);
-	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC100));
-	print(" hw1 ", 0);
-	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC104));
-	print(" hw2 ", 0);
-	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC108));
-	print(" hw3 ", 0);
-	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC10C));
-	print("\n", 0);
+	/*
+	 * CHIRON_GHWPARAMS_REAL_OFFSETS
+	 *
+	 * These used to read 0xC100..0xC10C and call them hw0..hw3.  Real GHWPARAMS registers
+	 * are at 0xC140..0xC15C (dwc3/core.h), so every such line in every log so far was a
+	 * reading of something else and the question they were meant to answer -- what this
+	 * controller actually supports -- was never asked.
+	 *
+	 * GHWPARAMS3 at 0xC14C carries the phy configuration:
+	 *   bits 0-1  HSPHY_INTERFACE    bits 6-7  SSPHY_INTERFACE  (0 = no SS phy)
+	 * and the version registers at 0xC1A0/0xC1A4 say which core this is.
+	 */
+	{
+		uint32_t hw3 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC14C);
+		uint32_t hs_if = hw3 & 3u, ss_if = (hw3 >> 6) & 3u;
+
+		print("env ", 0);
+		print((char *)tag, 0);
+		print(": ghw0 ", 0);
+		print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC140));
+		print(" ghw1 ", 0);
+		print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC144));
+		print(" ghw3 ", 0);
+		print("%x", (uint64_t)hw3);
+		print(" ghw6 ", 0);
+		print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC158));
+		print("\n", 0);
+
+		print("env ", 0);
+		print((char *)tag, 0);
+		print(": hsphy_if ", 0);
+		print("%x", (uint64_t)hs_if);
+		print(" ssphy_if ", 0);
+		print("%x", (uint64_t)ss_if);
+		print(ss_if == 0 ? "  <-- NO SUPERSPEED PHY on this controller\n"
+		                 : "  superspeed phy present\n", 0);
+		print("env ", 0);
+		print((char *)tag, 0);
+		print(": version ", 0);
+		print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC1A0));
+		print(" type ", 0);
+		print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC1A4));
+		print("\n", 0);
+	}
 	print("env ", 0);
 	print((char *)tag, 0);
 	print(": gcc 17004 ", 0);

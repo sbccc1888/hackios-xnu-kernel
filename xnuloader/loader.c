@@ -4112,6 +4112,12 @@ static int usb_native_mode;
 static int usb_manual_mode;
 /* usb_pure=1: HK6 + VBUS only, no other PHY writes. */
 static int usb_pure_mode;
+/* usb_restore=1: put the PHY back to its entry values at the end. */
+static int usb_restore_mode;
+/* usb_probe=1: interrogate the transport before touching anything. */
+static int usb_probe_mode;
+/* usb_sweep=1: try each UTMI transceiver setting. */
+static int usb_sweep_mode;
 
 static const uint8_t usb_dev_desc[18] = { 18, 1, 0x10, 0x02, 0, 0, 0, 64, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
 static const uint8_t usb_ss_dev_desc[18] = { 18, 1, 0x00, 0x03, 0, 0, 0, 9, 0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1 };
@@ -5134,6 +5140,339 @@ chiron_qusb2_report_levels(void)
  *   PORT_INT_STATUS  (0xF0)  bit0 DP, bit1 DM
  *   PORT_UTMI_STATUS (0xF4)  UTMI line-state view
  */
+/*
+ * CHIRON_PROBE_ENTRY
+ *
+ * Ask the transport what it thinks, before any write of ours.
+ *
+ * The upper Qualcomm protocol is located first (it is what fastboot itself used),
+ * then handle_event is polled a few times and send() is tried once.  If the
+ * firmware's session survived the hand-off, this reports a live device; if it did
+ * not, everything this loader does afterwards starts from a dead controller and
+ * that, not the PHY, is what has to be fixed.
+ */
+static void chiron_dwc3_snap(const char *where);
+
+static void
+chiron_probe_entry(void)
+{
+	static const efi_guid usb_guid = QCOM_USB_DEVICE_GUID;
+	usb_device_protocol *udev = NULL;
+	efi_status s;
+
+	print("prob: begin\n");
+
+	s = BS->locate_protocol(&usb_guid, NULL, (void **)&udev);
+	print("prob: UsbDevice ", 0);
+	print("%x", (uint64_t)s);
+	print("\n", 0);
+	if (EFI_ERROR(s) || udev == NULL) {
+		return;
+	}
+
+	/* the controller as the firmware left it */
+	chiron_dwc3_snap("PROBE-pre");
+	flush_log();
+
+	/*
+	 * CHIRON_PROBE_SAFE
+	 *
+	 * One handle_event call, nothing else.  Earlier probe code called it eight
+	 * times in a row and the phone stopped responding -- that call does not
+	 * return when no event is pending.  If it hangs here, the log already holds
+	 * PROBE-pre, which is itself the answer: the transport is not serving events.
+	 */
+	if (udev->handle_event != NULL) {
+		uint32_t msg = UsbDeviceEventNoEvent;
+		uint64_t size = 0;
+		usb_device_event_data data;
+
+		memset(&data, 0, sizeof(data));
+		s = udev->handle_event(&msg, &size, &data);
+		print("prob: ev ", 0);
+		print("%x", (uint64_t)s);
+		print(" msg ", 0);
+		print("%x", (uint64_t)msg);
+		print(" state ", 0);
+		print("%x", (uint64_t)(data.device_state & 0xf));
+		print("\n", 0);
+	} else {
+		print("prob: no handle_event\n");
+	}
+
+	chiron_dwc3_snap("PROBE-post");
+	flush_log();
+}
+
+/*
+ * CHIRON_ENV_SNAP
+ *
+ * Everything outside the PHY that fastboot was using and this loader may have
+ * disturbed: the TCSR clamp, the GCC USB clocks, and the controller's own PHY
+ * configuration registers.  None of these has ever been captured at entry.
+ *
+ *   TCSR clamp        0x1FCB24C
+ *   GCC base          0x100000  (a few USB clock branches)
+ *   GUSB2PHYCFG0      0xA800000 + 0xC200
+ *   GUSB3PIPECTL0     0xA800000 + 0xC2C0
+ *   GHWPARAMS0..3     0xA800000 + 0xC100, 0xC104, 0xC108, 0xC10C
+ */
+static void
+chiron_env_snap(const char *tag)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	const uint64_t gcc = 0x100000ULL;
+
+	print("env ", 0);
+	print((char *)tag, 0);
+	print(": tcsr ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)0x1FCB24CULL);
+	print(" phycfg ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC200));
+	print(" pipe ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC2C0));
+	print("\n", 0);
+	print("env ", 0);
+	print((char *)tag, 0);
+	print(": hw0 ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC100));
+	print(" hw1 ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC104));
+	print(" hw2 ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC108));
+	print(" hw3 ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC10C));
+	print("\n", 0);
+	print("env ", 0);
+	print((char *)tag, 0);
+	print(": gcc 17004 ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(gcc + 0x17004));
+	print(" 2a004 ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(gcc + 0x2A004));
+	print(" 2a008 ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(gcc + 0x2A008));
+	print(" 2a040 ", 0);
+	print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(gcc + 0x2A040));
+	print("\n", 0);
+}
+
+/*
+ * CHIRON_UTMI_SWEEP
+ *
+ * Try each UTMI transceiver setting and report DSTS after it.  One boot answers
+ * which value actually asserts the D+ pull-up, instead of guessing one per run.
+ *
+ *   UTMI_CTRL1 (0xC0)  bit4 TERM_SELECT, bit2 XCVR_SELECT_FS,
+ *                      bit0 OP_MODE_NON_DRIVE, bit5 SUSPEND_N
+ *   UTMI_CTRL2 (0xC4)  bit7 UTMI_ULPI_SEL, bit6 UTMI_TEST_MUX_SEL
+ *
+ * 0x14 is full-speed transceiver with terminations on -- the state that presents
+ * a USB2 device.  0x10 is terminations only.  0x00 and 0x04 are controls.
+ */
+static void
+chiron_utmi_sweep(void)
+{
+	static const uint8_t values[] = {0x14, 0x10, 0x04, 0x00, 0x24, 0x34};
+	const uint64_t phy = 0xC012000ULL;
+	const uint64_t dwc = 0xA800000ULL;
+
+	for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
+		uint32_t dctl, dsts;
+
+		*(volatile uint8_t *)(uintptr_t)(phy + 0xC4) = 0x80;   /* UTMI mode */
+		*(volatile uint8_t *)(uintptr_t)(phy + 0xC0) = values[i];
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		/* run the core at this setting and give the host a moment */
+		dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+		dctl |= (1u << 31);
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl;
+		chiron_udelay(30000);
+
+		dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+		print("sweep: c0 ", 0);
+		print("%x", (uint64_t)values[i]);
+		print(" readback ", 0);
+		print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xC0));
+		print(" dsts ", 0);
+		print("%x", (uint64_t)dsts);
+		print(" conn ", 0);
+		print("%x", (uint64_t)((dsts >> 24) & 1));
+		print(" lkst ", 0);
+		print("%x", (uint64_t)((dsts >> 18) & 0xf));
+		print(" spd ", 0);
+		print("%x", (uint64_t)(dsts & 7));
+		print("\n", 0);
+		flush_log();
+	}
+}
+
+/*
+ * CHIRON_PHY_RESTORE
+ *
+ * Put the PHY back to the values measured at loader entry, which is the state in
+ * which the firmware's own fastboot was driving this port successfully:
+ *
+ *   0xB4  = 0x19   powered down, clamp asserted, IO frozen
+ *   0x210 = 0x23   PWR_CTRL1 POWR_DOWN=1, CLAMP_N_EN=1
+ *
+ * and leave 0x1A0 (PLL status) alone -- at entry it read 0x64, unlocked, because a
+ * powered-down PHY has no locked PLL.
+ *
+ * Every other write this loader performed moved the block away from that state.
+ */
+static void
+chiron_phy_restore(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+
+	*(volatile uint8_t *)(uintptr_t)(phy + 0xB4) = 0x19;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = 0x23;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("restore: b4 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xB4));
+	print(" 210 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x210));
+	print(" 1a0 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x1A0));
+	print("\n", 0);
+}
+
+/*
+ * CHIRON_PHY_ENTRY_SNAP
+ *
+ * The PHY as the firmware left it, before this loader writes anything.  At this
+ * point fastboot has just been talking to the host over this very port, so these
+ * values are a working reference -- the one thing this port has never had.
+ *
+ * Only the offsets that matter are printed, so the line stays short.
+ */
+static void
+chiron_phy_entry_snap(const char *tag)
+{
+	const uint64_t phy = 0xC012000ULL;
+
+	print("phy ", 0);
+	print((char *)tag, 0);
+	print(": b4 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xB4));
+	print(" c0 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xC0));
+	print(" c4 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xC4));
+	print(" 210 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x210));
+	print(" 1a0 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x1A0));
+	print(" 23c ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x23C));
+	print(" 240 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x240));
+	print(" 70 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x70));
+	print(" 74 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x74));
+	print(" f0 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xF0));
+	print(" f4 ", 0);
+	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xF4));
+	print("\n", 0);
+}
+
+/*
+ * CHIRON_PHY_MAP
+ *
+ * Read-only sweep of the QUSB2 window.  Every row is 16 bytes at 0x20 stride, so
+ * the rows cover 0x00..0x2FF in 24 lines.  A decoded register rarely reads as a
+ * flat 0x00 or 0xFF, so the shape of the map says which offsets are real.
+ */
+static void
+chiron_phy_map(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+
+	/* low window 0x00..0xFF, one row per 0x20 */
+	for (uint32_t base = 0; base < 0x100; base += 0x20) {
+		print("map ", 0);
+		print("%x", (uint64_t)base);
+		print(":", 0);
+		for (uint32_t off = 0; off < 0x20; off += 4) {
+			print(" ", 0);
+			print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(phy + base + off));
+		}
+		print("\n", 0);
+	}
+
+	/*
+	 * CHIRON_PHY_MAP_HIGH: the window the init sequence actually uses.  0x184,
+	 * 0x18c, 0x23c and 0x240 all live up here, so these rows say whether the
+	 * byte stores land where the reads look.
+	 */
+	for (uint32_t base = 0x100; base < 0x300; base += 0x40) {
+		print("hi ", 0);
+		print("%x", (uint64_t)base);
+		print(":", 0);
+		for (uint32_t off = 0; off < 0x40; off += 4) {
+			print(" ", 0);
+			print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(phy + base + off));
+		}
+		print("\n", 0);
+	}
+}
+
+
+/*
+ * CHIRON_WRITE_TEST
+ *
+ * Which access width does this PHY honour?  Evidence it might not honour byte
+ * stores: "port: c4 0->0" -- 0x80 written to UTMI_CTRL2 read back as 0.
+ *
+ * TUNE5 (0x90) is a tuning byte the init sequence does not use, so a pattern
+ * written there cannot disturb the port setup.  Write with a byte store, read a
+ * byte; write with a word store, read a word; then the same on PLL_TEST (0x04).
+ * The original values are restored afterwards.
+ */
+static void
+chiron_write_test(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+	uint8_t b_before, b_after, p_before, p_after;
+	uint32_t w_before, w_after;
+
+	b_before = *(volatile uint8_t *)(uintptr_t)(phy + 0x90);
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x90) = 0x5a;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	b_after = *(volatile uint8_t *)(uintptr_t)(phy + 0x90);
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x90) = b_before;
+
+	w_before = *(volatile uint32_t *)(uintptr_t)(phy + 0x90);
+	*(volatile uint32_t *)(uintptr_t)(phy + 0x90) = 0x5a5a5a5a;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	w_after = *(volatile uint32_t *)(uintptr_t)(phy + 0x90);
+	*(volatile uint32_t *)(uintptr_t)(phy + 0x90) = w_before;
+
+	p_before = *(volatile uint8_t *)(uintptr_t)(phy + 0x04);
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x04) = 0x5a;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	p_after = *(volatile uint8_t *)(uintptr_t)(phy + 0x04);
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x04) = p_before;
+
+	print("wtest: b90 ", 0);
+	print("%x", (uint64_t)b_before);
+	print("->", 0);
+	print("%x", (uint64_t)b_after);
+	print(" w90 ", 0);
+	print("%x", (uint64_t)w_before);
+	print("->", 0);
+	print("%x", (uint64_t)w_after);
+	print(" b04 ", 0);
+	print("%x", (uint64_t)p_before);
+	print("->", 0);
+	print("%x", (uint64_t)p_after);
+	print("\n", 0);
+}
 static void
 chiron_port_powerdown(void)
 {
@@ -5184,6 +5523,141 @@ chiron_port_powerdown(void)
 	print("\n", 0);
 }
 
+
+/*
+ * CHIRON_USBFN_EP
+ *
+ * Configure the endpoints through the vendor USB Function IO protocol that HK6
+ * installs -- the entry the upper Qualcomm protocol normally uses underneath.
+ *
+ *   ConfigureEnableEndpoints(DeviceInfo): device descriptor plus the endpoint
+ *     chain the interface declares
+ *   start_controller(): bring the controller up in the configured mode
+ *
+ * Until HK6 existed there was no UsbFnIo here, so this path had never been tried.
+ */
+static int
+chiron_usbfn_endpoints(void)
+{
+	static const efi_guid usbfn_guid = QCOM_USBFN_IO_GUID;
+	efi_usbfn_io *fn = NULL;
+	static efi_usb_device_descriptor dev_desc;
+	static efi_usb_config_descriptor cfg_desc;
+	static efi_usb_interface_descriptor if_desc;
+	static efi_usb_endpoint_descriptor ep_in, ep_out;
+	static efi_usb_endpoint_descriptor *ep_table[3];
+	static efi_usb_interface_info if_info;
+	static efi_usb_interface_info *if_table[2];
+	static efi_usb_config_info cfg_info;
+	static efi_usb_config_info *cfg_table[2];
+	static efi_usb_device_info dev_info;
+	efi_status se, ss;
+
+	if (EFI_ERROR(BS->locate_protocol(&usbfn_guid, NULL, (void **)&fn)) || fn == NULL) {
+		print("usbfn: protocol absent\n");
+		return 0;
+	}
+	if (fn->configure_enable_endpoints == NULL) {
+		print("usbfn: no ConfigureEnableEndpoints\n");
+		return 0;
+	}
+
+	memcpy(&dev_desc, usb_dev_desc, sizeof(dev_desc));
+
+	cfg_desc.length = 9;
+	cfg_desc.descriptor_type = 2;
+	cfg_desc.total_length = 9 + 9 + 7 + 7;
+	cfg_desc.num_interfaces = 1;
+	cfg_desc.configuration_value = 1;
+	cfg_desc.attributes = 0x80;
+	cfg_desc.max_power = 0x50;
+
+	if_desc.length = 9;
+	if_desc.descriptor_type = 4;
+	if_desc.num_endpoints = 2;
+	if_desc.interface_class = 0xff;
+	if_desc.interface_sub_class = 0x42;
+	if_desc.interface_protocol = 0x03;
+
+	ep_in.length = 7;
+	ep_in.descriptor_type = 5;
+	ep_in.endpoint_address = USB_EP_IN;
+	ep_in.attributes = 2;
+	ep_in.max_packet_size = 512;
+
+	ep_out.length = 7;
+	ep_out.descriptor_type = 5;
+	ep_out.endpoint_address = USB_EP_OUT;
+	ep_out.attributes = 2;
+	ep_out.max_packet_size = 512;
+
+	ep_table[0] = &ep_in;
+	ep_table[1] = &ep_out;
+	ep_table[2] = NULL;
+	if_info.interface_descriptor = &if_desc;
+	if_info.endpoint_descriptor_table = ep_table;
+	if_table[0] = &if_info;
+	if_table[1] = NULL;
+	cfg_info.config_descriptor = &cfg_desc;
+	cfg_info.interface_info_table = if_table;
+	cfg_table[0] = &cfg_info;
+	cfg_table[1] = NULL;
+	dev_info.device_descriptor = &dev_desc;
+	dev_info.config_info_table = cfg_table;
+
+	se = fn->configure_enable_endpoints(fn, &dev_info);
+	print("usbfn: ConfigureEnableEndpoints ", 0);
+	print("%x", (uint64_t)se);
+	print("\n", 0);
+
+	if (fn->start_controller != NULL) {
+		ss = fn->start_controller(fn);
+		print("usbfn: start_controller ", 0);
+		print("%x", (uint64_t)ss);
+		print("\n", 0);
+	}
+	return !EFI_ERROR(se);
+}
+
+/*
+ * CHIRON_FW_VBUS
+ *
+ * Ask the firmware to enable VBUS through its own USB Config callback instead of
+ * faking the controller-internal signal.  UsbConfigDxe asserts both callbacks are
+ * present and uses them to talk to the PMIC, so this is the only VBUS path the
+ * loader can reach without an SPMI driver of its own.
+ *
+ * Returns 1 if the firmware afterwards reports VBUS present.
+ */
+static int
+chiron_fw_vbus(efi_qcom_usb_config *cfg)
+{
+	uint8_t before = 0xff, after = 0xff;
+	efi_status s_get, s_en, s_after;
+
+	if (cfg == NULL || cfg->get_vbus_status == NULL || cfg->enable_vbus == NULL) {
+		print("fwvbus: callbacks missing\n");
+		return 0;
+	}
+
+	s_get = cfg->get_vbus_status(cfg, &before);
+	s_en = cfg->enable_vbus(cfg, 1);
+	s_after = cfg->get_vbus_status(cfg, &after);
+
+	print("fwvbus: get ", 0);
+	print("%x", (uint64_t)s_get);
+	print(" val ", 0);
+	print("%x", (uint64_t)before);
+	print(" enable ", 0);
+	print("%x", (uint64_t)s_en);
+	print(" then get ", 0);
+	print("%x", (uint64_t)s_after);
+	print(" val ", 0);
+	print("%x", (uint64_t)after);
+	print("\n", 0);
+
+	return !EFI_ERROR(s_after) && after != 0;
+}
 
 /*
  * CHIRON_VBUS_OVERRIDE
@@ -5365,6 +5839,8 @@ usb_start(void)
 	 * using successfully moments ago.
 	 */
 	chiron_dwc3_snap("0-ENTRY");
+	chiron_phy_entry_snap("ENTRY");
+	chiron_env_snap("ENTRY");
 
 	charger_start();
 
@@ -5382,6 +5858,9 @@ usb_start(void)
 	usb_native_mode = 0;
 	usb_manual_mode = 0;
 	usb_pure_mode = 0;
+	usb_restore_mode = 0;
+	usb_probe_mode = 0;
+	usb_sweep_mode = 0;
 	{
 		struct payload_info npi;
 
@@ -5401,6 +5880,26 @@ usb_start(void)
 				    (c[10] == 0 || c[10] == ' ')) {
 					usb_pure_mode = 1;
 				}
+				/* "usb_restore=1" is 13 characters */
+				if (starts_with(c, "usb_restore=1") &&
+				    (c[13] == 0 || c[13] == ' ')) {
+					usb_restore_mode = 1;
+				}
+				/* "usb_probe=1" is 11 characters */
+				if (starts_with(c, "usb_probe=1") &&
+				    (c[11] == 0 || c[11] == ' ')) {
+					usb_probe_mode = 1;
+				}
+				/* "usb_sweep=1" is 11 characters */
+				if (starts_with(c, "usb_sweep=1") &&
+				    (c[11] == 0 || c[11] == ' ')) {
+					usb_sweep_mode = 1;
+				}
+	/* CHIRON_PROBE_ENTRY: usb_probe=1 asks the transport before any write. */
+	if (usb_probe_mode) {
+		chiron_probe_entry();
+		flush_log();
+	}
 			}
 		}
 	}
@@ -5422,8 +5921,40 @@ usb_start(void)
 	if (!usb_manual_mode) {
 		if (chiron_usb_hk6()) {
 			print("usb: HK6 gave us UsbFnIo\n");
+			chiron_usbfn_endpoints();
 		} else {
 			print("usb: HK6 did not reach UsbFnIo\n");
+		}
+
+		/*
+		 * CHIRON_FW_VBUS_CALL
+		 *
+		 * HK6 has the USB Config protocol in place.  Use the firmware's own VBUS
+		 * callback on the peripheral controller it created: UsbConfigDxe routes
+		 * that to the PMIC, which is the only supply path this loader can reach.
+		 */
+		{
+			efi_handle *cfgs = NULL;
+			uint64_t n = 0;
+
+			if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &QCOM_USB_CONFIG_GUID,
+			    NULL, &n, &cfgs))) {
+				for (uint64_t i = 0; i < n; i++) {
+					efi_qcom_usb_config *c = NULL;
+
+					if (EFI_ERROR(BS->handle_protocol(cfgs[i],
+					    &QCOM_USB_CONFIG_GUID, (void **)&c)) || c == NULL) {
+						continue;
+					}
+					/* prefer the peripheral-mode table */
+					if (c->mode_type == UsbModePeripheralAlt ||
+					    c->mode_type == UsbModePeripheral) {
+						chiron_fw_vbus(c);
+						break;
+					}
+				}
+				BS->free_pool(cfgs);
+			}
 		}
 		flush_log();
 	}
@@ -5442,6 +5973,8 @@ usb_start(void)
 	if (!usb_pure_mode) {
 		chiron_clocks_on();
 		chiron_gdsc_on();
+		chiron_phy_map();
+	chiron_write_test();
 		chiron_qusb2_init();
 	}
 	if (!usb_native_mode || usb_manual_mode) {
@@ -5880,6 +6413,14 @@ usb_command_loop(void)
 	 * log stops after this line the very first USB call is what hangs, and if this
 	 * line never appears usb_command_loop() was never reached.
 	 */
+	if (usb_restore_mode) {
+		chiron_phy_restore();
+	}
+	chiron_env_snap("FINAL");
+	if (usb_sweep_mode) {
+		chiron_utmi_sweep();
+	}
+	chiron_phy_entry_snap("FINAL");
 	print("usb: command loop entered\n");
 	flush_log();
 

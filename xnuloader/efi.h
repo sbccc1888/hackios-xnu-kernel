@@ -240,13 +240,14 @@ typedef struct {
 } efi_qcom_usb_init;
 
 /* The vendor DWC3 Supported() reads CoreNum/ModeType at 0x88/0x8c. */
-typedef struct {
+typedef struct efi_qcom_usb_config {
 	uint32_t revision;
 	void *methods[16];
 	uint32_t core_num;
 	uint32_t mode_type;
-	void *get_vbus_status;
-	void *enable_vbus;
+	/* the two VBUS callbacks UsbConfigDxe asserts non-null */
+	efi_status (EFIAPI *get_vbus_status)(struct efi_qcom_usb_config *self, uint8_t *state);
+	efi_status (EFIAPI *enable_vbus)(struct efi_qcom_usb_config *self, uint8_t enable);
 } efi_qcom_usb_config;
 
 typedef struct {

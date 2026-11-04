@@ -5881,17 +5881,31 @@ chiron_usbfn_endpoints(void)
 	dev_info.device_descriptor = &dev_desc;
 	dev_info.config_info_table = cfg_table;
 
-	se = fn->configure_enable_endpoints(fn, &dev_info);
-	print("usbfn: ConfigureEnableEndpoints ", 0);
-	print("%x", (uint64_t)se);
-	print("\n", 0);
-
+	/*
+	 * CHIRON_USBFN_ORDER
+	 *
+	 * StartController first: "Initializes the hardware and internal data
+	 * structures, but must not activate the port."  ConfigureEnableEndpoints
+	 * second: "Enable the device by setting the run/stop bit."
+	 *
+	 * This function had them the other way round, so the port was told to activate
+	 * before the controller owning it had been initialised, and was then "started"
+	 * afterwards -- both returning success, nothing appearing on the wire.
+	 */
 	if (fn->start_controller != NULL) {
 		ss = fn->start_controller(fn);
 		print("usbfn: start_controller ", 0);
 		print("%x", (uint64_t)ss);
 		print("\n", 0);
+	} else {
+		print("usbfn: no start_controller\n");
 	}
+
+	se = fn->configure_enable_endpoints(fn, &dev_info);
+	print("usbfn: ConfigureEnableEndpoints ", 0);
+	print("%x", (uint64_t)se);
+	print("\n", 0);
+
 	return !EFI_ERROR(se);
 }
 

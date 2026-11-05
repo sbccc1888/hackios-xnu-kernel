@@ -49,13 +49,18 @@ typedef struct {
 	efi_status (EFIAPI *get_memory_map)(uint64_t *size, void *map, uint64_t *key, uint64_t *desc_size, uint32_t *desc_ver);
 	efi_status (EFIAPI *allocate_pool)(int type, uint64_t size, void **buf);
 	efi_status (EFIAPI *free_pool)(void *buf);
-	void *create_event, *set_timer, *wait_for_event;
+	efi_status (EFIAPI *create_event)(uint32_t type, uint64_t tpl,
+	    void (EFIAPI *notify)(void *event, void *ctx), const void *ctx, void **event);
+	efi_status (EFIAPI *set_timer)(void *event, uint32_t type, uint64_t trigger_time);
+	efi_status (EFIAPI *wait_for_event)(uint64_t count, void **event, uint64_t *index);
 	efi_status (EFIAPI *signal_event)(void *event);
 	efi_status (EFIAPI *close_event)(void *event);
-	void *check_event;
+	efi_status (EFIAPI *check_event)(void *event);
 	efi_status (EFIAPI *install_protocol_interface)(efi_handle *handle, const efi_guid *guid,
 	    int type, void *iface);
-	void *reinstall_protocol_interface, *uninstall_protocol_interface;
+	efi_status (EFIAPI *reinstall_protocol_interface)(efi_handle handle, const efi_guid *guid,
+	    void *old_iface, void *new_iface);
+	void *uninstall_protocol_interface;
 	efi_status (EFIAPI *handle_protocol)(efi_handle h, const efi_guid *guid, void **iface);
 	void *reserved, *register_protocol_notify, *locate_handle, *locate_device_path, *install_configuration_table;
 	efi_status (EFIAPI *load_image)(int boot_policy, efi_handle parent, void *path,

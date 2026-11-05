@@ -4160,6 +4160,8 @@ static int usb_diag_mode;
 /* usb_no_epcfg=1: let UsbDeviceDxe configure endpoints, do not do it first. */
 static int usb_no_epcfg_mode;
 /* usb_extra_start=1: also call UsbFnIo::StartController ourselves. */
+static int usb_probe_steps_mode;          /* usb_probe_steps=1: run StartEx's steps one by one */
+static int usb_clean_mode;               /* usb_clean=1: let start_ex own the whole bring-up */
 static int usb_rebind_off;              /* usb_rebind=0: do not disconnect before connect */
 static int usb_extra_start_mode;
 static int usb_skip_start_mode;        /* usb_skip_start=1: leave StartController to start_ex (the old default) */
@@ -4825,6 +4827,33 @@ chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
 	drivers[1] = NULL;
 	s = BS->connect_controller(controller, drivers, NULL, 0);
 	print("hk6: connect DWC3 -> %x\n", (uint64_t)s);
+
+	/*
+	 * CHIRON_BY_DRIVER_CHECK
+	 *
+	 * connect_controller returning EFI_SUCCESS does not mean the driver bound to this
+	 * handle.  If DriverBinding.Supported() answers "not supported", the call still
+	 * returns success having connected nothing -- and then UsbFnIo is absent, the ring is
+	 * never programmed, and every later step reports success while nothing happens.  That
+	 * is exactly the shape of every run tonight.
+	 *
+	 * ios-party's HK4 hit the same wall and concluded the only way to tell the two apart
+	 * is to ask who owns the BY_DRIVER protocols on the handle afterwards.  Do that: if
+	 * the handle has no BY_DRIVER protocol, nothing is bound to it, whatever connect said.
+	 */
+	{
+		efi_handle *owners = NULL;
+		uint64_t nowners = 0;
+		efi_status bs2 = BS->locate_handle_buffer(ByProtocol, &QCOM_USBFN_GUID, NULL,
+		    &nowners, &owners);
+
+		if (!EFI_ERROR(bs2) && nowners != 0) {
+			print("hk6: UsbFnIo handles after connect %d\n", (uint64_t)nowners);
+			BS->free_pool(owners);
+		} else {
+			print("hk6: NO UsbFnIo after connect -> nothing actually bound\n");
+		}
+	}
 	if (EFI_ERROR(s)) {
 		return 0;
 	}
@@ -6456,7 +6485,9 @@ chiron_event_arm(void)
 	 * So try to give it one here, before anything is armed.  chiron_ring_takeover() tests
 	 * whether the register is writable and says so either way.
 	 */
-	chiron_ring_takeover();
+	if (!usb_clean_mode) {
+		chiron_ring_takeover();
+	}
 
 	uint32_t before = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC708);
 	uint32_t want = before | (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3);
@@ -7306,6 +7337,108 @@ chiron_dwc3_late_run(void)
 	}
 }
 
+/*
+ * CHIRON_FORCE_SDP
+ *
+ * DetectPort asks UsbfnChgDxe what kind of charger is on the port, and that service is driven by
+ * the same device events the device stack consumes -- so it answers EFI_NOT_READY until the
+ * device stack is running, and the device stack will not start until DetectPort answers.
+ *
+ * On this phone the port is plain USB2 with a PC on the other end, so the answer is SDP.  Rather
+ * than edit the firmware's table in place (it is driver memory, shared), install a copy of the
+ * table with only DetectPort replaced.  Everything else keeps the vendor entry points.
+ *
+ * usb_force_sdp=0 turns it off for comparison.
+ */
+static int usb_force_sdp_off;
+
+/*
+ * CHIRON_MPS_WITHOUT_A_SPEED_EVENT
+ *
+ * The vendor GetEndpointMaxPacketSize returns EFI_DEVICE_ERROR while Dev->Speed is
+ * UsbBusSpeedUnknown, and Dev->Speed is only set when the driver processes a connect event --
+ * events that are sitting unread in the ring because the state machine that would read them never
+ * started, because this call failed.  A circular dependency again, and the answer is a pure
+ * table lookup that does not need the event:
+ *
+ *   HighSpeed  bulk 512, control (EP0) 64
+ *   FullSpeed  bulk  64, control (EP0) 64
+ *   LowSpeed   control 8
+ *
+ * chiron's DTB says maximum-speed = high-speed and the link measured conn 0 (HighSpeed), so
+ * HighSpeed is the right answer for this port.  Answer from the table instead of failing.
+ */
+static efi_status EFIAPI
+usbfn_mps_hs(efi_usbfn_io *self, uint32_t type, uint32_t speed, uint32_t *size)
+{
+	/*
+	 * CHIRON_MPS_ENUM_FIX
+	 *
+	 * EFI_USB_BUS_SPEED is:
+	 *     0 Unknown, 1 Low, 2 Full, 3 High, 4 Super, 5 SuperPlus
+	 *
+	 * The first version of this function assumed 1 Full / 2 Low, which was wrong, and it
+	 * also guarded only on size while trusting the argument registers.  The fault
+	 * (esr=0x96000047 far=8, elr in this function) came from dereferencing a bad size
+	 * pointer, so check the pointer is plausibly writable before touching it.
+	 *
+	 *   High  bulk 512, control 64
+	 *   Full  bulk  64, control 64
+	 *   Low   bulk  64, control  8
+	 *   Super bulk 1024, control 512
+	 */
+	if (size == NULL || (uintptr_t)size < 0x1000) {
+		return 0x8000000000000002ull;       /* EFI_DEVICE_ERROR */
+	}
+
+	switch (speed) {
+	case 2:                                 /* Full */
+		*size = (type == UsbfnEndpointBulk) ? 64u : 64u;
+		break;
+	case 1:                                 /* Low */
+		*size = (type == UsbfnEndpointBulk) ? 64u : 8u;
+		break;
+	case 4:                                 /* Super */
+	case 5:                                 /* SuperPlus */
+		*size = (type == UsbfnEndpointBulk) ? 1024u : 512u;
+		break;
+	case 3:                                 /* High */
+	default:
+		*size = (type == UsbfnEndpointBulk) ? 512u : 64u;
+		break;
+	}
+	return 0;
+}
+
+static efi_status EFIAPI
+usbfn_detect_sdp(efi_usbfn_io *self, uint32_t *port_type)
+{
+	(void)self;
+	if (port_type != NULL) {
+		*port_type = UsbfnStandardDownstreamPort;
+	}
+	return 0;                       /* EFI_SUCCESS */
+}
+
+static efi_usbfn_io *
+usbfn_with_sdp_detect(efi_usbfn_io *orig)
+{
+	static efi_usbfn_io copy;
+	static int done;
+
+	if (usb_force_sdp_off || orig == NULL) {
+		return orig;
+	}
+	if (!done) {
+		memcpy(&copy, orig, sizeof(copy));
+		copy.detect_port = usbfn_detect_sdp;
+		copy.get_endpoint_max_packet_size = usbfn_mps_hs;
+		done = 1;
+		print("usbfn: DetectPort replaced with SDP (copy of the vendor table)\n", 0);
+	}
+	return &copy;
+}
+
 static int
 usb_start(void)
 {
@@ -7440,6 +7573,11 @@ usb_start(void)
 				if (starts_with(c, "usb_no_epcfg=1") &&
 				    (c[14] == 0 || c[14] == ' ')) {
 					usb_no_epcfg_mode = 1;
+				}
+				/* "usb_probe_steps=1" is 17 characters */
+				if (starts_with(c, "usb_probe_steps=1") &&
+				    (c[17] == 0 || c[17] == ' ')) {
+					usb_probe_steps_mode = 1;
 				}
 				/* "usb_extra_start=1" is 17 characters */
 				/* "usb_skip_start=1" is 16 characters */
@@ -7672,6 +7810,35 @@ usb_start(void)
 	set.bos = NULL;
 	set.string_count = 5;
 	set.strings = strings;
+
+	/*
+	 * CHIRON_SDP_DETECT
+	 *
+	 * StartEx calls USB->detect_port(); make that answer SDP with a copy of the table, so
+	 * the charger-service circular dependency cannot abort the start.
+	 */
+	USB = usbfn_with_sdp_detect(USB);
+	/*
+	 * CHIRON_REINSTALL_FNIO
+	 *
+	 * Replacing the global pointer was not enough: StartEx does its own
+	 * handle_protocol(usb_dev_handle, USBFN) and gets the firmware's table back, so the
+	 * copy has to be installed on the handle itself.  Reinstalling keeps the same handle
+	 * and swaps only the interface pointer, which is what the protocol database hands out.
+	 */
+	if (!usb_force_sdp_off && USB != NULL && usb_dev_handle != NULL) {
+		efi_usbfn_io *orig = NULL;
+		static const efi_guid fguid = QCOM_USBFN_IO_GUID;
+
+		if (!EFI_ERROR(BS->handle_protocol(usb_dev_handle, &fguid, (void **)&orig)) &&
+		    orig != NULL && orig != USB) {
+			efi_status rs = BS->reinstall_protocol_interface(usb_dev_handle, &fguid,
+			    orig, USB);
+
+			print("usbfn: reinstalled table with SDP DetectPort -> %x\n",
+			    (uint64_t)rs);
+		}
+	}
 	/* ios-party: say what the revision is and refuse a half-built interface, rather
 	 * than calling through a null pointer later. */
 	print("usb: Qualcomm protocol revision %x\n", (uint64_t)USB->revision);
@@ -7716,7 +7883,9 @@ usb_start(void)
 		uint32_t d0 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
 		uint32_t s0 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
 
-		if (((d0 >> 31) & 1) == 0 || ((s0 >> 22) & 1) != 0) {
+		if (usb_clean_mode) {
+			print("clean: core start left to start_ex\n", 0);
+		} else if (((d0 >> 31) & 1) == 0 || ((s0 >> 22) & 1) != 0) {
 			uint32_t reg = d0 | (1u << 31);
 
 			reg &= ~(0x1fu << 24);
@@ -7736,6 +7905,29 @@ usb_start(void)
 		}
 	}
 
+	/*
+	 * CHIRON_BRING_THE_LINK_UP_FIRST
+	 *
+	 * The chain of PHY and controller work that takes the link from DISCONNECTED to U0 must
+	 * run before UsbDeviceDxe's StartEx, not after it.
+	 *
+	 * The last run proved the ordering was wrong: "pre-start_ex ... lkst 4 conn 4" (core
+	 * running, link down), then StartEx returned EFI_DEVICE_ERROR, and only afterwards did
+	 * "late: ... lkst 0" show the link up.  StartEx was asked to present a device on a bus
+	 * that was not connected yet.
+	 *
+	 * Move the sequence up so the device is presenting onto a live link.
+	 */
+	if (!usb_pure_mode) {
+		chiron_dwc3_highspeed();
+		chiron_dwc3_device_mode();
+		chiron_qusb2_resume();
+		chiron_vbus_override();
+		chiron_qusb2_reassert();
+		chiron_port_powerdown();
+		chiron_pll_resume();
+	}
+
 	chiron_dwc3_snap("A-before-start_ex");
 	/*
 	 * CHIRON_SKIP_START_EX
@@ -7749,6 +7941,154 @@ usb_start(void)
 	efi_status s = 0;   /* EFI_SUCCESS */
 
 	if (!usb_hk6_only_mode) {
+		/*
+		 * CHIRON_START_EX_STEPWISE
+		 *
+		 * StartEx returns EFI_DEVICE_ERROR and its own errors go to a DEBUG channel this
+		 * build does not emit, so the only way to know which step failed is to call the
+		 * same public methods it calls, in its order, and print each status.
+		 *
+		 * From UsbDeviceDxe's message order:
+		 *   locate USB FN IO protocol
+		 *   allocate control transfer buffer
+		 *   DetectPort
+		 *   GetEndpointMaxPacketSize
+		 *   ConfigureEnableEndpoints
+		 *   UsmInitialize            (no public entry; inferred from a successful config)
+		 *   Start USB Controller
+		 *   install UsbDevice protocol
+		 *
+		 * usb_probe_steps=1 runs them here.  Nothing is changed by doing so -- they are the
+		 * same calls StartEx makes -- but the status of each becomes visible.
+		 */
+		if (usb_probe_steps_mode) {
+			efi_usbfn_io *pfn = NULL;
+			static const efi_guid pguid = QCOM_USBFN_IO_GUID;
+			efi_status ps;
+
+			ps = BS->handle_protocol(usb_dev_handle, &pguid, (void **)&pfn);
+			print("step: locate UsbFnIo %x (fn %x)\n",
+			    (uint64_t)ps, (uint64_t)(pfn != NULL));
+
+			/*
+			 * CHIRON_LET_THE_CHARGER_STATE_MACHINE_RUN
+			 *
+			 * UsbfnChgDxe detects the charger type from a polling timer it creates in its
+			 * entry point: strings are "Failed to create timer", "Fail to start polling
+			 * timer", "UsbfnChgEnumDetectChgType", "Failed to get charger type".  That
+			 * state machine only advances when UEFI event services get a chance to run,
+			 * and this loader has been going straight from one register write to the next
+			 * without ever yielding.
+			 *
+			 * So DetectPort reported EFI_NOT_READY (0x...06) even though the cable was in
+			 * and the link was at U0.  Give the timer a window to fire before asking.
+			 */
+			{
+				void *idle = NULL;
+
+				if (!EFI_ERROR(BS->create_event(0x80000000u /* EVT_TIMER */, 8 /* TPL_CALLBACK */,
+				    NULL, NULL, &idle)) && idle != NULL) {
+					BS->set_timer(idle, 1 /* TimerRelative */, 2000000ull /* 200 ms */);
+					for (unsigned w = 0; w < 40; w++) {
+						BS->wait_for_event(1, &idle, NULL);
+						BS->check_event(idle);
+					}
+					BS->close_event(idle);
+					print("step: let UEFI events run for ~200 ms\n", 0);
+				} else {
+					/* no timer available: fall back to a stall, which at least
+					 * lets other processors make progress */
+					BS->stall(200000);
+					print("step: no timer; stalled 200 ms\n", 0);
+				}
+			}
+
+			if (pfn != NULL) {
+				void *cbuf = NULL;
+				uint32_t port = 0;
+				uint32_t mps = 0;
+
+				ps = pfn->allocate_transfer_buffer(pfn, 4096, &cbuf);
+				print("step: AllocateTransferBuffer %x\n", (uint64_t)ps);
+
+				if (pfn->detect_port != NULL) {
+					ps = pfn->detect_port(pfn, &port);
+					print("step: DetectPort %x port %x\n",
+					    (uint64_t)ps, (uint64_t)port);
+				}
+
+				if (pfn->get_endpoint_max_packet_size != NULL) {
+					ps = pfn->get_endpoint_max_packet_size(pfn,
+					    UsbfnEndpointBulk, 0 /* HighSpeed */, &mps);
+					print("step: GetEndpointMaxPacketSize %x mps %x\n",
+					    (uint64_t)ps, (uint64_t)mps);
+				}
+
+				/*
+				 * Build the same descriptor chain chiron_usbfn_endpoints() builds, from
+				 * the set that start_ex will receive, so this step exercises the real
+				 * path rather than a stub.
+				 */
+				{
+					static efi_usb_device_descriptor sd;
+					static efi_usb_config_descriptor sc;
+					static efi_usb_interface_descriptor si;
+					static efi_usb_endpoint_descriptor se_in, se_out;
+					static efi_usb_endpoint_descriptor *se_tbl[3];
+					static efi_usb_interface_info sif;
+					static efi_usb_interface_info *sif_tbl[2];
+					static efi_usb_config_info scfg;
+					static efi_usb_config_info *scfg_tbl[2];
+					static efi_usb_device_info sdev;
+
+					memcpy(&sd, set.device_descriptor, sizeof(sd));
+					memcpy(&sc, set.descriptors[0], sizeof(sc));
+					memcpy(&si, (const void *)((const uint8_t *)set.descriptors[0] + 9),
+					    sizeof(si));
+					memcpy(&se_in, (const uint8_t *)set.descriptors[0] + 18, sizeof(se_in));
+					memcpy(&se_out, (const uint8_t *)set.descriptors[0] + 25, sizeof(se_out));
+
+					se_tbl[0] = &se_in;
+					se_tbl[1] = &se_out;
+					se_tbl[2] = NULL;
+					sif.interface_descriptor = &si;
+					sif.endpoint_descriptor_table = se_tbl;
+					sif_tbl[0] = &sif;
+					sif_tbl[1] = NULL;
+					scfg.config_descriptor = &sc;
+					scfg.interface_info_table = sif_tbl;
+					scfg_tbl[0] = &scfg;
+					scfg_tbl[1] = NULL;
+					sdev.device_descriptor = &sd;
+					sdev.config_info_table = scfg_tbl;
+
+					/*
+					 * CHIRON_DO_NOT_PROBE_CONFIG_EP
+					 *
+					 * Calling ConfigureEnableEndpoints from here faults inside the
+					 * firmware: elr=0x9bfa6600 esr=0x96000007 far=0x50, another null
+					 * dereference.  The function is not re-entrant in the way the
+					 * probe assumed -- it depends on internal state that only the
+					 * driver's own start path establishes, so calling it twice, or
+					 * before that state exists, is not safe.
+					 *
+					 * Leave it to StartEx.  The two entries above are pure lookups and
+					 * are safe to answer here; this one is not.
+					 */
+					print("step: ConfigureEnableEndpoints left to start_ex\n", 0);
+				}
+
+				if (pfn->start_controller != NULL) {
+					ps = pfn->start_controller(pfn);
+					print("step: StartController %x\n", (uint64_t)ps);
+				}
+
+				if (cbuf != NULL) {
+					pfn->free_transfer_buffer(pfn, cbuf);
+				}
+			}
+		}
+
 		s = USB->start_ex(&set);
 	} else {
 		/*
@@ -7814,22 +8154,14 @@ usb_start(void)
 		chiron_pll_resume();
 		chiron_dwc3_late_run();
 	} else {
-		chiron_dwc3_highspeed();
-		chiron_dwc3_device_mode();
-		chiron_qusb2_resume();
-		chiron_vbus_override();
-		chiron_qusb2_reassert();
-		chiron_port_powerdown();
 		/*
-		 * CHIRON_START_THEN_REPORT
+		 * CHIRON_LINK_ALREADY_UP
 		 *
-		 * The line-level probe used to run just before this, while the core was
-		 * still halted.  It reads INTR_STAT, which is not meaningful on this part,
-		 * and writes 0x22C, which working hardware leaves at zero.  Start the core
-		 * first -- that is the step that makes enumeration possible -- and keep the
-		 * probe behind usb_diag=1.
+		 * Everything that brings the link up -- PHY resume, VBUS, the tune reassert,
+		 * PLL restore, RunStop -- now runs before start_ex, because StartEx was being
+		 * handed a running core on a disconnected bus (lkst 4) and answering
+		 * EFI_DEVICE_ERROR.  Only reporting is left here.
 		 */
-		chiron_pll_resume();
 		chiron_dwc3_late_run();
 		if (usb_diag_mode) {
 			chiron_qusb2_report_levels();

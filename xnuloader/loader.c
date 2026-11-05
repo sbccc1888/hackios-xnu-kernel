@@ -3111,9 +3111,26 @@ exception_handler(int64_t type, uint64_t *ctx)
 	print("loader image base %x (elr offset %x)\n", (uint64_t)(uintptr_t)&__ImageBase,
 	    ctx[EXC_CTX_ELR] - (uint64_t)(uintptr_t)&__ImageBase);
 	flush_log();
-	/* CHIRON_HALT_NO_REBOOT: do not reset -- the bootloader would boot Android and the
-	 * fault would be gone from the screen before it could be read. */
-	print("\n== HALTED (no reboot) ==\n");
+	/*
+	 * CHIRON_FAULT_REBOOT
+	 *
+	 * This used to halt for ever, on the reasoning that a reset would hand the phone to the
+	 * bootloader and the fault would vanish from the screen before anyone read it.
+	 *
+	 * The log is already flushed at this point, and it is read over adb -- which needs
+	 * Android up.  So halting loses the screen as surely as resetting does, and additionally
+	 * loses the log.  Observed cost: four hours of a phone that looked dead, from a fault
+	 * that had already been captured in a partition.
+	 *
+	 * Reset by default; halt=1 keeps the old behaviour for when someone is watching the
+	 * panel.  Same reasoning as c42a676 applied to the final exit path.
+	 */
+	if (!halt_instead) {
+		print("\n== resetting after fault; the log is in the partition ==\n");
+		BS->stall(500000);
+		ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+	}
+	print("\n== HALTED (halt=1) ==\n");
 	for (;;) {
 	}
 }

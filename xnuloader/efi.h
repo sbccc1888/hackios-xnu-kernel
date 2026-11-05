@@ -69,7 +69,9 @@ typedef struct {
 	efi_status (EFIAPI *set_watchdog_timer)(uint64_t timeout, uint64_t code, uint64_t size, char16 *data);
 	efi_status (EFIAPI *connect_controller)(efi_handle controller, efi_handle *drivers,
 	    void *remaining, int recursive);
-	void *disconnect_controller, *open_protocol, *close_protocol;
+	efi_status (EFIAPI *disconnect_controller)(efi_handle controller, efi_handle child,
+	    efi_handle driver_binding);
+	void *open_protocol, *close_protocol;
 	efi_status (EFIAPI *open_protocol_information)(efi_handle handle, const efi_guid *guid,
 	    void **entry_buffer, uint64_t *entry_count);
 	void *protocols_per_handle;

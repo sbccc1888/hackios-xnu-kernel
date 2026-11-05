@@ -4160,7 +4160,9 @@ static int usb_diag_mode;
 /* usb_no_epcfg=1: let UsbDeviceDxe configure endpoints, do not do it first. */
 static int usb_no_epcfg_mode;
 /* usb_extra_start=1: also call UsbFnIo::StartController ourselves. */
+static int usb_rebind_off;              /* usb_rebind=0: do not disconnect before connect */
 static int usb_extra_start_mode;
+static int usb_skip_start_mode;        /* usb_skip_start=1: leave StartController to start_ex (the old default) */
 /* the USB Config handle chiron_pick_usb_device() selected */
 static efi_handle usb_dev_handle;
 
@@ -4797,6 +4799,28 @@ chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
 		return 0;
 	}
 
+	/*
+	 * CHIRON_FORCE_REBIND
+	 *
+	 * The event ring is allocated in UsbFnDriverBindingStart -> UsbfnDwcCoreInitImpl
+	 * (the driver's own strings say so: "DwcConfigureEventBuffer failed" sits between
+	 * UsbfnDwcCoreInitImpl and the endpoint setup).  UsbFnIo::StartController only
+	 * "initialises hardware and internal data structures" and does not re-allocate it.
+	 *
+	 * This controller arrives used -- the entry snapshot reads devaddr d, an address
+	 * fastboot assigned -- and HK6 stops it before connecting.  If the driver was already
+	 * bound, connect_controller succeeds without running binding start again, so the ring
+	 * that binding stop freed is never re-allocated.  That is exactly the state the log
+	 * shows: StartController returns 0 and GEVNTADR is still zero.
+	 *
+	 * Disconnect first, so the connect below is a real bind.
+	 */
+	if (!usb_rebind_off) {
+		efi_status ds = BS->disconnect_controller(controller, NULL, NULL);
+
+		print("hk6: disconnect before rebind -> %x\n", (uint64_t)ds);
+	}
+
 	drivers[0] = binding->image_handle;
 	drivers[1] = NULL;
 	s = BS->connect_controller(controller, drivers, NULL, 0);
@@ -4804,6 +4828,15 @@ chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
 	if (EFI_ERROR(s)) {
 		return 0;
 	}
+
+	/*
+	 * Read the ring right here, before anything else can touch it.  This is the value that
+	 * has been zero in every run so far and it decides whether the rest is worth doing.
+	 */
+	print("hk6: ring after rebind adr %x sz %x count %x\n",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C));
 
 	s = BS->handle_protocol(controller, &QCOM_USBFN_GUID, &usbfn);
 	print("hk6: cloned controller UsbFnIo %x\n", (uint64_t)s);
@@ -4815,6 +4848,35 @@ chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
  *
  * The whole handshake.  Returns 1 when USB Function IO exists afterwards.
  */
+/* defined below; HK6 re-runs it after starting the peripheral controller */
+static usb_device_protocol *chiron_pick_usb_device(void);
+
+/*
+ * usb_config_is_peripheral: true when this handle's USB Config reports a peripheral mode.
+ *
+ * Needed because UsbfnDwc3Dxe publishes UsbFnIo for whatever it bound to, and on this part that
+ * can still be the host-mode controller.  Checking the mode is the difference between "UsbFnIo
+ * exists" and "a peripheral controller exists", and every earlier attempt in this session
+ * confused the two.
+ */
+static int
+usb_config_is_peripheral(efi_handle h)
+{
+	static const efi_guid cfg_guid = QCOM_USB_CONFIG_GUID;
+	efi_qcom_usb_config *cfg = NULL;
+
+	if (h == NULL) {
+		return 0;
+	}
+	if (EFI_ERROR(BS->handle_protocol(h, &cfg_guid, (void **)&cfg)) || cfg == NULL) {
+		return 0;
+	}
+	if (cfg->revision != 0x10003) {
+		return 0;
+	}
+	return cfg->mode_type == UsbModePeripheral || cfg->mode_type == UsbModePeripheralAlt;
+}
+
 static int
 chiron_usb_hk6(void)
 {
@@ -4874,10 +4936,103 @@ chiron_usb_hk6(void)
 		print("hk6: start peripheral %x\n", (uint64_t)s);
 
 		/*
-		 * Prefer the controller handle that was selected by mode.  locate_protocol
-		 * returns whichever comes first, which is how this port could end up
-		 * talking to a different controller than the one it chose.
+		 * CHIRON_HK6_REPICK_AFTER_START
+		 *
+		 * The picker above ran before the start and could only see whatever already
+		 * existed -- on this part, a single host-mode controller.  The call above created
+		 * the peripheral one.  So re-run the picker now, while it can see it, and use
+		 * that handle.
+		 *
+		 * This used to fall straight through to locate_protocol, which returns whichever
+		 * handle is first in the database without asking its mode.  Everything after
+		 * this point -- StartController, the ring check, event arming -- then addressed
+		 * the wrong controller, which is why StartController could return success while
+		 * GEVNTADR stayed zero: the controller that owns a ring was never the one being
+		 * talked to.
 		 */
+		{
+			usb_device_protocol *dev = chiron_pick_usb_device();
+
+			/*
+			 * CHIRON_CLONE_BEFORE_FNIO
+			 *
+			 * A peripheral controller is only usable if the picker can see one in
+			 * mode 4.  The vendor StartController does not produce one: its static
+			 * configuration path replaces the requested mode with host before
+			 * comparing, so it returns success and changes nothing (ios-party HK4
+			 * measured this on the same phone: core 0 stays at mode 1, XHCI host).
+			 *
+			 * Their HK5 answer is the one to follow, and it is what
+			 * chiron_usb_clone_config() below already implements: build a peripheral
+			 * config record, register it, and let the real DWC3 driver bind to it.
+			 *
+			 * So only take the picked-handle shortcut when the picker actually found
+			 * a peripheral controller.  Otherwise fall through to the clone.
+			 */
+			if (dev != NULL && usb_dev_handle != NULL &&
+			    usb_config_is_peripheral(usb_dev_handle)) {
+				/*
+				 * CHIRON_REBIND_BEFORE_FNIO
+				 *
+				 * The disconnect/connect pair that forces a real
+				 * DriverBindingStart lives in chiron_usb_clone_config(), below the
+				 * return that the picked-handle path takes -- so it never runs, and
+				 * with it never runs UsbfnDwcCoreInitImpl and DwcConfigureEventBuffer.
+				 * The log confirms: no "hk6: clone source", no "hk6: stop host
+				 * controller", and GEVNTADR still zero afterwards.
+				 *
+				 * Binding start is what allocates the ring.  Do the rebind here, on
+				 * the handle that was actually picked, before taking UsbFnIo from it.
+				 * If the driver is already bound, disconnect fails harmlessly and
+				 * connect is a no-op.
+				 */
+				if (!usb_rebind_off) {
+					efi_status ds;
+
+					/*
+					 * CHIRON_NO_MANUAL_SUPPORTED
+					 *
+					 * Calling binding->supported() on this handle faults inside the
+					 * vendor driver: elr=0x30, far=0x30, a call through a null
+					 * pointer at offset 0x30.  It is safe only on the controller the
+					 * clone path builds, not on one the firmware created.
+					 *
+					 * connect_controller runs Supported() itself for every driver it
+					 * is given, so there is no need to call it by hand here -- and
+					 * doing so crashed the loader twice before this was noticed.
+					 */
+					ds = BS->disconnect_controller(usb_dev_handle, NULL, NULL);
+					print("hk6: disconnect picked handle -> %x\n", (uint64_t)ds);
+
+					{
+						efi_handle only[2];
+						efi_status cs;
+
+						only[0] = binding->image_handle;
+						only[1] = NULL;
+						cs = BS->connect_controller(usb_dev_handle, only, NULL, 0);
+						print("hk6: reconnect picked handle -> %x\n", (uint64_t)cs);
+					}
+
+					/*
+					 * Read the ring before anything else can touch it.  This is the
+					 * value that has been zero in every run.
+					 */
+					print("hk6: ring after rebind adr %x sz %x count %x\n",
+					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400),
+					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408),
+					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C));
+				}
+
+				if (!EFI_ERROR(BS->handle_protocol(usb_dev_handle, &QCOM_USBFN_GUID,
+				    &usbfn))) {
+					print("hk6: UsbFnIo after start (picked handle)\n");
+					return 1;
+				}
+			}
+			print("hk6: re-pick after start found no peripheral controller\n");
+		}
+
 		if (usb_dev_handle != NULL &&
 		    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &QCOM_USBFN_GUID, &usbfn))) {
 			print("hk6: UsbFnIo after start (chosen handle)\n");
@@ -4913,9 +5068,26 @@ chiron_usb_hk6(void)
 				print("%x rev %x core %x mode %x\n", (uint64_t)i,
 				    (uint64_t)cfg->revision, (uint64_t)cfg->core_num,
 				    (uint64_t)cfg->mode_type);
+				/*
+				 * CHIRON_HOST_CFG_ANY_MODE
+				 *
+				 * This required mode_type == UsbModeHost, and UsbModeHost is 0x01
+				 * in our enum.  The controller on this part reports 0x10000, so
+				 * the test never matched, host_cfg stayed NULL, and HK6 returned
+				 * before cloning -- which is why DriverBindingStart never ran and
+				 * the event ring was never allocated.
+				 *
+				 * What the clone actually needs is any controller that is not
+				 * already peripheral, so that its config record can be copied and
+				 * reinstalled in peripheral mode.  Select on that instead of on an
+				 * exact mode value this part does not use.
+				 */
 				if (cfg->revision == 0x10003 && cfg->core_num == core.core_num &&
-				    cfg->mode_type == UsbModeHost) {
+				    cfg->mode_type != UsbModePeripheral &&
+				    cfg->mode_type != UsbModePeripheralAlt) {
 					host_cfg = cfg;
+					print("hk6: clone source core %x mode %x\n",
+					    (uint64_t)cfg->core_num, (uint64_t)cfg->mode_type);
 				}
 			}
 			BS->free_pool(handles);
@@ -6025,6 +6197,8 @@ chiron_pick_usb_device(void)
 	print("%x", (uint64_t)count);
 	print(" config handles\n", 0);
 
+	uint32_t picked_core = 0xff, picked_mode = 0xff;
+
 	for (uint64_t i = 0; i < count; i++) {
 		efi_qcom_usb_config *cfg = NULL;
 		usb_device_protocol *dev = NULL;
@@ -6058,13 +6232,48 @@ chiron_pick_usb_device(void)
 		print("%x", (uint64_t)(dev != NULL));
 		print("\n", 0);
 
-		if (dev != NULL && is_peripheral && chosen == NULL) {
-			chosen = dev;
+		/*
+		 * CHIRON_PICK_ON_CONFIG_ALONE
+		 *
+		 * This required UsbDevice to sit on the same handle as the config protocol:
+		 *
+		 *     if (dev != NULL && is_peripheral && chosen == NULL)
+		 *
+		 * On this part it does not.  Tonight's log shows two config handles, the
+		 * peripheral one among them (core 0, mode 4), and dev 0 for both -- so the
+		 * correct controller was discarded and the fallback picked a handle it knew
+		 * nothing about.
+		 *
+		 * Which handle carries UsbDevice is a firmware detail.  The picker needs the
+		 * config in peripheral mode and the handle to hand to UsbFnIo; UsbDevice can be
+		 * resolved separately, which is what the fallback already does by GUID.  Select
+		 * on the config alone, then look UsbDevice up: on this handle first, then
+		 * globally.
+		 */
+		if (is_peripheral && chosen == NULL && cfg != NULL) {
+			chosen = dev;                   /* may still be NULL; resolved below */
 			usb_dev_handle = handles[i];
+			picked_core = core;
+			picked_mode = mode;
 		}
 	}
 	if (handles != NULL) {
 		BS->free_pool(handles);
+	}
+
+	if (chosen == NULL && usb_dev_handle != NULL) {
+		/*
+		 * A peripheral controller was found but UsbDevice was not on its handle.
+		 * Look it up by GUID before giving up on it.
+		 */
+		print("pick: peripheral core %x mode %x, UsbDevice looked up separately\n",
+		    (uint64_t)picked_core, (uint64_t)picked_mode);
+		if (!EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&chosen))) {
+			print("pick: UsbDevice resolved globally\n");
+			return chosen;
+		}
+		print("pick: UsbDevice not present anywhere\n");
+		return NULL;
 	}
 
 	if (chosen == NULL) {
@@ -6079,6 +6288,9 @@ chiron_pick_usb_device(void)
 		}
 		return NULL;
 	}
+
+	print("pick: chose peripheral core %x mode %x\n",
+	    (uint64_t)picked_core, (uint64_t)picked_mode);
 	/*
 	 * CHIRON_PICK_REPORT_FNIO
 	 *
@@ -6142,6 +6354,81 @@ chiron_event_probe(const char *tag)
  * disconnect or a completed control command.  Without this the controller is
  * mute and "nothing happened" means nothing.
  */
+/*
+ * CHIRON_RING_TAKEOVER
+ *
+ * Dwc3EventBufferSetup in the driver is the only code that writes GEVNTADR, and it is reached
+ * only through Dwc3CoreInit, which is reached only through Dwc3StartController, whose first
+ * statement returns immediately when Dev->Started is already set.  Stopping and restarting did not
+ * produce a ring, so this loader can reach neither the allocation nor the programming.
+ *
+ * Test the register first: if GEVNTADRLO does not hold what is written to it, nothing can be done
+ * from here and the log should say so plainly.  If it does hold, give the controller a ring.
+ *
+ * The ring buffer is static: this loader runs identity-mapped, so its address is its physical
+ * address, and DWC3 needs a physical address in GEVNTADR.
+ */
+static uint8_t chiron_evt_ring[4096] __attribute__((aligned(4096)));
+
+static void
+chiron_ring_takeover(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t adrlo = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC400);
+	uint32_t siz   = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC408);
+	uint32_t probe;
+
+	/* 1. is the register writable from here at all? */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400) = 0xA5A50000u;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	probe = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC400);
+
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400) = adrlo;    /* put it back */
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("ring: adr %x sz %x | write test %x\n", (uint64_t)adrlo, (uint64_t)siz, (uint64_t)probe);
+
+	if (probe != 0xA5A50000u) {
+		print("ring: GEVNTADRLO is not writable from the loader; nothing to do here\n", 0);
+		return;
+	}
+
+	/* 2. it is writable -- hand the controller a ring */
+	{
+		uint64_t phys = (uint64_t)(uintptr_t)chiron_evt_ring;
+
+		for (unsigned i = 0; i < sizeof(chiron_evt_ring); i++) {
+			chiron_evt_ring[i] = 0;
+		}
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400) = (uint32_t)(phys & 0xFFFFFFFFu);
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC404) = (uint32_t)(phys >> 32);
+		/* size in 4-byte words is bits 19:0; INTMASK (bit 31) clear so events interrupt */
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408) = (uint32_t)(sizeof(chiron_evt_ring) >> 2);
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C) = 0;
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		print("ring: programmed by the loader at %x siz %x -> adr %x sz %x\n",
+		    phys, (uint64_t)(sizeof(chiron_evt_ring) >> 2),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408));
+	}
+}
+
+/*
+ * CHIRON_PLL_RESUME
+ *
+ * chiron_port_powerdown() clears PLL_AUTOPGM_CTL1 (0x1C) as part of putting the PHY back into
+ * a powered-down state, and the finish path calls it immediately before late_run() -- which is
+ * what starts the core.  So the PLL was configured for power-down and then asked to run.
+ *
+ * The vendor's power-up sequence (phy-msm-qusb.c:931-944) writes the reset count as its second
+ * step, before releasing the clamp and powering the PLL.  Restore that here so the value does
+ * not depend on which helper ran last.
+ *
+ * 0x05 is PLL_RESET_N_CNT_5 -- the reset count alone, exactly what the driver writes.
+ */
 static void
 chiron_event_arm(void)
 {
@@ -6160,6 +6447,17 @@ chiron_event_arm(void)
 	 * value before as well as after, so the log says what the driver chose -- which is
 	 * the useful number when the question is whether it is listening at all.
 	 */
+	/*
+	 * CHIRON_RING_BEFORE_ARM
+	 *
+	 * Arming DEVTEN is pointless if the controller has nowhere to write an event, and
+	 * the driver has not programmed a ring by this point -- it only does so from
+	 * Dwc3CoreInit, which only runs from Dwc3StartController when Dev->Started is clear.
+	 * So try to give it one here, before anything is armed.  chiron_ring_takeover() tests
+	 * whether the register is writable and says so either way.
+	 */
+	chiron_ring_takeover();
+
 	uint32_t before = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC708);
 	uint32_t want = before | (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3);
 
@@ -6521,7 +6819,7 @@ chiron_usbfn_endpoints(void)
 	static efi_usb_config_info cfg_info;
 	static efi_usb_config_info *cfg_table[2];
 	static efi_usb_device_info dev_info;
-	efi_status se, ss;
+	efi_status se, ss, es;
 
 	/*
 	 * CHIRON_FNIO_FROM_CHOSEN_HANDLE
@@ -6622,6 +6920,66 @@ chiron_usbfn_endpoints(void)
 	 * doc comment without looking at how the driver that owns the sequence orders
 	 * its own calls.  StartController is the last step, not the first.
 	 */
+	/*
+	 * CHIRON_STOP_BEFORE_CONFIGURE
+	 *
+	 * Dwc3ConfigureEnableEndpoints ends with Dwc3RunStop(Dev, TRUE): it enables the
+	 * endpoints, starts EP0, and turns the core on -- and that is the call that leaves
+	 * everything working.
+	 *
+	 * Dwc3StopController calls Dwc3CoreExit(), which masks DEVTEN, disables all endpoints,
+	 * calls Dwc3EventBufferCleanup() (zeroing GEVNTADR and GEVNTSIZ) and clears
+	 * Dev->Started.  Doing that AFTER configure tears down exactly what configure built.
+	 *
+	 * It was placed after, on the theory that Dev->Started was already set and Start
+	 * would return early.  The right place is before: stop clears any stale state, then
+	 * configure builds a fresh one.  Nothing may stop the controller afterwards.
+	 */
+	if (fn->stop_controller != NULL) {
+		efi_status st = fn->stop_controller(fn);
+
+		print("usbfn: stop_controller ", 0);
+		print("%x", (uint64_t)st);
+		print("\n", 0);
+	}
+
+	/*
+	 * CHIRON_DRIVER_ORDER_CORRECTED
+	 *
+	 * The order here used to be configure then start, justified by UsbDeviceDxe's StartEx
+	 * error string sequence.  The driver source says otherwise:
+	 *
+	 *   Dwc3StartController
+	 *       if (Dev->Started) return EFI_SUCCESS;
+	 *       UsbfnPlatformPhyInit ()
+	 *       Dwc3CoreInit (Dev)          -> Dwc3SoftReset() stops the core,
+	 *                                      Dwc3EventBufferSetup() programmes GEVNTADR,
+	 *                                      DCFG and DEVTEN are written.
+	 *                                      It never sets RunStop.
+	 *       Dev->Started = TRUE
+	 *
+	 *   Dwc3ConfigureEnableEndpoints
+	 *       ... enable each endpoint, Dwc3Ep0OutStart ()
+	 *       Dwc3RunStop (Dev, TRUE)     -> this is the ONLY place the core is started
+	 *
+	 * So start must come first -- it is what allocates and programmes the ring -- and
+	 * configure must come last, because it is what turns the core on.  The previous order
+	 * ran CoreInit after configure, and CoreInit's soft reset stopped the core that
+	 * configure had just started.  That is why every snapshot read run 0 hlt 1 with a ring
+	 * of zero: the ring was programmed, then wiped by the next soft reset.
+	 */
+	if (fn->start_controller != NULL) {
+		es = fn->start_controller(fn);
+		print("usbfn: start_controller ", 0);
+		print("%x", (uint64_t)es);
+		print("\n", 0);
+		print("usbfn: ring after start_controller adr ", 0);
+		print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400));
+		print(" sz ", 0);
+		print("%x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408));
+		print("\n", 0);
+	}
+
 	se = fn->configure_enable_endpoints(fn, &dev_info);
 	print("usbfn: ConfigureEnableEndpoints ", 0);
 	print("%x", (uint64_t)se);
@@ -6639,18 +6997,34 @@ chiron_usbfn_endpoints(void)
 	 * produces.  Off by default; usb_extra_start=1 restores the old behaviour so a
 	 * comparison run can show what the extra start costs.
 	 */
-	if (usb_extra_start_mode) {
-		if (fn->start_controller != NULL) {
-			ss = fn->start_controller(fn);
-			print("usbfn: start_controller (extra, requested) ", 0);
-			print("%x", (uint64_t)ss);
-			print("\n", 0);
-		} else {
-			print("usbfn: no start_controller\n");
-		}
-	} else {
-		print("usbfn: start_controller left to start_ex\n");
-	}
+	/*
+	 * CHIRON_START_CONTROLLER_ALLOCATES_THE_RING
+	 *
+	 * EFIUsbfnIo.h on StartController:
+	 *
+	 *     Initialize hardware and internal data structures. The port must not be activated
+	 *     by this function.
+	 *
+	 * 1a5a240 stopped calling it because of the second sentence: start_ex also starts the
+	 * controller, so calling both looked like a double start.  The first sentence is the
+	 * real problem -- StartController initialises the hardware and internal data structures,
+	 * and the event ring is one of those structures.
+	 *
+	 * With it skipped, tonight's run logged:
+	 *
+	 *     evt: armed devten now f ring adr 0 sz 0   <-- NO EVENT RING
+	 *     usb: pre-loop pumped 18 changes 0
+	 *     late: driver left the core HALTED  run 0 hlt 1 lkst 4
+	 *     usb: start failed 8000000000000002
+	 *
+	 * GEVNTADRLO and GEVNTSIZ both zero, so the controller cannot post an event, handle_event
+	 * never has anything to hand back, and the core ends up halted.  That accounts for all of
+	 * it: success at every layer, nothing on the wire.
+	 *
+	 * The double start is about activation.  Call StartController for the ring and let start_ex
+	 * activate the port.  usb_skip_start=1 restores the old behaviour for comparison.
+	 */
+
 	return !EFI_ERROR(se);
 }
 
@@ -6839,19 +7213,7 @@ chiron_dwc3_run(void)
  * DCTL.RunStop does not stick, or DSTS.DEVCTRLHLT stays set, that is worth knowing
  * explicitly rather than inferring from silence.
  */
-/*
- * CHIRON_PLL_RESUME
- *
- * chiron_port_powerdown() clears PLL_AUTOPGM_CTL1 (0x1C) as part of putting the PHY back into
- * a powered-down state, and the finish path calls it immediately before late_run() -- which is
- * what starts the core.  So the PLL was configured for power-down and then asked to run.
- *
- * The vendor's power-up sequence (phy-msm-qusb.c:931-944) writes the reset count as its second
- * step, before releasing the clamp and powering the PLL.  Restore that here so the value does
- * not depend on which helper ran last.
- *
- * 0x05 is PLL_RESET_N_CNT_5 -- the reset count alone, exactly what the driver writes.
- */
+
 static void
 chiron_pll_resume(void)
 {
@@ -6906,8 +7268,41 @@ chiron_dwc3_late_run(void)
 	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) >> 3) & 0x7f),
 	    (uint64_t)devten, (uint64_t)(evcnt & 0xfffc));
 
+	/*
+	 * CHIRON_RUN_IT_OURSELVES
+	 *
+	 * Every layer above reported success and the core is still halted.  From the driver
+	 * source, RunStop is set in exactly one place:
+	 *
+	 *   Dwc3ConfigureEnableEndpoints -> Dwc3Ep0OutStart -> Dwc3RunStop (Dev, TRUE)
+	 *
+	 * and nothing else starts the core.  If that path did not complete, nothing ever
+	 * will -- the driver returns EFI_SUCCESS either way.
+	 *
+	 * The same ownership rule that made this loader program the QUSB2 PHY applies here:
+	 * if no firmware driver performs the write, the loader must.  DCTL.RunStop is one bit
+	 * and the ring is already programmed, so set it and report what the hardware says.
+	 */
 	if (!running) {
-		print("late: not forcing it; the driver owns this controller\n");
+		uint32_t reg = dctl;
+
+		reg |= (1u << 31);              /* DCTL.RunStop */
+		reg &= ~(0x1fu << 24);          /* leave HIRD alone (already set above) */
+		reg |= (0x10u << 24);
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = reg;
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		chiron_udelay(1000);
+
+		{
+			uint32_t d2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+			uint32_t s2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+
+			print("late: set RunStop -> DCTL %x run %x | DSTS %x hlt %x lkst %x conn %x\n",
+			    (uint64_t)d2, (uint64_t)((d2 >> 31) & 1),
+			    (uint64_t)s2, (uint64_t)((s2 >> 22) & 1),
+			    (uint64_t)((s2 >> 18) & 0xf), (uint64_t)(s2 & 7));
+		}
 	}
 }
 
@@ -7047,6 +7442,16 @@ usb_start(void)
 					usb_no_epcfg_mode = 1;
 				}
 				/* "usb_extra_start=1" is 17 characters */
+				/* "usb_skip_start=1" is 16 characters */
+				if (starts_with(c, "usb_skip_start=1") &&
+				    (c[16] == 0 || c[16] == ' ')) {
+					usb_skip_start_mode = 1;
+				}
+				/* "usb_rebind=0" is 11 characters */
+				if (starts_with(c, "usb_rebind=0") &&
+				    (c[11] == 0 || c[11] == ' ')) {
+					usb_rebind_off = 1;
+				}
 				if (starts_with(c, "usb_extra_start=1") &&
 				    (c[17] == 0 || c[17] == ' ')) {
 					usb_extra_start_mode = 1;
@@ -7292,6 +7697,44 @@ usb_start(void)
 	 */
 	chiron_event_arm();
 	chiron_event_probe("armed-before-start_ex");
+
+	/*
+	 * CHIRON_RUN_BEFORE_START_EX
+	 *
+	 * The core has to be running before UsbDeviceDxe's StartEx is asked to present the
+	 * device.  StartEx returned EFI_DEVICE_ERROR (0x8000000000000002) in every run
+	 * tonight because it was handed a halted controller -- and the code that started the
+	 * core, chiron_dwc3_late_run(), ran after it.
+	 *
+	 * From the driver source, RunStop is set in exactly one place,
+	 * Dwc3ConfigureEnableEndpoints -> Dwc3RunStop(Dev, TRUE), and nothing else ever starts
+	 * the core.  If that path did not complete, nothing will.  The ring is programmed
+	 * above, so set the bit here, where it takes effect.
+	 */
+	{
+		const uint64_t dwc = 0xA800000ULL;
+		uint32_t d0 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+		uint32_t s0 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+
+		if (((d0 >> 31) & 1) == 0 || ((s0 >> 22) & 1) != 0) {
+			uint32_t reg = d0 | (1u << 31);
+
+			reg &= ~(0x1fu << 24);
+			reg |= (0x10u << 24);
+			*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = reg;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			chiron_udelay(2000);
+
+			d0 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+			s0 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+			print("pre-start_ex: DCTL %x run %x | DSTS %x hlt %x lkst %x conn %x\n",
+			    (uint64_t)d0, (uint64_t)((d0 >> 31) & 1),
+			    (uint64_t)s0, (uint64_t)((s0 >> 22) & 1),
+			    (uint64_t)((s0 >> 18) & 0xf), (uint64_t)(s0 & 7));
+		} else {
+			print("pre-start_ex: core already running\n", 0);
+		}
+	}
 
 	chiron_dwc3_snap("A-before-start_ex");
 	/*

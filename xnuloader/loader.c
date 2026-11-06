@@ -8662,6 +8662,17 @@ usb_start(void)
 		 */
 		usb_device_protocol *again = chiron_pick_usb_device();
 
+		/*
+		 * CHIRON_PICK_RESULT
+		 *
+		 * UsbDevice is on handle 9c0ed898 while UsbFnIo is on 9bdabf18, and 9c0ed898 carries
+		 * no UsbConfig at all.  The picker selects by UsbConfig, so whatever it returns here
+		 * decides which controller StartEx drives.  Spell it out rather than inferring from
+		 * the absence of the "second pick failed" message.
+		 */
+		print("pick2: returned %x (ours was %x)\n",
+		    (uint64_t)(uintptr_t)again, (uint64_t)(uintptr_t)USB);
+
 		if (again == NULL) {
 			if (EFI_ERROR(BS->locate_protocol(&usb_guid, NULL, (void **)&USB))) {
 				print("usb: device protocol not found\n");
@@ -8874,6 +8885,59 @@ usb_start(void)
 			}
 		} else {
 			print("dev: no UsbDevice handles at all\n", 0);
+		}
+	}
+	/*
+	 * CHIRON_WHAT_IS_9C0ED898
+	 *
+	 * UsbDevice sits on a different handle than the controller HK6 built.  The question that
+	 * decides everything is what that handle describes: if its UsbConfig says host (mode 1),
+	 * then StartEx is being invoked on the host controller while this loader configured the
+	 * peripheral one, and every failure tonight follows from that.
+	 *
+	 * Print the config record behind both handles, side by side.
+	 */
+	{
+		static const efi_guid cfg_g = QCOM_USB_CONFIG_GUID;
+		static const efi_guid dev_g2 = QCOM_USB_DEVICE_GUID;
+		efi_handle *hs2 = NULL;
+		uint64_t n2 = 0;
+
+		/* our handle first */
+		if (usb_dev_handle != NULL) {
+			efi_qcom_usb_config *c = NULL;
+
+			if (!EFI_ERROR(BS->handle_protocol(usb_dev_handle, &cfg_g, (void **)&c)) &&
+			    c != NULL) {
+				print("cfg[ours %x]: rev %x core %x mode %x\n",
+				    (uint64_t)(uintptr_t)usb_dev_handle, (uint64_t)c->revision,
+				    (uint64_t)c->core_num, (uint64_t)c->mode_type);
+			} else {
+				print("cfg[ours %x]: no UsbConfig on this handle\n",
+				    (uint64_t)(uintptr_t)usb_dev_handle);
+			}
+		}
+
+		if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &dev_g2, NULL, &n2, &hs2))) {
+			for (uint64_t i = 0; i < n2; i++) {
+				efi_qcom_usb_config *c = NULL;
+
+				if (hs2[i] == usb_dev_handle) {
+					continue;
+				}
+				if (!EFI_ERROR(BS->handle_protocol(hs2[i], &cfg_g, (void **)&c)) &&
+				    c != NULL) {
+					print("cfg[dev %x]: rev %x core %x mode %x\n",
+					    (uint64_t)(uintptr_t)hs2[i], (uint64_t)c->revision,
+					    (uint64_t)c->core_num, (uint64_t)c->mode_type);
+				} else {
+					print("cfg[dev %x]: no UsbConfig\n",
+					    (uint64_t)(uintptr_t)hs2[i]);
+				}
+			}
+			if (hs2 != NULL) {
+				BS->free_pool(hs2);
+			}
 		}
 	}
 	chiron_platforminfo_view();

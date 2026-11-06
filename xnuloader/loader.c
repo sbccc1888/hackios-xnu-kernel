@@ -6686,7 +6686,30 @@ chiron_ring_takeover(void)
 		 * as 1024 bytes.  Event count is GEVNTSIZ / 4, so the controller believed it had
 		 * 256 slots when this loader had allocated 1024.
 		 */
-		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408) = (uint32_t)sizeof(chiron_evt_ring);
+		/*
+		 * CHIRON_GEVNTSIZ_AS_THE_VENDOR_WRITES_IT
+		 *
+		 * Matched against the vendor reference (Dwc3Core.c, Dwc3EventBufferSetup):
+		 *
+		 *     MmioWrite32 (Dev->Base + DWC3_GEVNTSIZ(0),
+		 *                  DWC3_GEVNTSIZ_INTMASK | DWC3_GEVNTSIZ_SIZE(DWC3_EVENT_BUFFER_SIZE));
+		 *
+		 *     DWC3_GEVNTSIZ_INTMASK     BIT31
+		 *     DWC3_GEVNTSIZ_SIZE(n)     ((n) & 0xFFFF)
+		 *     DWC3_EVENT_BUFFER_SIZE    SIZE_4KB
+		 *
+		 * So the field is a byte count with no shift, and bit 31 must be set.  This wrote
+		 * sizeof(ring) >> 2 with no INTMASK, which both misdescribed the size and left the
+		 * mask bit clear -- two differences from what the driver the firmware ships with
+		 * does.
+		 */
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408) =
+		    (1u << 31) | ((uint32_t)sizeof(chiron_evt_ring) & 0xffffu);
+		/*
+		 * DWC3_GEVNTCOUNT_MASK is 0xFFFC: only the low 14 bits are implemented, and
+		 * writing them is how an event is retired.  Writing a bare 0 happens to be the
+		 * same value, but the mask is what the vendor uses and it documents the width.
+		 */
 		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C) = 0;
 		__asm__ volatile ("dsb sy" ::: "memory");
 
@@ -7197,12 +7220,14 @@ chiron_ring_dump(const char *when)
 {
 	const uint64_t dwc = 0xA800000ULL;
 	uint32_t adr = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC400);
-	uint32_t siz = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC408);
+	uint32_t siz_raw = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC408);
+	uint32_t siz = siz_raw & 0xffffu;      /* bit 31 is INTMASK, not size */
 	uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C);
 
 	print("ringdump ", 0);
 	print((char *)when, 0);
-	print(": adr %x siz %x count %x\n", (uint64_t)adr, (uint64_t)siz, (uint64_t)cnt);
+	print(": adr %x siz %x (raw %x) count %x\n", (uint64_t)adr, (uint64_t)siz,
+	    (uint64_t)siz_raw, (uint64_t)cnt);
 
 	if (adr == 0 || siz == 0 || siz > 0x1000) {
 		return;
@@ -8835,7 +8860,7 @@ usb_start(void)
 	 */
 	{
 		uint32_t radr = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400);
-		uint32_t rsiz = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408);
+		uint32_t rsiz = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408) & 0xffffu;
 
 		if (radr != 0 && rsiz != 0 && rsiz <= 0x10000) {
 			uintptr_t q = (uintptr_t)radr;

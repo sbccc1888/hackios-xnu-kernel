@@ -8216,6 +8216,46 @@ usbfn_mps_hs(efi_usbfn_io *self, uint32_t type, uint32_t speed, uint32_t *size)
 	return 0;
 }
 
+/*
+ * CHIRON_FNIO_DUMP
+ *
+ * The driver's own protocol table is the only place its entry points can be read from, since the
+ * image exports nothing and the table is built at runtime.  Printing every slot turns
+ * "EventHandler answers 0x2" into "EventHandler is this address in this module", which is what
+ * the disassembly needs to know.
+ */
+static void
+chiron_fnio_dump(const char *when, efi_usbfn_io *fn)
+{
+	if (fn == NULL) {
+		return;
+	}
+	print("fnio[", 0);
+	print((char *)when, 0);
+	print("]: rev %x detect %x cfg %x mps %x devinfo %x vidpid %x abort %x\n",
+	    (uint64_t)fn->revision, (uint64_t)(uintptr_t)fn->detect_port,
+	    (uint64_t)(uintptr_t)fn->configure_enable_endpoints,
+	    (uint64_t)(uintptr_t)fn->get_endpoint_max_packet_size,
+	    (uint64_t)(uintptr_t)fn->get_device_info,
+	    (uint64_t)(uintptr_t)fn->get_vendor_id_product_id,
+	    (uint64_t)(uintptr_t)fn->abort_transfer);
+	print("fnio[", 0);
+	print((char *)when, 0);
+	print("]: stall %x setstall %x evt %x xfer %x maxsz %x alloc %x free %x\n",
+	    (uint64_t)(uintptr_t)fn->get_endpoint_stall_state,
+	    (uint64_t)(uintptr_t)fn->set_endpoint_stall_state,
+	    (uint64_t)(uintptr_t)fn->event_handler,
+	    (uint64_t)(uintptr_t)fn->transfer,
+	    (uint64_t)(uintptr_t)fn->get_max_transfer_size,
+	    (uint64_t)(uintptr_t)fn->allocate_transfer_buffer,
+	    (uint64_t)(uintptr_t)fn->free_transfer_buffer);
+	print("fnio[", 0);
+	print((char *)when, 0);
+	print("]: startc %x stopc %x\n",
+	    (uint64_t)(uintptr_t)fn->start_controller,
+	    (uint64_t)(uintptr_t)fn->stop_controller);
+}
+
 static efi_status EFIAPI
 usbfn_detect_sdp(efi_usbfn_io *self, uint32_t *port_type)
 {
@@ -8843,6 +8883,15 @@ usb_start(void)
 	}
 	if (usb_stop_before_start_ex) {
 		chiron_stop_before_start_ex();
+	}
+
+	if (usb_dev_handle != NULL) {
+		static const efi_guid fg0 = QCOM_USBFN_IO_GUID;
+		efi_usbfn_io *fn0 = NULL;
+
+		if (!EFI_ERROR(BS->handle_protocol(usb_dev_handle, &fg0, (void **)&fn0))) {
+			chiron_fnio_dump("vendor", fn0);
+		}
 	}
 
 	chiron_usbfn_handles();

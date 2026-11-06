@@ -4387,6 +4387,72 @@ usb_serial_fill(uint8_t *out, uint32_t cap, const char *tag)
 	}
 
 	/*
+	 * CHIRON_SERIAL_MUST_BE_A_SERIAL
+	 *
+	 * A USB serial number is not a free-text field.  It keys the device instance on the host:
+	 * Windows creates a different device node for every distinct serial string, so a device
+	 * whose serial changes looks like a brand new device each boot.
+	 *
+	 * This loader has a built-in default -- "xnuloader" -- and Windows already has a node for
+	 * it:
+	 *
+	 *     USB\VID_18D1&PID_D00D\xnuloader   WinUSB   (phantom, not currently attached)
+	 *
+	 * That node is proof this device has enumerated successfully before.  But this board's
+	 * SMBIOS reports the literal string "Not Specified" for the serial, which was being
+	 * accepted, so recent runs announce that instead:
+	 *
+	 *     serial: from SMBIOS, Not Specified len d
+	 *
+	 * Reject anything that is not plausibly an identifier and fall back to the default, so the
+	 * device keeps a stable identity across boots.  Placeholders and strings with spaces are
+	 * not serial numbers.
+	 */
+	{
+		uint32_t slen = 0;
+		int usable = 1;
+
+		while (serial[slen] != 0 && slen < 64) {
+			uint8_t ch = (uint8_t)serial[slen];
+
+			if (ch < 0x20 || ch > 0x7e || ch == ' ') {
+				usable = 0;
+				break;
+			}
+			slen++;
+		}
+
+		if (slen < 4) {
+			usable = 0;
+		}
+
+		/* common firmware placeholders, compared case-insensitively */
+		if (usable) {
+			static const char *const bad[] = {
+				"Not Specified", "NotSpecified", "Default string",
+				"To be filled by O.E.M.", "None", "Unknown", "System Serial Number",
+			};
+
+			for (unsigned k = 0; k < sizeof(bad) / sizeof(bad[0]); k++) {
+				uint32_t bl = 0;
+
+				while (bad[k][bl] != 0) {
+					bl++;
+				}
+				if (serial[bl] == 0 && starts_with(serial, bad[k])) {
+					usable = 0;
+					break;
+				}
+			}
+		}
+
+		if (!usable) {
+			print("serial: SMBIOS value is not a serial number, keeping the default\n", 0);
+			return 0;
+		}
+	}
+
+	/*
 	 * ASCII -> UTF-16LE, stopping at anything not printable.
 	 *
 	 * The character limit comes from cap, not from a literal: a USB string descriptor is

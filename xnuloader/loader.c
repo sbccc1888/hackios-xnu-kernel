@@ -8125,6 +8125,28 @@ chiron_power_up_phy(void)
  * actually do.  Read the speed the controller last negotiated from DSTS and program DCFG to the
  * same value instead of assuming high speed.
  */
+/*
+ * CHIRON_STEP
+ *
+ * The entry snapshot proved CONNECTSTAT is 1 before this loader runs and 0 after, so one of the
+ * USB steps below is disconnecting a working port.  Snapshot DSTS after each one and the culprit
+ * is whichever step flips conn from 1 to 0.
+ */
+static void
+chiron_step(const char *what)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	uint32_t dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	uint32_t dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+
+	print("STEP ", 0);
+	print((char *)what, 0);
+	print(": conn %x lkst %x spd %x | DCTL %x DCFG %x\\n",
+	    (uint64_t)(dsts & 1u), (uint64_t)((dsts >> 18) & 0xfu),
+	    (uint64_t)(dsts & 7u), (uint64_t)dctl, (uint64_t)dcfg);
+}
+
 static void
 chiron_match_speed(void)
 {
@@ -8243,6 +8265,29 @@ chiron_vbus_override(void)
 	const uint64_t ctrl = 0xA800000ULL + 0xF8810ULL;      /* HS_PHY_CTRL_REG */
 	uint32_t before = *(volatile uint32_t *)(uintptr_t)ctrl;
 	uint32_t value = before | (1u << 20) | (1u << 28);
+
+	/*
+	 * CHIRON_VBUS_ONLY_IF_DOWN
+	 *
+	 * Stepping DSTS through the bring-up showed this call is what breaks the port:
+	 *
+	 *     STEP after-resume:  conn 1 lkst 4 spd 1
+	 *     vbus: hs_phy_ctrl 10000000 -> 10100000
+	 *     STEP after-vbus:    conn 0 lkst 0 spd 0
+	 *
+	 * The entry snapshot had already shown the register reading 0x10000000 -- BIT28 set, BIT20
+	 * clear -- with CONNECTSTAT 1 and a device address still assigned.  So that is what a
+	 * working session looks like, and setting BIT20 (UTMI_OTG_VBUS_VALID) is what takes the
+	 * port down.
+	 *
+	 * The override exists to convince the controller that VBUS is present when nothing else
+	 * tells it.  If CONNECTSTAT is already 1, something is telling it, and overriding can only
+	 * contradict the hardware.  So only override when the controller reports no connection.
+	 */
+	if ((*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC70C) & 1u) != 0) {
+		print("vbus: skipped, conn already up (hs_phy_ctrl %x)\n", (uint64_t)before);
+		return;
+	}
 
 	*(volatile uint32_t *)(uintptr_t)ctrl = value;
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -9523,13 +9568,21 @@ usb_start(void)
 	 * Move the sequence up so the device is presenting onto a live link.
 	 */
 	if (!usb_pure_mode) {
+		chiron_step("before-any");
 		chiron_dwc3_highspeed();
+		chiron_step("after-highspeed");
 		chiron_dwc3_device_mode();
+		chiron_step("after-devmode");
 		chiron_qusb2_resume();
+		chiron_step("after-resume");
 		chiron_vbus_override();
+		chiron_step("after-vbus");
 		chiron_qusb2_reassert();
+		chiron_step("after-reassert");
 		chiron_port_powerdown();
+		chiron_step("after-powerdown");
 		chiron_pll_resume();
+		chiron_step("after-pllresume");
 	}
 
 	{
@@ -9756,9 +9809,13 @@ usb_start(void)
 	__asm__ volatile ("dsb sy" ::: "memory");
 	chiron_linestate("after-clear");
 	chiron_update_ref_clk();
+	chiron_step("after-refclk");
 	chiron_enable_termination();
+	chiron_step("after-term");
 	chiron_match_speed();
+	chiron_step("after-speed");
 	chiron_clear_disconnect();
+	chiron_step("after-cleardisc");
 	chiron_pullup_audit("after-disc");
 
 	chiron_ring_dump("pre-start_ex");

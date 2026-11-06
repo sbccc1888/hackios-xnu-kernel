@@ -5836,12 +5836,24 @@ chiron_qusb2_init(void)
 
 	print("qusb2: PLL %x ready %x\n", (uint64_t)ready, (uint64_t)(ready & 1));
 	{
-		uint32_t r210w = *(volatile uint32_t *)(uintptr_t)(phy + 0x210);
+		/*
+		 * CHIRON_210_IS_A_BYTE
+		 *
+		 * This used to read 0x210 as a 32-bit word as well as a byte and print both:
+		 *
+		 *     qusb2: r210 23232323 byte 23
+		 *
+		 * 0x23232323 is the byte replicated across all four lanes, which is this PHY's
+		 * signature for a byte-wide register -- the same thing the write test showed at 0x90.
+		 * Printing the replicated word alongside the byte only invited the two readings to be
+		 * compared as if they disagreed.  Byte width only.
+		 */
 		uint8_t r210b = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
 
-		print("qusb2: r210 %x byte %x (pwrdn %x clamp %x)\n",
-		    (uint64_t)r210w, (uint64_t)r210b,
-		    (uint64_t)(r210b & 1), (uint64_t)((r210b >> 1) & 1));
+		print("qusb2: r210 %x (pwrdn %x clamp %x pwrgood %x)\n",
+		    (uint64_t)r210b,
+		    (uint64_t)(r210b & 1), (uint64_t)((r210b >> 1) & 1),
+		    (uint64_t)((r210b >> 5) & 1));
 	}
 	print("qusb2: r00 %x r04 %x r2c %x r18c %x\n",
 	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x000),

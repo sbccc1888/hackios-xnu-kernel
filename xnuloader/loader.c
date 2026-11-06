@@ -12116,6 +12116,27 @@ efi_main(efi_handle image, efi_system_table *st)
 			flush_log();
 			/* CHIRON_USB_HANDLE_BOUNDED: a session with no host must end by itself */
 			usb_session_begin(usb_idle_seconds > 0 ? (uint64_t)usb_idle_seconds : 300);
+
+			/*
+			 * CHIRON_ANNOUNCE_THE_LOOP
+			 *
+			 * usb_command_loop() never returns, so everything that happens from here on is
+			 * invisible to the log.  A run that reaches this point and then hangs is
+			 * indistinguishable, from the partition, from a run that died earlier -- both just
+			 * stop writing.
+			 *
+			 * Say so, and flush it, before the loop starts.  Then "reached the loop" is a line
+			 * in the log rather than an inference from silence.
+			 */
+			print("usb: entering command loop\n", 0);
+			print("usb: state at loop entry: DCFG %x DSTS %x DCTL %x devten %x evtcnt %x\n",
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC700),
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC70C),
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC704),
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC708),
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C));
+			flush_log();
+
 			usb_command_loop();
 		}
 		print("\n== USB session unavailable; resetting ==\n");

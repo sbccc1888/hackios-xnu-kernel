@@ -4162,6 +4162,7 @@ static int usb_no_epcfg_mode;
 /* usb_extra_start=1: also call UsbFnIo::StartController ourselves. */
 static int usb_probe_steps_mode;          /* usb_probe_steps=1: run StartEx's steps one by one */
 static int usb_state_force;              /* usb_state_force=1: force UsbConfig state to 0xf (proven harmful) */
+static int usb_no_recover;                /* usb_no_recover=1: return on start_ex failure, no endpoint retry */
 static int usb_noop_startstop;            /* usb_noop_startstop=1: report success for stop/start, let StartEx continue */
 static int usb_start_first = 1;          /* usb_start_first=0: do not stop/start here, let start_ex do it */
 static int usb_no_ring;                  /* usb_no_ring=1: do not program the event ring, leave it to the driver */
@@ -8027,6 +8028,11 @@ usb_start(void)
 				    (c[17] == 0 || c[17] == ' ')) {
 					usb_probe_steps_mode = 1;
 				}
+				/* "usb_no_recover=1" is 16 characters */
+				if (starts_with(c, "usb_no_recover=1") &&
+				    (c[16] == 0 || c[16] == ' ')) {
+					usb_no_recover = 1;
+				}
 				/* "usb_noop_startstop=1" is 20 characters */
 				if (starts_with(c, "usb_noop_startstop=1") &&
 				    (c[20] == 0 || c[20] == ' ')) {
@@ -8832,8 +8838,91 @@ usb_start(void)
 		flush_log();
 	}
 	if (EFI_ERROR(s)) {
-		print("usb: start failed %x\n", s);
-		return 0;
+		/*
+		 * CHIRON_CONFIG_ENDPOINTS_AFTER_START_EX
+		 *
+		 * Everything is now measured rather than assumed.  With StopController and
+		 * StartController shimmed to success, StartEx still fails, and the full record of
+		 * what it touched is:
+		 *
+		 *     StopController 0, StartController 0, EventHandler 1 call
+		 *     DetectPort / AllocateTransferBuffer / GetDeviceInfo / GetVendorIdProductId /
+		 *     GetEndpointStallState / ConfigureEnableEndpoints   -- all untouched
+		 *
+		 * So StartEx stops between StartController and ConfigureEnableEndpoints, inside its
+		 * own state machine, with six events still queued.  It is waiting for the control
+		 * state machine to be activated, and that cannot happen until endpoints exist,
+		 * because there is nothing for a SETUP packet to arrive on.
+		 *
+		 * ConfigureEnableEndpoints is the call that creates them, and StartEx never makes
+		 * it.  This loader can: it already builds the descriptor chain for it.  Do it here,
+		 * after StartEx has given up, and then keep pumping -- an endpoint that exists and a
+		 * driver being polled is the only combination that can answer a host.
+		 *
+		 * usb_no_recover=1 keeps the old immediate return for comparison.
+		 */
+		if (usb_no_recover) {
+			print("usb: start failed %x\n", s);
+			return 0;
+		}
+
+		print("usb: start_ex failed %x; configuring endpoints ourselves\n", (uint64_t)s);
+
+		if (chiron_usbfn_endpoints()) {
+			print("usb: endpoints configured after start_ex\n", 0);
+		} else {
+			print("usb: endpoint configuration after start_ex failed\n", 0);
+		}
+
+		/*
+		 * Endpoints exist now, so re-run the event pump.  It ran before this point too,
+		 * but against a controller with no endpoints, which is why it produced one event
+		 * and gave up.
+		 */
+		{
+			uint64_t freq = READ_SYSREG(CNTFRQ_EL0), began = READ_SYSREG(CNTVCT_EL0);
+			unsigned pumped = 0, changes = 0;
+			uint32_t last_msg = 0;
+
+			while (pumped < 400000) {
+				uint32_t m = UsbDeviceEventNoEvent;
+				uint64_t sz = 0;
+				usb_device_event_data d;
+				uint64_t now = READ_SYSREG(CNTVCT_EL0);
+
+				if (now - began > freq / 2) {          /* 500 ms */
+					break;
+				}
+
+				memset(&d, 0, sizeof(d));
+				USB->handle_event(&m, &sz, &d);
+				pumped++;
+
+				if (m != UsbDeviceEventNoEvent) {
+					last_msg = m;
+				}
+				if (m == UsbDeviceEventDeviceStateChange) {
+					changes++;
+					usb_connected = (d.device_state == UsbDeviceStateConnected);
+				}
+				if ((pumped % 50000) == 0) {
+					wdt_pet();
+					flush_log();
+				}
+			}
+			print("usb: post-config pumped %d changes %d last %x connected %d\n",
+			    (uint64_t)pumped, (uint64_t)changes, (uint64_t)last_msg,
+			    (uint64_t)(usb_connected != 0));
+			flush_log();
+		}
+
+		chiron_dwc3_snap("C-after-recover");
+
+		if (!usb_connected) {
+			print("usb: still not connected after endpoint recovery\n", 0);
+			return 0;
+		}
+		print("usb: connected after endpoint recovery\n", 0);
 	}
 	/*
 	 * CHIRON_USB_PRESENTED

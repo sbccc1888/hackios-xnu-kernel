@@ -6839,7 +6839,20 @@ chiron_utmi_sweep(void)
 	for (unsigned i = 0; i < sizeof(values) / sizeof(values[0]); i++) {
 		uint32_t dctl, dsts;
 
-		*(volatile uint8_t *)(uintptr_t)(phy + 0xC4) = 0x80;   /* UTMI mode */
+		/*
+		 * The 0xC4 = 0x80 write that used to be here is gone.  Measured:
+		 *
+		 *     bwt: 0xC4 was 0 wrote 80 read 0 (IGNORED)
+		 *
+		 * so the register does not accept it.  And the driver for this PHY does not write
+		 * it at all -- phy-msm-qusb-v2.c has no reference to 0xC4 -- while the v1 driver
+		 * does, as a 32-bit writel (phy-msm-qusb.c:931, 968).  This was v1 code carried
+		 * into a v2 port, where the write is both wrong-width and meaningless.
+		 *
+		 * The byte-write path itself is fine; the same test wrote 0x5a to TUNE5 and read
+		 * 0x5a back, so 0x90 takes byte writes.  0xC4 is simply read-only here.
+		 */
+		;
 		*(volatile uint8_t *)(uintptr_t)(phy + 0xC0) = values[i];
 		__asm__ volatile ("dsb sy" ::: "memory");
 
@@ -7905,6 +7918,68 @@ chiron_fw_vbus(efi_qcom_usb_config *cfg)
  *
  * chiron's QUSB2 reference is 19.2 MHz, so the 19200000 branch applies.
  */
+/*
+ * CHIRON_BYTE_WRITE_TEST
+ *
+ * The question this project kept skipping: do byte-wide writes to the QUSB2 PHY take effect at
+ * all?  The evidence that they might not is that UTMI_CTRL2 (0xC4) is written 0x80 at init and
+ * every later read reports 0.
+ *
+ * Test it properly: write a known value to a scratch-capable register, read it straight back, then
+ * restore what was there.  TUNE5 (0x90) is the register the earlier probe used and it behaved like
+ * memory, so it is the right subject.
+ *
+ * Two access widths are tried, because a byte write landing in a 32-bit-only register and a 32-bit
+ * write hitting replicated bytes look identical from the outside:
+ *
+ *   byte: write 0x5a, read back
+ *   word: write 0x5a5a5a5a, read back
+ *
+ * If the byte write does not read back, every 0xC0/0xC4 write in this file is suspect and the fix
+ * is a width change, not a sequencing change.
+ */
+static void
+chiron_byte_write_test(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+	uint8_t b0 = *(volatile uint8_t *)(uintptr_t)(phy + 0x90);
+	uint8_t rb;
+	uint32_t w0 = *(volatile uint32_t *)(uintptr_t)(phy + 0x90);
+	uint32_t rw;
+
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x90) = 0x5a;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	rb = *(volatile uint8_t *)(uintptr_t)(phy + 0x90);
+
+	*(volatile uint32_t *)(uintptr_t)(phy + 0x90) = 0x5a5a5a5au;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	rw = *(volatile uint32_t *)(uintptr_t)(phy + 0x90);
+
+	/* put it back */
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x90) = b0;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("bwt: 0x90 byte was %x wrote 5a read %x (%s) | word was %x wrote 5a5a5a5a read %x\n",
+	    (uint64_t)b0, (uint64_t)rb, (rb == 0x5a) ? "TAKES" : "IGNORED",
+	    (uint64_t)w0, (uint64_t)rw);
+
+	/*
+	 * And the register that started this: write UTMI_CTRL2 bit 7, read it back, and say plainly
+	 * whether the write survived.
+	 */
+	{
+		uint8_t c4 = *(volatile uint8_t *)(uintptr_t)(phy + 0xC4);
+		uint8_t c4w = (uint8_t)(c4 | 0x80);
+
+		*(volatile uint8_t *)(uintptr_t)(phy + 0xC4) = c4w;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		print("bwt: 0xC4 was %x wrote %x read %x (%s)\n",
+		    (uint64_t)c4, (uint64_t)c4w,
+		    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xC4),
+		    (*(volatile uint8_t *)(uintptr_t)(phy + 0xC4) == c4w) ? "TAKES" : "IGNORED");
+	}
+}
+
 static void
 chiron_update_ref_clk(void)
 {
@@ -8684,6 +8759,37 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 		 * directly removes the struct from the question: whatever is at each offset is what
 		 * the driver will call.
 		 */
+		/*
+		 * CHIRON_IS_9BFAB924_CODE
+		 *
+		 * Slot +0x50 holds 9bfab924 and slot +0xb0 holds 9bfab937.  Two functions 19 bytes
+		 * apart is not plausible, and the code pointers before it run 9bfa6ac8, 9bfa6b9c,
+		 * 9bfa6bf8, 9bfa6c5c -- sequential -- while +0x50 jumps far past them.  That is the
+		 * signature of data, not a function table.
+		 *
+		 * Calling it faults with esr=0x02000000 far=0, which is what an attempt to execute
+		 * non-code produces here.  Dump the bytes so the question is settled instead of
+		 * argued.
+		 */
+		{
+			const uint8_t *m = (const uint8_t *)(uintptr_t)(0x9bfab924ULL & ~0xfULL);
+
+			print("mem9bfab: ", 0);
+			for (unsigned k = 0; k < 32; k++) {
+				print("%x ", (uint64_t)m[k]);
+			}
+			print("\n", 0);
+			print("mem9bfa7: c0  ", 0);
+			{
+				const uint8_t *n = (const uint8_t *)(uintptr_t)0x9bfa65ccULL;
+
+				for (unsigned k = 0; k < 16; k++) {
+					print("%x ", (uint64_t)n[k]);
+				}
+			}
+			print("\n", 0);
+		}
+
 		for (unsigned q = 0; q < 24; q++) {
 			print("vraw +%x: %x\n", (uint64_t)(q * 8),
 			    *(volatile uint64_t *)(uintptr_t)((uintptr_t)orig + q * 8));
@@ -9483,6 +9589,7 @@ usb_start(void)
 	 * sequences correctly (assert POWR_DOWN, write the init seq, write TUNE1, clear
 	 * POWR_DOWN), matching qusb_phy_init() line for line.
 	 */
+	chiron_byte_write_test();
 	chiron_update_ref_clk();
 	chiron_enable_termination();
 	chiron_clear_disconnect();

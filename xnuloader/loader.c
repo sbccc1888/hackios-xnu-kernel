@@ -4162,6 +4162,8 @@ static int usb_no_epcfg_mode;
 /* usb_extra_start=1: also call UsbFnIo::StartController ourselves. */
 static int usb_probe_steps_mode;          /* usb_probe_steps=1: run StartEx's steps one by one */
 static int usb_state_force;              /* usb_state_force=1: force UsbConfig state to 0xf (proven harmful) */
+static int usb_prestart_ring;              /* usb_prestart_ring=1: let the driver allocate the ring, then hand over */
+static int usb_no_qualifier;              /* usb_no_qualifier=1: omit the device qualifier */
 static int usb_no_recover;                /* usb_no_recover=1: return on start_ex failure, no endpoint retry */
 static int usb_noop_startstop;            /* usb_noop_startstop=1: report success for stop/start, let StartEx continue */
 static int usb_start_first = 1;          /* usb_start_first=0: do not stop/start here, let start_ex do it */
@@ -7053,6 +7055,146 @@ chiron_port_powerdown(void)
  *
  * Until HK6 existed there was no UsbFnIo here, so this path had never been tried.
  */
+/*
+ * CHIRON_CONFIGURE_ONLY
+ *
+ * The full chiron_usbfn_endpoints() does stop, start, then configure.  That order is what
+ * faults: StartController allocates the ring and returns 0, and the ConfigureEnableEndpoints
+ * that follows dies inside the firmware at elr=0x9bfab924 far=0 (EC 0, "unknown reason"),
+ * twelve bytes away from the elr=0x9bfa6600 far=0x50 fault already recorded.
+ *
+ * So the two jobs are separated.  This one only creates the endpoints, which is the step
+ * StartEx never reaches and which has to exist before a host's SETUP packet can arrive.
+ * StartController is left to StartEx, where it works -- that is what allocated a102f000.
+ */
+static int
+chiron_usbfn_configure_only(void)
+{
+	static const efi_guid usbfn_guid = QCOM_USBFN_IO_GUID;
+	efi_usbfn_io *fn = NULL;
+	static efi_usb_device_descriptor dev_desc;
+	static efi_usb_config_descriptor cfg_desc;
+	static efi_usb_interface_descriptor if_desc;
+	static efi_usb_endpoint_descriptor ep_in, ep_out;
+	static efi_usb_endpoint_descriptor *ep_table[3];
+	static efi_usb_interface_info if_info;
+	static efi_usb_interface_info *if_table[2];
+	static efi_usb_config_info cfg_info;
+	static efi_usb_config_info *cfg_table[2];
+	static efi_usb_device_info dev_info;
+	efi_status ce;
+
+	if (usb_dev_handle != NULL &&
+	    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &usbfn_guid, (void **)&fn)) &&
+	    fn != NULL) {
+		/* chosen handle first, as everywhere else */
+	} else if (!EFI_ERROR(BS->locate_protocol(&usbfn_guid, NULL, (void **)&fn)) &&
+	           fn != NULL) {
+	} else {
+		print("cfgonly: no UsbFnIo\n", 0);
+		return 0;
+	}
+
+	memcpy(&dev_desc, usb_dev_desc, sizeof(dev_desc));
+
+	cfg_desc.length = 9;
+	cfg_desc.descriptor_type = 2;
+	cfg_desc.total_length = 9 + 9 + 7 + 7;
+	cfg_desc.num_interfaces = 1;
+	cfg_desc.configuration_value = 1;
+	cfg_desc.attributes = 0x80;
+	cfg_desc.max_power = 0x50;
+
+	if_desc.length = 9;
+	if_desc.descriptor_type = 4;
+	if_desc.num_endpoints = 2;
+	if_desc.interface_class = 0xff;
+	if_desc.interface_sub_class = 0x42;
+	if_desc.interface_protocol = 0x03;
+
+	ep_in.length = 7;
+	ep_in.descriptor_type = 5;
+	ep_in.endpoint_address = USB_EP_IN;
+	ep_in.attributes = 2;
+	ep_in.max_packet_size = 512;
+
+	ep_out = ep_in;
+	ep_out.endpoint_address = USB_EP_OUT;
+
+	ep_table[0] = &ep_in;
+	ep_table[1] = &ep_out;
+	ep_table[2] = NULL;
+
+	if_info.interface_descriptor = &if_desc;
+	if_info.endpoint_descriptor_table = ep_table;
+	if_table[0] = &if_info;
+	if_table[1] = NULL;
+
+	cfg_info.config_descriptor = &cfg_desc;
+	cfg_info.interface_info_table = if_table;
+	cfg_table[0] = &cfg_info;
+	cfg_table[1] = NULL;
+
+	dev_info.device_descriptor = &dev_desc;
+	dev_info.config_info_table = cfg_table;
+
+	ce = fn->configure_enable_endpoints(fn, &dev_info);
+	print("cfgonly: ConfigureEnableEndpoints %x\n", (uint64_t)ce);
+	return !EFI_ERROR(ce);
+}
+
+/*
+ * CHIRON_PRESTART_DRIVER_RING
+ *
+ * Every measurement this session points at one place.  StartController inside StartEx
+ * answers EFI_OUT_OF_RESOURCES (7), and it is the function that allocates and programs the
+ * event ring through DwcConfigureEventBuffer.  This loader has already occupied that ring
+ * with chiron_ring_takeover(), writing GEVNTADR to a static buffer, before StartEx runs.
+ *
+ * The one run that showed the driver allocating a ring itself was the recovery path, where
+ * chiron_usbfn_endpoints() called start_controller and the ring came out as a102f000 with
+ * size 0x400 -- allocated by the driver, not written by us.
+ *
+ * So: release the ring, let the driver take it once, stop the controller again, and hand
+ * the result to StartEx as a plain restart.  usb_prestart_ring=1 selects this.
+ */
+static void
+chiron_prestart_driver_ring(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	static const efi_guid usbfn_guid = QCOM_USBFN_IO_GUID;
+	efi_usbfn_io *fn = NULL;
+	efi_status ss, st;
+
+	/* give the ring back: the driver's allocator is what should own it */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408) = 0;
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC404) = 0;
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400) = 0;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("prestart: ring released -> adr %x sz %x\n",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408));
+
+	if (usb_dev_handle == NULL ||
+	    EFI_ERROR(BS->handle_protocol(usb_dev_handle, &usbfn_guid, (void **)&fn)) ||
+	    fn == NULL || fn->start_controller == NULL || fn->stop_controller == NULL) {
+		print("prestart: no UsbFnIo to start with\n", 0);
+		return;
+	}
+
+	st = fn->start_controller(fn);
+	print("prestart: start_controller %x -> ring adr %x sz %x\n", (uint64_t)st,
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408));
+
+	ss = fn->stop_controller(fn);
+	print("prestart: stop_controller %x -> ring adr %x sz %x\n", (uint64_t)ss,
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408));
+
+	/* the driver may have freed the ring on stop; say so rather than assume */
+}
 static int
 chiron_usbfn_endpoints(void)
 {
@@ -7707,12 +7849,35 @@ shim_stop_ctrl(efi_usbfn_io *self)
 	return rec_stop_ctrl;
 }
 
+static uint32_t rec_evt_type, rec_evt_size_in, rec_evt_size_out, rec_evt_ret;
+static uint8_t rec_evt_data0, rec_evt_data1;
+
 static efi_status EFIAPI
 shim_evt_handler(efi_usbfn_io *self, void *evt, uint64_t *size, void *data)
 {
+	efi_status r;
+
 	rec_evt_pending_last = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C);
 	rec_evt_count++;
-	return orig_evt_handler(self, evt, size, data);
+
+	/*
+	 * Record what the driver was handed, not just that it was called.  StartEx invoked this
+	 * exactly once and then stopped; whether that is because the event was the wrong type,
+	 * the wrong size, or because it returned an error decides what to fix, and the log so
+	 * far only said "calls 1".
+	 */
+	rec_evt_type = (uint32_t)(uintptr_t)evt;
+	rec_evt_size_in = (size != NULL) ? (uint32_t)*size : 0xffffffffu;
+	if (data != NULL) {
+		rec_evt_data0 = ((const uint8_t *)data)[0];
+		rec_evt_data1 = ((const uint8_t *)data)[1];
+	}
+
+	r = orig_evt_handler(self, evt, size, data);
+
+	rec_evt_size_out = (size != NULL) ? (uint32_t)*size : 0xffffffffu;
+	rec_evt_ret = (uint32_t)r;
+	return r;
 }
 
 static void
@@ -7720,8 +7885,10 @@ chiron_shim_report(void)
 {
 	print("shim: StopController %x | StartController %x | ConfigureEnableEndpoints %x\n",
 	    (uint64_t)rec_stop_ctrl, (uint64_t)rec_start_ctrl, (uint64_t)rec_cfg_eps);
-	print("shim: EventHandler calls %d last pending %x\n",
-	    (uint64_t)rec_evt_count, (uint64_t)rec_evt_pending_last);
+	print("shim: EventHandler calls %d pending %x type %x size %x->%x ret %x data %x%x\n",
+	    (uint64_t)rec_evt_count, (uint64_t)rec_evt_pending_last,
+	    (uint64_t)rec_evt_type, (uint64_t)rec_evt_size_in, (uint64_t)rec_evt_size_out,
+	    (uint64_t)rec_evt_ret, (uint64_t)rec_evt_data0, (uint64_t)rec_evt_data1);
 	print("shim: DetectPort calls %d -> port %x\n",
 	    (uint64_t)rec_detect_port_calls, (uint64_t)rec_detect_port_result);
 	print("shim: AllocateTransferBuffer %d calls -> %x | GetDeviceInfo %x | VidPid %x\n",
@@ -8028,6 +8195,17 @@ usb_start(void)
 				    (c[17] == 0 || c[17] == ' ')) {
 					usb_probe_steps_mode = 1;
 				}
+				/* "usb_prestart_ring=1" is 19 characters */
+				if (starts_with(c, "usb_prestart_ring=1") &&
+				    (c[19] == 0 || c[19] == ' ')) {
+					usb_prestart_ring = 1;
+				}
+				/* "usb_no_qualifier=1" is 18 characters */
+				if (starts_with(c, "usb_no_qualifier=1") &&
+				    (c[18] == 0 || c[18] == ' ')) {
+					usb_no_qualifier = 1;
+					print("usb: device qualifier omitted\n", 0);
+				}
 				/* "usb_no_recover=1" is 16 characters */
 				if (starts_with(c, "usb_no_recover=1") &&
 				    (c[16] == 0 || c[16] == ' ')) {
@@ -8289,7 +8467,16 @@ usb_start(void)
 	set.descriptors = cfg;
 	set.ss_device_descriptor = NULL;
 	set.ss_descriptors = NULL;
-	set.device_qualifier = usb_qualifier;
+	/*
+	 * CHIRON_NO_QUALIFIER_OPTION
+	 *
+	 * UsbDeviceDxe's UsbDevDescInitDescriptors reports "DeviceDescriptor: Out of
+	 * Resources" through the descriptor path, and the qualifier is the one descriptor in
+	 * this set that is optional and only meaningful for a device that can also run at a
+	 * different speed.  chiron is USB2 HighSpeed only, so ask for it to be left out with
+	 * usb_no_qualifier=1 and see whether the descriptor init then succeeds.
+	 */
+	set.device_qualifier = usb_no_qualifier ? NULL : usb_qualifier;
 	set.bos = NULL;
 	set.string_count = 5;
 	set.strings = strings;
@@ -8415,6 +8602,10 @@ usb_start(void)
 		efi_handle cfgimg = chiron_find_image_by_sig(chiron_is_usb_config, NULL);
 
 		chiron_usbconfig_state("pre-start_ex", cfgimg, NULL, NULL);
+	}
+
+	if (usb_prestart_ring) {
+		chiron_prestart_driver_ring();
 	}
 
 	chiron_usbfn_handles();
@@ -8809,8 +9000,21 @@ usb_start(void)
 		 */
 		while (pumped < 200000) {
 			uint32_t m = UsbDeviceEventNoEvent;
-			uint64_t sz = 0;
+			/*
+			 * CHIRON_PAYLOAD_SIZE_IN
+			 *
+			 * PayloadSize is IN OUT, not OUT: on the way in it must hold the size of the
+			 * payload buffer, and the driver rejects a zero.  That is measurable -- the
+			 * EventHandler shim recorded size 0x10000001 in and the same out, with a
+			 * return of 0x2 (EFI_DEVICE_ERROR), which is exactly what this call gets
+			 * when the buffer size is nonsense.
+			 *
+			 * It has been zero since the loader first pumped events, so every pump in
+			 * this project has been asking the driver a malformed question and getting
+			 * an error back.
+			 */
 			usb_device_event_data d;
+			uint64_t sz = sizeof(d);
 			uint64_t now = READ_SYSREG(CNTVCT_EL0);
 
 			if (now - began > freq / 4) {           /* 250 ms */
@@ -8868,7 +9072,14 @@ usb_start(void)
 
 		print("usb: start_ex failed %x; configuring endpoints ourselves\n", (uint64_t)s);
 
-		if (chiron_usbfn_endpoints()) {
+		/*
+		 * Only the configure step here.  chiron_usbfn_endpoints() stops and starts the
+		 * controller first, and that is what crashed: start allocated the ring
+		 * (a102f000) and the configure that followed faulted in the firmware.
+		 * StartEx already ran StartController successfully, so there is nothing to
+		 * start -- the endpoints are the only missing piece.
+		 */
+		if (chiron_usbfn_configure_only()) {
 			print("usb: endpoints configured after start_ex\n", 0);
 		} else {
 			print("usb: endpoint configuration after start_ex failed\n", 0);
@@ -9532,8 +9743,21 @@ usb_command_loop(void)
 		 */
 		while (pumped < 200000) {
 			uint32_t m = UsbDeviceEventNoEvent;
-			uint64_t sz = 0;
+			/*
+			 * CHIRON_PAYLOAD_SIZE_IN
+			 *
+			 * PayloadSize is IN OUT, not OUT: on the way in it must hold the size of the
+			 * payload buffer, and the driver rejects a zero.  That is measurable -- the
+			 * EventHandler shim recorded size 0x10000001 in and the same out, with a
+			 * return of 0x2 (EFI_DEVICE_ERROR), which is exactly what this call gets
+			 * when the buffer size is nonsense.
+			 *
+			 * It has been zero since the loader first pumped events, so every pump in
+			 * this project has been asking the driver a malformed question and getting
+			 * an error back.
+			 */
 			usb_device_event_data d;
+			uint64_t sz = sizeof(d);
 
 			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now));
 			if (now - began > freq) {           /* 1 s */

@@ -4178,6 +4178,7 @@ static int usb_no_qualifier;              /* usb_no_qualifier=1: omit the device
 static int usb_no_recover;                /* usb_no_recover=1: return on start_ex failure, no endpoint retry */
 /* the driver publishes revision + nine entry points; see the shim copy below */
 #define CHIRON_USBFN_REAL_SIZE  0x50u
+static int usb_bwt_mode;        /* usb_bwt=1: run the byte-write diagnostic (writes PHY regs) */
 static int usb_no_ring_touch;   /* usb_no_ring_touch=1: never program the event ring ourselves */
 static int usb_noop_startstop;            /* usb_noop_startstop=1: report success for stop/start, let StartEx continue */
 static uint32_t rec_evt_none_taken;
@@ -9909,6 +9910,12 @@ usb_start(void)
 				    (c[19] == 0 || c[19] == ' ')) {
 					usb_no_ring_touch = 1;
 				}
+
+				/* "usb_bwt=1" is 9 characters */
+				if (starts_with(c, "usb_bwt=1") &&
+				    (c[9] == 0 || c[9] == ' ')) {
+					usb_bwt_mode = 1;
+				}
 				/* "usb_start_first=0" is 17 characters */
 				if (starts_with(c, "usb_start_first=0") &&
 				    (c[17] == 0 || c[17] == ' ')) {
@@ -10518,22 +10525,51 @@ usb_start(void)
 	 * sequences correctly (assert POWR_DOWN, write the init seq, write TUNE1, clear
 	 * POWR_DOWN), matching qusb_phy_init() line for line.
 	 */
-	chiron_byte_write_test();
+	/*
+	 * CHIRON_DIAGNOSTICS_ARE_NOT_PRODUCTION_CODE
+	 *
+	 * chiron_byte_write_test() exists to answer one question that was open several rounds ago:
+	 * does a byte store to this PHY take effect at all.  It answers by writing five PHY
+	 * registers and reading them back.
+	 *
+	 * It was being called unconditionally, on every run, immediately before start_ex -- so the
+	 * one path that matters was being crossed while a diagnostic scribbled on the PHY.  The
+	 * working build has no such call.  Gate it behind usb_bwt=1 so the question stays answerable
+	 * without putting a test in the way of the thing being tested.
+	 */
+	if (usb_bwt_mode) {
+		chiron_byte_write_test();
+	}
 
 	/*
 	 * Read the line levels three ways.  If 0xF4 never changes across these, the register really
 	 * is inert here; if it moves, it is a live view of the wire and every earlier conclusion
 	 * that skipped it needs revisiting.
 	 */
-	chiron_linestate("as-found");
-	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB8) = 0x0C;
-	__asm__ volatile ("dsb sy" ::: "memory");
-	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB8) = 0x04;
-	__asm__ volatile ("dsb sy" ::: "memory");
-	chiron_linestate("after-test-ctrl");
-	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB8) = 0x00;
-	__asm__ volatile ("dsb sy" ::: "memory");
-	chiron_linestate("after-clear");
+	/*
+	 * CHIRON_PORT_TEST_CTRL_IS_V1
+	 *
+	 * 0xB8 is QUSB2PHY_PORT_TEST_CTRL.  It appears in phy-msm-qusb.c (v1) and not in
+	 * phy-msm-qusb-v2.c, which is the driver chiron's device tree selects.  These three writes
+	 * were a diagnostic -- force D+ to a known level and see whether the line-status registers
+	 * react -- and they were running unconditionally, on every boot, immediately before
+	 * start_ex, on a register this PHY's driver never touches.
+	 *
+	 * The diagnostic has served its purpose: the line-status registers were shown inert either
+	 * way, and touching a v1 register while the v2 PHY is being handed to the controller is not
+	 * a neutral act.  Gate it behind usb_bwt=1 with the other probe that writes PHY registers.
+	 */
+	if (usb_bwt_mode) {
+		chiron_linestate("as-found");
+		*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB8) = 0x0C;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB8) = 0x04;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		chiron_linestate("after-test-ctrl");
+		*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB8) = 0x00;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		chiron_linestate("after-clear");
+	}
 	chiron_restore_gctl(g_entry_gctl);
 	chiron_update_ref_clk();
 	chiron_step("after-refclk");

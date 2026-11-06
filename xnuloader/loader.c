@@ -1097,6 +1097,7 @@ static int auto_reboot;
 static int halt_instead;
 /* CHIRON_USB_IDLE_RESET: seconds a USB session may sit with no command (usb_idle=N) */
 static int usb_idle_seconds;
+static void *chiron_idle_timer;   /* a yielding timer used by the command loop's idle path */
 
 static void
 reboot(void)
@@ -11715,8 +11716,32 @@ usb_command_loop(void)
 					 * yielding here is also what makes a session that never attaches end by
 					 * itself rather than hanging with the cable in.
 					 */
-					if ((pumped % 16) == 0 && BS != NULL && BS->stall != NULL) {
-						BS->stall(1000);          /* 1 ms; lets timers tick */
+					/*
+					 * CHIRON_STALL_DOES_NOT_DISPATCH_EVENTS
+					 *
+					 * BS->stall() busy-waits; it does not dispatch UEFI events, so the
+					 * firmware's timers do not get a turn during it.  wait_for_event() does.
+					 *
+					 * Create one timer event once, arm it relative with a short interval, and
+					 * wait on it here.  Each wait is a genuine yield: platform timers fire,
+					 * UsbfnChgDxe's charger poller runs, and this loader gets control back.
+					 * The deadline is then checked with the clock having actually advanced
+					 * through a dispatch rather than through a spin.
+					 */
+					if ((pumped % 16) == 0) {
+						if (chiron_idle_timer == NULL && BS != NULL &&
+						    BS->create_event != NULL && BS->set_timer != NULL) {
+							if (!EFI_ERROR(BS->create_event(0x80000000u, 8,
+							    NULL, NULL, &chiron_idle_timer))) {
+								BS->set_timer(chiron_idle_timer, 1, 10000ull);
+							}
+						}
+						if (chiron_idle_timer != NULL && BS->wait_for_event != NULL) {
+							BS->wait_for_event(1, &chiron_idle_timer, NULL);
+							BS->set_timer(chiron_idle_timer, 1, 10000ull);
+						} else if (BS != NULL && BS->stall != NULL) {
+							BS->stall(1000);
+						}
 						usb_session_check();
 					}
 					if ((pumped % 2000) == 0) {

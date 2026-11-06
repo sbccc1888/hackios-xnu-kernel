@@ -7277,83 +7277,99 @@ chiron_raw_pump(const char *when, unsigned budget)
 	const uint64_t dwc = 0xA800000ULL;
 	uint32_t adr = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC400);
 	uint32_t siz = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC408) & 0xffffu;
-	unsigned got = 0, device = 0, transfer = 0, cmdevy = 0, junk = 0;
+	uint32_t cnt0 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C) & 0xfffcu;
 	uint32_t rd;
+	unsigned n = 0;
 
-	if (adr == 0 || siz == 0) {
+	if (adr == 0 || siz == 0 || cnt0 < 4) {
 		return;
 	}
 
 	chiron_invalidate((void *)(uintptr_t)adr, siz);
 
 	/*
-	 * Start at the first non-zero word.  GEVNTCOUNT counts bytes outstanding, but the live
-	 * records in this ring begin partway in -- the dump showed them at +0x18 while the
-	 * buffer start was still zeroed.  Scanning for the first non-zero word is a cheap way to
-	 * find the consumer's real position without tracking a pointer this loader does not own.
+	 * CHIRON_DWC3_EVENT_DECODE
+	 *
+	 * Earlier passes decoded these records with the wrong bit layout -- they took event type
+	 * from the low byte and the size from bits 16:17, which produced "DEVICE err=1 conn=0"
+	 * readings that sent several rounds chasing a connection problem.
+	 *
+	 * The real layout, from dwc3/core.h:
+	 *
+	 *   struct dwc3_event_type { u32 is_devspec:1; u32 type:7; };
+	 *   struct dwc3_event_devt {
+	 *           u32 one_bit:1; u32 device_event:7; u32 type:4;
+	 *           u32 reserved15_12:4; u32 event_info:9; u32 reserved31_25:7;
+	 *   };
+	 *
+	 * so bit 0 alone says which union member this is, bits 7:1 are the event number, and for a
+	 * device event bits 24:16 carry event_info (the speed or link state, depending on event).
+	 * Every record is 4 bytes; the ring advances one word at a time.
 	 */
-	for (rd = 0; rd + 8 <= siz; rd += 4) {
-		if (*(volatile uint32_t *)(uintptr_t)(adr + rd) != 0) {
-			break;
-		}
-	}
-	print("rawd ", 0);
-	print((char *)when, 0);
-	print(": first non-zero at +%x, count was %x\n", (uint64_t)rd,
-	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C) & 0xfffcu));
+	for (rd = 0; rd + 4 <= siz && cnt0 >= (rd + 4); rd += 4) {
+		uint32_t raw = *(volatile uint32_t *)(uintptr_t)(adr + rd);
 
-	for (unsigned i = 0; i < budget && rd + 8 <= siz; i++) {
-		uint32_t hdr = *(volatile uint32_t *)(uintptr_t)(adr + rd);
-		uint32_t params = *(volatile uint32_t *)(uintptr_t)(adr + rd + 4);
-		uint32_t type = hdr & 0xffu;
-		uint32_t sizec = (hdr >> 16) & 0x3u;
-		uint32_t len = 4u + (4u << sizec);
-
-		if (len < 8) {
-			len = 8;
+		if (raw == 0) {
+			continue;
 		}
 
-		if (type == 1) {
-			device++;
-			print("raw ", 0);
+		n++;
+
+		if (raw & 1u) {
+			/* device event */
+			uint32_t ev = (raw >> 1) & 0x7fu;
+			uint32_t info = (raw >> 16) & 0x1ffu;
+			const char *nm;
+
+			switch (ev) {
+			case 0:  nm = "DISCONNECT";        break;
+			case 1:  nm = "RESET";             break;
+			case 2:  nm = "CONNECT_DONE";      break;
+			case 3:  nm = "LINK_STATUS";       break;
+			case 4:  nm = "WAKEUP";            break;
+			case 6:  nm = "EOPF";              break;
+			case 7:  nm = "SOF";               break;
+			case 9:  nm = "ERRATIC_ERROR";     break;
+			case 10: nm = "CMD_CMPL";          break;
+			case 11: nm = "OVERFLOW";          break;
+			default: nm = "?";                 break;
+			}
+			print("evt ", 0);
 			print((char *)when, 0);
-			print(": DEVICE err %x conn %x link %x speed %x\n",
-			    (uint64_t)(params & 1u), (uint64_t)((params >> 1) & 1u),
-			    (uint64_t)((params >> 2) & 3u), (uint64_t)((params >> 4) & 0xfu));
-		} else if (type == 3) {
-			transfer++;
-			print("raw ", 0);
-			print((char *)when, 0);
-			print(": XFER ep %x status %x\n",
-			    (uint64_t)((params >> 1) & 0x1fu),
-			    (uint64_t)((params >> 12) & 0xfu));
-		} else if (type == 2) {
-			cmdevy++;
+			print(": dev ", (uint64_t)0);
+			print((char *)nm, 0);
+			print(" info %x (raw %x)\n", (uint64_t)info, (uint64_t)raw);
 		} else {
-			junk++;
+			/* endpoint event */
+			uint32_t ep = (raw >> 1) & 0x1fu;
+			uint32_t ev = (raw >> 6) & 0xfu;
+			uint32_t st = (raw >> 12) & 0xfu;
+			const char *nm;
+
+			switch (ev) {
+			case 1:  nm = "XFERCOMPLETE"; break;
+			case 2:  nm = "XFERINPROGRESS"; break;
+			case 3:  nm = "XFERNOTREADY"; break;
+			case 4:  nm = "RXTXFIFO";     break;
+			case 6:  nm = "STREAM";       break;
+			case 7:  nm = "EPCMDCMPLT";   break;
+			default: nm = "?";            break;
+			}
+			print("evt ", 0);
+			print((char *)when, 0);
+			print(": ep %x ", (uint64_t)ep);
+			print((char *)nm, 0);
+			print(" status %x (raw %x)\n", (uint64_t)st, (uint64_t)raw);
 		}
 
-		/*
-		 * Retire what was consumed.  Only do this for a plausible record: writing a length
-		 * derived from a garbage header would desynchronise the controller's own counter.
-		 */
-		if (type >= 1 && type <= 3) {
-			*(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C) = len;
-			__asm__ volatile ("dsb sy" ::: "memory");
-			got++;
-		}
-		else if (junk > 4) {
+		if (n >= budget) {
 			break;
 		}
-
-		rd += len;
 	}
 
-	print("raw ", 0);
+	print("evt ", 0);
 	print((char *)when, 0);
-	print(": %d taken (%d device, %d xfer, %d cmd, %d junk)\n",
-	    (uint64_t)got, (uint64_t)device, (uint64_t)transfer, (uint64_t)cmdevy,
-	    (uint64_t)junk);
+	print(": %d record(s), %x bytes pending\n", (uint64_t)n, (uint64_t)cnt0);
 	flush_log();
 }
 

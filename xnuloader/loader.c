@@ -8790,6 +8790,33 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 			print("\n", 0);
 		}
 
+		/*
+		 * CHIRON_SLOT_CLASSIFY
+		 *
+		 * For every slot, print the target and the first four bytes there.  Real AArch64
+		 * functions in this image begin with a recognisable prologue (f4 4f be a9 and
+		 * friends); anything printable is a string literal.  That turns "which slots are
+		 * callable" into a table of bytes instead of an argument.
+		 */
+		for (unsigned q = 0; q < 20; q++) {
+			uint64_t v = *(volatile uint64_t *)(uintptr_t)((uintptr_t)orig + q * 8);
+			uint64_t b0 = 0, b1 = 0, b2 = 0, b3 = 0;
+
+			/*
+			 * Slot 0 is the 32-bit revision plus padding, so reading it as a u64 yields a
+			 * value no pointer can hold.  Only follow values that land inside the firmware
+			 * image; the earlier version bounded at 0x40000000 which let 0x10000001 through
+			 * and faulted on the revision word itself.
+			 */
+			if (v >= 0x9b000000ULL && v < 0x9c000000ULL) {
+				const uint8_t *t = (const uint8_t *)(uintptr_t)v;
+
+				b0 = t[0]; b1 = t[1]; b2 = t[2]; b3 = t[3];
+			}
+			print("slot %x: %x [%x %x %x %x]\n",
+			    (uint64_t)(q * 8), v, b0, b1, b2, b3);
+		}
+
 		for (unsigned q = 0; q < 24; q++) {
 			print("vraw +%x: %x\n", (uint64_t)(q * 8),
 			    *(volatile uint64_t *)(uintptr_t)((uintptr_t)orig + q * 8));

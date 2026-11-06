@@ -8835,6 +8835,47 @@ usb_start(void)
 	}
 
 	chiron_usbfn_handles();
+
+	/*
+	 * CHIRON_DEVICE_VS_FNIO
+	 *
+	 * Every measurement so far listed UsbFnIo handles and found exactly one, which was this
+	 * loader's chosen controller.  UsbDevice was never enumerated the same way, and it is a
+	 * different protocol on a possibly different handle.  StartEx is reached through
+	 * UsbDevice, so if that protocol lives elsewhere, everything StartEx does happens on a
+	 * controller HK6 never configured -- and the symptom would look exactly like this:
+	 * UsbFnIo calls succeed, StartEx fails, and no state anywhere explains it.
+	 *
+	 * List both, side by side, with the handles, so "same controller" stops being an
+	 * assumption.
+	 */
+	{
+		static const efi_guid dev_guid = QCOM_USB_DEVICE_GUID;
+		efi_handle *hs = NULL;
+		uint64_t n = 0;
+
+		if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &dev_guid, NULL, &n, &hs))) {
+			print("dev: %d handle(s) carry UsbDevice (ours is %x)\n",
+			    (uint64_t)n, (uint64_t)(uintptr_t)usb_dev_handle);
+
+			for (uint64_t i = 0; i < n; i++) {
+				usb_device_protocol *d = NULL;
+
+				if (EFI_ERROR(BS->handle_protocol(hs[i], &dev_guid,
+				    (void **)&d)) || d == NULL) {
+					continue;
+				}
+				print("dev[%d]: handle %x proto %x %s\n", i,
+				    (uint64_t)(uintptr_t)hs[i], (uint64_t)(uintptr_t)d,
+				    (hs[i] == usb_dev_handle) ? "<- same as ours" : "<- DIFFERENT");
+			}
+			if (hs != NULL) {
+				BS->free_pool(hs);
+			}
+		} else {
+			print("dev: no UsbDevice handles at all\n", 0);
+		}
+	}
 	chiron_platforminfo_view();
 
 	/*

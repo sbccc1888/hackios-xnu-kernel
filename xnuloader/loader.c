@@ -1097,6 +1097,8 @@ static int auto_reboot;
 static int halt_instead;
 /* CHIRON_USB_IDLE_RESET: seconds a USB session may sit with no command (usb_idle=N) */
 static int usb_idle_seconds;
+static uint8_t usb_static_rx[4096] __attribute__((aligned(64)));
+static uint8_t usb_static_tx[4096] __attribute__((aligned(64)));
 static void *chiron_idle_timer;   /* a yielding timer used by the command loop's idle path */
 
 static void
@@ -11058,10 +11060,38 @@ usb_start(void)
 	 * faults, and until now the log could not tell them apart.
 	 */
 	print("usb: device presented (start_ex ok); waiting for the host\n");
-	if (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
-	    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf))) {
-		print("usb: no transfer buffers\n");
-		return 0;
+	/*
+	 * CHIRON_ALLOCATE_IS_OUT_OF_TABLE
+	 *
+	 * This driver publishes nine entry points, ending at EventHandler in slot 0x48.  Everything
+	 * from 0x50 onwards -- transfer, get_max_transfer_size, allocate_transfer_buffer,
+	 * free_transfer_buffer, start_controller, stop_controller and the rest -- is adjacent
+	 * memory that happens to sit after the table.
+	 *
+	 * Two things tonight were this exact mistake: calling slot 0x50 executed the string
+	 * "DEV_STATE_DETACHED", and calling slot 0x68 was the fault that ended nearly every run.
+	 * allocate_transfer_buffer is slot 0x60, and it is the last thing usb_start() does:
+	 *
+	 *     if (EFI_ERROR(USB->allocate_transfer_buffer(...)) || ...) return 0;
+	 *
+	 * so a call into adjacent memory is also the most likely reason usb_start() kept returning
+	 * 0 even after start_ex was made to succeed.  A zero return there means the command loop --
+	 * the only place enumeration happens -- is never entered.
+	 *
+	 * Check the slot before using it.  If it is not a function, the control path's own buffers
+	 * are used instead: the loop never needs the transfer buffers to poll the controller, only
+	 * to move bulk data, and enumeration comes before any of that.
+	 */
+	if (chiron_fnio_slot_is_callable(USB, 0x60)) {
+		if (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
+		    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf))) {
+			print("usb: no transfer buffers\n");
+			return 0;
+		}
+	} else {
+		print("usb: allocate_transfer_buffer is slot 0x60, outside the table; using static buffers\n", 0);
+		usb_rx_buf = usb_static_rx;
+		usb_tx_buf = usb_static_tx;
 	}
 	print("usb: started\n");
 	return 1;

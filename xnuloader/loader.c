@@ -4178,6 +4178,7 @@ static int usb_no_qualifier;              /* usb_no_qualifier=1: omit the device
 static int usb_no_recover;                /* usb_no_recover=1: return on start_ex failure, no endpoint retry */
 /* the driver publishes revision + nine entry points; see the shim copy below */
 #define CHIRON_USBFN_REAL_SIZE  0x50u
+static int usb_no_ring_touch;   /* usb_no_ring_touch=1: never program the event ring ourselves */
 static int usb_noop_startstop;            /* usb_noop_startstop=1: report success for stop/start, let StartEx continue */
 static uint32_t rec_evt_none_taken;
 static int usb_evt_none;               /* usb_evt_none=1: answer success with MsgNone when no events pending */
@@ -6961,8 +6962,28 @@ chiron_event_arm(void)
 	 * So try to give it one here, before anything is armed.  chiron_ring_takeover() tests
 	 * whether the register is writable and says so either way.
 	 */
-	if (!usb_clean_mode && !usb_no_ring) {
+	/*
+	 * CHIRON_THE_WORKING_BUILD_NEVER_TOUCHED_THE_RING
+	 *
+	 * Counting by register offset across the two loaders:
+	 *
+	 *     GEVNTADR   working build 2 writes   now 18
+	 *     GEVNTSIZ   working build 2 writes   now 15
+	 *
+	 * and the four functions responsible -- ring_takeover, ring_has_events,
+	 * prestart_driver_ring, ring_dump -- do not exist in the working build at all.
+	 *
+	 * That build let StartController allocate the ring and never wrote to it, and it reached the
+	 * command loop.  This loader restores the ring address measured at entry, which is a buffer
+	 * StartController has since reallocated and no longer recognises.  Writing an address the
+	 * controller does not own is not a restoration.
+	 *
+	 * usb_no_ring_touch=1 reproduces the working build's behaviour: leave the ring alone.
+	 */
+	if (!usb_clean_mode && !usb_no_ring && !usb_no_ring_touch) {
 		chiron_ring_takeover();
+	} else if (usb_no_ring_touch) {
+		print("ring: usb_no_ring_touch=1, leaving the ring to the driver\n", 0);
 	}
 
 	uint32_t before = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC708);
@@ -9882,6 +9903,12 @@ usb_start(void)
 				    (c[14] == 0 || c[14] == ' ')) {
 					usb_evt_none = 1;
 				}
+
+				/* "usb_no_ring_touch=1" is 19 characters */
+				if (starts_with(c, "usb_no_ring_touch=1") &&
+				    (c[19] == 0 || c[19] == ' ')) {
+					usb_no_ring_touch = 1;
+				}
 				/* "usb_start_first=0" is 17 characters */
 				if (starts_with(c, "usb_start_first=0") &&
 				    (c[17] == 0 || c[17] == ' ')) {
@@ -10326,7 +10353,9 @@ usb_start(void)
 	}
 
 	if (usb_prestart_ring) {
-		chiron_prestart_driver_ring();
+		if (!usb_no_ring_touch) {
+			chiron_prestart_driver_ring();
+		}
 	}
 	if (usb_stop_before_start_ex) {
 		chiron_stop_before_start_ex();

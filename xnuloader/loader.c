@@ -4163,6 +4163,7 @@ static int usb_no_epcfg_mode;
 static int usb_probe_steps_mode;          /* usb_probe_steps=1: run StartEx's steps one by one */
 static int usb_state_force;              /* usb_state_force=1: force UsbConfig state to 0xf (proven harmful) */
 static int usb_stop_before_start_ex;        /* usb_stop_before_start_ex=1: stop once before StartEx */
+static uint8_t g_entry_tune1, g_entry_qc1;   /* PHY values as the firmware left them */
 static int usb_force_bind;                 /* usb_force_bind=1: call binding->start() directly */
 static int usb_hk6_no_start;               /* usb_hk6_no_start=1: do not start the controller in HK6 */
 static int usb_prestart_ring;              /* usb_prestart_ring=1: let the driver allocate the ring, then hand over */
@@ -5753,8 +5754,24 @@ chiron_qusb2_init(void)
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 
-	/* fold the per-chip trim in, as the working hardware has it (0x45 from 0xa5) */
-	chiron_efuse_tune1();
+	/*
+	 * CHIRON_RESTORE_TUNE1
+	 *
+	 * chiron_efuse_tune1() folds the efuse trim into TUNE1, turning 0xa5 into 0x45.  The entry
+	 * snapshot, taken before this program touched anything, reads TUNE1 as 0xf0 -- that is the
+	 * value a working fastboot session left behind.  Writing 0x45 unconditionally therefore
+	 * replaces a known-good value with a computed one.
+	 *
+	 * Put back whatever the firmware had when it was found, and only fall back to the computed
+	 * trim if entry was zero (which would mean the PHY was not initialised at all).
+	 */
+	if (g_entry_tune1 != 0) {
+		*(volatile uint8_t *)(uintptr_t)(phy + 0x23C) = g_entry_tune1;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		print("tune1: restored entry %x (init had set 45)\n", (uint64_t)g_entry_tune1);
+	} else {
+		chiron_efuse_tune1();
+	}
 	/* CHIRON_QUSB2_PWRUP (byte access, same reason): POWR_DOWN clear, CLAMP_N_EN set */
 	{
 		uint8_t pw = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
@@ -8094,12 +8111,71 @@ chiron_power_up_phy(void)
 	}
 }
 
+/*
+ * CHIRON_MATCH_SPEED
+ *
+ * The entry snapshot is unambiguous about what this cable does:
+ *
+ *     entry DSTS 0xd2c789: CONNSTAT 1, CONNECTSPD 1 (FullSpeed), device address 0x39
+ *
+ * fastboot had just been talking to the host at full speed, with an address assigned.  This
+ * loader then programs DCFG.DevSpd to 0 (HighSpeed) and the connection never comes back.
+ *
+ * DWC3 picks the device speed in DCFG bits 2:0, and it has to agree with what the port can
+ * actually do.  Read the speed the controller last negotiated from DSTS and program DCFG to the
+ * same value instead of assuming high speed.
+ */
+static void
+chiron_match_speed(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	uint32_t want = dsts & 7u;
+	uint32_t dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+	uint32_t now = dcfg & 7u;
+
+	if (want > 3u) {
+		print("speed: DSTS speed %x not usable, left DCFG at %x\n",
+		    (uint64_t)want, (uint64_t)now);
+		return;
+	}
+
+	if (want == now) {
+		print("speed: DCFG already %x\n", (uint64_t)now);
+		return;
+	}
+
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) = (dcfg & ~7u) | want;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(100);
+
+	print("speed: DSTS said %x, DCFG %x -> %x | DSTS now %x conn %x\n",
+	    (uint64_t)want, (uint64_t)now,
+	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) & 7u),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C),
+	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) & 1u));
+}
+
 static void
 chiron_enable_termination(void)
 {
 	const uint64_t phy = 0xC012000ULL;
 	uint8_t before = *(volatile uint8_t *)(uintptr_t)(phy + 0xC0);
-	uint8_t value = before | (1u << 4);        /* TERM_SELECT */
+	/*
+	 * CHIRON_UTMI_CTRL1_FULL
+	 *
+	 * phy-msm-qusb.c sets all three of these together:
+	 *
+	 *     writel_relaxed(TERM_SELECT | XCVR_SELECT_FS | OP_MODE_NON_DRIVE, UTMI_CTRL1)
+	 *
+	 * with TERM_SELECT BIT(4), XCVR_SELECT_FS BIT(2), OP_MODE_NON_DRIVE BIT(0) -- 0x15.
+	 *
+	 * Only TERM_SELECT was being set here.  XCVR_SELECT_FS matters on this port specifically:
+	 * the entry snapshot reads DSTS with CONNECTSPD = 1, FullSpeed, and a device address of
+	 * 0x39 still assigned from the fastboot session that just finished.  So the last working
+	 * connection on this cable was full speed, and the transceiver was left in HS mode.
+	 */
+	uint8_t value = (uint8_t)(before | (1u << 4) | (1u << 2) | 1u);
 
 	if ((before & (1u << 4)) != 0) {
 		return;
@@ -9681,6 +9757,7 @@ usb_start(void)
 	chiron_linestate("after-clear");
 	chiron_update_ref_clk();
 	chiron_enable_termination();
+	chiron_match_speed();
 	chiron_clear_disconnect();
 	chiron_pullup_audit("after-disc");
 
@@ -11130,6 +11207,56 @@ efi_main(efi_handle image, efi_system_table *st)
 		    (uint64_t)SCREEN.stride, (uint64_t)GOP->mode->fb_size, (uint64_t)SCREEN.base);
 		print("display %d x %d at %x\n", (uint64_t)SCREEN.width, (uint64_t)SCREEN.height, SCREEN.base);
 	}
+	/*
+	 * CHIRON_ENTRY_SNAPSHOT
+	 *
+	 * The one measurement that separates "the port is not driving the wire" from "the loader
+	 * breaks a working link": read the controller and PHY before this program has written a
+	 * single USB register.
+	 *
+	 * The phone arrives here because `fastboot boot` worked, so at this instant the cable is
+	 * connected and the data lines were being driven moments ago.  If DSTS shows CONNECT set
+	 * and 0xF4 shows a line high here, then everything this loader does to the port afterwards
+	 * is what turns a working link into a dead one.
+	 */
+	{
+		const uint64_t dwc0 = 0xA800000ULL;
+		const uint64_t phy0 = 0xC012000ULL;
+		uint32_t dsts0 = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC70C);
+		uint32_t dctl0 = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC704);
+		uint32_t dcfg0 = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC700);
+		uint32_t gctl0 = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC110);
+		uint32_t phycfg0 = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC200);
+		uint8_t f4 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0xF4);
+		uint8_t f0 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0xF0);
+		uint8_t p210 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x210);
+		uint8_t p1a0 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x1A0);
+		uint8_t pc0 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0xC0);
+
+		print("ENTRY: DSTS %x conn=%x lkst=%x spd=%x | DCTL %x | DCFG %x | GCTL %x | phycfg %x\n",
+		    (uint64_t)dsts0, (uint64_t)(dsts0 & 1u), (uint64_t)((dsts0 >> 18) & 0xfu),
+		    (uint64_t)((dsts0 >> 22) & 1u), (uint64_t)dctl0, (uint64_t)dcfg0,
+		    (uint64_t)gctl0, (uint64_t)phycfg0);
+		/*
+		 * CHIRON_ENTRY_TUNE1
+		 *
+		 * The value the PHY holds while fastboot is working.  The init sequence below writes
+		 * 0xa5 and then folds the efuse trim in, producing 0x45, on a comment claiming the
+		 * working hardware reads 0x45.  The entry measurement says otherwise each run:
+		 *
+		 *     phy ENTRY: ... 23c f0 ...
+		 *
+		 * so 0xf0 is what a working port looks like, and 0x45 is what this loader replaces it
+		 * with.  Keep both, so the init can put back what was actually there.
+		 */
+		g_entry_tune1 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x23C);
+		g_entry_qc1 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x70);
+
+		print("ENTRY: phy f4 %x f0 %x d+ %x d- %x | 210 %x 1a0 %x c0 %x\n",
+		    (uint64_t)f4, (uint64_t)f0, (uint64_t)(f4 & 1u), (uint64_t)((f4 >> 1) & 1u),
+		    (uint64_t)p210, (uint64_t)p1a0, (uint64_t)pc0);
+	}
+
 	print("platform %s\n", PLAT->name);
 	dump_partitions();
 	list_partitions();

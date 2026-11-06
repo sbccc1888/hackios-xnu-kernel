@@ -4162,6 +4162,8 @@ static int usb_no_epcfg_mode;
 /* usb_extra_start=1: also call UsbFnIo::StartController ourselves. */
 static int usb_probe_steps_mode;          /* usb_probe_steps=1: run StartEx's steps one by one */
 static int usb_state_force;              /* usb_state_force=1: force UsbConfig state to 0xf (proven harmful) */
+static int usb_stop_before_start_ex;        /* usb_stop_before_start_ex=1: stop once before StartEx */
+static int usb_hk6_no_start;               /* usb_hk6_no_start=1: do not start the controller in HK6 */
 static int usb_prestart_ring;              /* usb_prestart_ring=1: let the driver allocate the ring, then hand over */
 static int usb_no_qualifier;              /* usb_no_qualifier=1: omit the device qualifier */
 static int usb_no_recover;                /* usb_no_recover=1: return on start_ex failure, no endpoint retry */
@@ -5180,9 +5182,31 @@ chiron_usb_hk6(void)
 		}
 		print("hk6: core %x modes %x\n", (uint64_t)core.core_num, (uint64_t)core.mode_type);
 
-		/* ask for peripheral */
-		s = init->start_controller(init, core.core_num, UsbModePeripheral);
-		print("hk6: start peripheral %x\n", (uint64_t)s);
+		/*
+		 * CHIRON_HK6_NO_START
+		 *
+		 * This is the UsbConfig-level start: init->start_controller(core, peripheral).
+		 * It is the call that actually brings the controller up and is what the log has
+		 * always reported as "hk6: start peripheral 0".
+		 *
+		 * The UsbFnIo-level StopController that StartEx calls first then answers 7 --
+		 * EFI_OUT_OF_RESOURCES -- which is what a driver says when asked to stop something
+		 * it considers already stopped or not owned.  Every experiment so far shimmed the
+		 * UsbFnIo level, never this one.
+		 *
+		 * usb_hk6_no_start=1 skips it, so StartEx's StopController/StartController pair is
+		 * the first thing that touches the controller and starts from a clean state.  The
+		 * peripheral config record is still installed and the driver still binds; only the
+		 * start is withheld.
+		 */
+		if (usb_hk6_no_start) {
+			print("hk6: start peripheral SKIPPED (left to start_ex)\n", 0);
+			s = 0;
+		} else {
+			/* ask for peripheral */
+			s = init->start_controller(init, core.core_num, UsbModePeripheral);
+			print("hk6: start peripheral %x\n", (uint64_t)s);
+		}
 
 		/*
 		 * CHIRON_HK6_REPICK_AFTER_START
@@ -7067,6 +7091,54 @@ chiron_port_powerdown(void)
  * StartEx never reaches and which has to exist before a host's SETUP packet can arrive.
  * StartController is left to StartEx, where it works -- that is what allocated a102f000.
  */
+/*
+ * CHIRON_STOP_BEFORE_START_EX
+ *
+ * HK6 must call init->start_controller(core 0, peripheral): it is the only call that creates
+ * the peripheral controller at all.  Measured -- with it skipped, the re-pick finds no
+ * peripheral controller and there is nothing to clone onto either ("no host config to clone
+ * on core 0").
+ *
+ * But after it runs, UsbFnIo's StopController answers 7.  StartEx calls StopController first
+ * and takes that as fatal.  So the controller HAS to be stopped before StartEx runs, by
+ * whoever can stop it successfully.
+ *
+ * usb_stop_before_start_ex=1 does exactly that: after HK6 has created the controller and
+ * UsbFnIo exists, call stop_controller once and report the status, then let StartEx do its
+ * own stop/start against a controller that is already down.
+ */
+static void
+chiron_stop_before_start_ex(void)
+{
+	static const efi_guid usbfn_guid = QCOM_USBFN_IO_GUID;
+	efi_usbfn_io *fn = NULL;
+	efi_status st;
+	const uint64_t dwc = 0xA800000ULL;
+
+	if (usb_dev_handle == NULL ||
+	    EFI_ERROR(BS->handle_protocol(usb_dev_handle, &usbfn_guid, (void **)&fn)) ||
+	    fn == NULL || fn->stop_controller == NULL) {
+		print("prestop: no UsbFnIo\n", 0);
+		return;
+	}
+
+	print("prestop: before -> DCTL %x run %x hlt %x ring %x/%x\n",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704),
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) >> 31) & 1),
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) >> 22) & 1),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408));
+
+	st = fn->stop_controller(fn);
+
+	print("prestop: stop_controller %x -> DCTL %x run %x hlt %x ring %x/%x\n", (uint64_t)st,
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704),
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) >> 31) & 1),
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) >> 22) & 1),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408));
+}
+
 static int
 chiron_usbfn_configure_only(void)
 {
@@ -8195,6 +8267,16 @@ usb_start(void)
 				    (c[17] == 0 || c[17] == ' ')) {
 					usb_probe_steps_mode = 1;
 				}
+				/* "usb_stop_before_start_ex=1" is 26 characters */
+				if (starts_with(c, "usb_stop_before_start_ex=1") &&
+				    (c[26] == 0 || c[26] == ' ')) {
+					usb_stop_before_start_ex = 1;
+				}
+				/* "usb_hk6_no_start=1" is 18 characters */
+				if (starts_with(c, "usb_hk6_no_start=1") &&
+				    (c[18] == 0 || c[18] == ' ')) {
+					usb_hk6_no_start = 1;
+				}
 				/* "usb_prestart_ring=1" is 19 characters */
 				if (starts_with(c, "usb_prestart_ring=1") &&
 				    (c[19] == 0 || c[19] == ' ')) {
@@ -8606,6 +8688,9 @@ usb_start(void)
 
 	if (usb_prestart_ring) {
 		chiron_prestart_driver_ring();
+	}
+	if (usb_stop_before_start_ex) {
+		chiron_stop_before_start_ex();
 	}
 
 	chiron_usbfn_handles();

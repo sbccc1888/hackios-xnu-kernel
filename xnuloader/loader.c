@@ -7216,6 +7216,115 @@ chiron_invalidate(void *addr, uint64_t len)
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
+/*
+ * CHIRON_RAW_PUMP
+ *
+ * UsbFnIo's controller entry points in this driver are a stub (nine consecutive slots hold the
+ * same address), and its event handler answers EFI_DEVICE_ERROR because the internal event buffer
+ * pointer that DwcConfigureEventBuffer would have set was never set.  So waiting for the driver to
+ * report bus state is a dead end.
+ *
+ * The controller, however, does post events into the ring this loader programmed -- that was
+ * measured once the cache was invalidated.  Nothing needs the driver to read them.
+ *
+ * This reads them directly and decodes the DWC3 event records:
+ *
+ *   header word:  bits 0..7 event type, bits 16..17 the size code
+ *                 1 = Device, 2 = Command completion, 3 = Transfer
+ *   Device event params word:
+ *                 bit 0 ERR, bit 1 CONNECT, bits 2..3 LINK_STATE, bits 4..7 SPEED
+ *   Transfer event params word:
+ *                 bits 1..5 endpoint number, bits 12..15 status
+ *
+ * Each record is retired by writing its length back to GEVNTCOUNT, which is how the controller
+ * knows the consumer has taken it.
+ */
+static void
+chiron_raw_pump(const char *when, unsigned budget)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t adr = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC400);
+	uint32_t siz = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC408) & 0xffffu;
+	unsigned got = 0, device = 0, transfer = 0, cmdevy = 0, junk = 0;
+	uint32_t rd;
+
+	if (adr == 0 || siz == 0) {
+		return;
+	}
+
+	chiron_invalidate((void *)(uintptr_t)adr, siz);
+
+	/*
+	 * Start at the first non-zero word.  GEVNTCOUNT counts bytes outstanding, but the live
+	 * records in this ring begin partway in -- the dump showed them at +0x18 while the
+	 * buffer start was still zeroed.  Scanning for the first non-zero word is a cheap way to
+	 * find the consumer's real position without tracking a pointer this loader does not own.
+	 */
+	for (rd = 0; rd + 8 <= siz; rd += 4) {
+		if (*(volatile uint32_t *)(uintptr_t)(adr + rd) != 0) {
+			break;
+		}
+	}
+	print("rawd ", 0);
+	print((char *)when, 0);
+	print(": first non-zero at +%x, count was %x\n", (uint64_t)rd,
+	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C) & 0xfffcu));
+
+	for (unsigned i = 0; i < budget && rd + 8 <= siz; i++) {
+		uint32_t hdr = *(volatile uint32_t *)(uintptr_t)(adr + rd);
+		uint32_t params = *(volatile uint32_t *)(uintptr_t)(adr + rd + 4);
+		uint32_t type = hdr & 0xffu;
+		uint32_t sizec = (hdr >> 16) & 0x3u;
+		uint32_t len = 4u + (4u << sizec);
+
+		if (len < 8) {
+			len = 8;
+		}
+
+		if (type == 1) {
+			device++;
+			print("raw ", 0);
+			print((char *)when, 0);
+			print(": DEVICE err %x conn %x link %x speed %x\n",
+			    (uint64_t)(params & 1u), (uint64_t)((params >> 1) & 1u),
+			    (uint64_t)((params >> 2) & 3u), (uint64_t)((params >> 4) & 0xfu));
+		} else if (type == 3) {
+			transfer++;
+			print("raw ", 0);
+			print((char *)when, 0);
+			print(": XFER ep %x status %x\n",
+			    (uint64_t)((params >> 1) & 0x1fu),
+			    (uint64_t)((params >> 12) & 0xfu));
+		} else if (type == 2) {
+			cmdevy++;
+		} else {
+			junk++;
+		}
+
+		/*
+		 * Retire what was consumed.  Only do this for a plausible record: writing a length
+		 * derived from a garbage header would desynchronise the controller's own counter.
+		 */
+		if (type >= 1 && type <= 3) {
+			*(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C) = len;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			got++;
+		}
+		else if (junk > 4) {
+			break;
+		}
+
+		rd += len;
+	}
+
+	print("raw ", 0);
+	print((char *)when, 0);
+	print(": %d taken (%d device, %d xfer, %d cmd, %d junk)\n",
+	    (uint64_t)got, (uint64_t)device, (uint64_t)transfer, (uint64_t)cmdevy,
+	    (uint64_t)junk);
+	flush_log();
+}
+
 static void
 chiron_ring_dump(const char *when)
 {
@@ -7674,6 +7783,47 @@ chiron_fw_vbus(efi_qcom_usb_config *cfg)
  * Both bits are set, so the controller's session-valid input comes from here
  * rather than from a PMIC line that reads zero.
  */
+/*
+ * CHIRON_CLEAR_DISCONNECT
+ *
+ * DCTL bit 28 is DISCONNECT: while it is set the controller keeps itself off the bus, and no
+ * amount of PHY or pull-up work will make a host notice the device.
+ *
+ * The controller has been running this whole session with
+ *
+ *     DCTL = 0x90f00000
+ *              ^-- bit28 set, bit31 RunStop also set
+ *
+ * so the core was running and holding the bus in a forced disconnect at the same time.  That is
+ * why every snapshot read conn 0 while the link reported U0, and why the device events this
+ * loader decoded say err=1 conn=0: the controller was told to stay disconnected.
+ *
+ * Clearing it is a single bit.  The comment records the decode because "0x90f00000 looks fine"
+ * was the reading that let this survive every earlier pass over DCTL.
+ */
+static void
+chiron_clear_disconnect(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t before = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	uint32_t after;
+
+	if ((before & (1u << 28)) == 0) {
+		return;
+	}
+
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = before & ~(1u << 28);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(1000);
+
+	after = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	print("dctl: clear DISCONNECT %x -> %x | DSTS %x conn %x lkst %x\n",
+	    (uint64_t)before, (uint64_t)after,
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C),
+	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) & 7),
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) >> 18) & 0xf));
+}
+
 static void
 chiron_vbus_override(void)
 {
@@ -9106,6 +9256,8 @@ usb_start(void)
 		}
 	}
 
+	chiron_clear_disconnect();
+
 	chiron_ring_dump("pre-start_ex");
 
 	chiron_dwc3_snap("A-before-start_ex");
@@ -9320,6 +9472,7 @@ usb_start(void)
 		s = USB->start_ex(&set);
 		chiron_shim_report();
 		chiron_ring_dump("post-start_ex");
+		chiron_raw_pump("post-start_ex", 32);
 	} else {
 		/*
 		 * CHIRON_HK6_ONLY_STARTS_ITSELF

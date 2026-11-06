@@ -7856,6 +7856,65 @@ chiron_fw_vbus(efi_qcom_usb_config *cfg)
  * sequence, and nothing ever takes the PHY back out of it.  Clear POWER_DOWN and SLEEP_B and drop
  * the clamp, then let the caller re-check the link.
  */
+/*
+ * CHIRON_UPDATE_REF_CLK
+ *
+ * The one step the reference driver does that this loader never did.  dwc3-msm.c,
+ * dwc3_msm_update_ref_clk(), runs right after the PHY is brought up:
+ *
+ *     guctl  = DWC3_GUCTL;
+ *     guctl &= ~DWC3_GUCTL_REFCLKPER;
+ *     guctl |= 52 << __ffs(DWC3_GUCTL_REFCLKPER);      // for utmi_clk_rate 19200000
+ *
+ *     gfladj  = DWC3_GFLADJ;
+ *     gfladj &= ~(DECR | DECR_PLS1 | LPM_SEL | FLADJ);
+ *     gfladj |= 12 << 24;
+ *     gfladj |= BIT(31);
+ *     gfladj |= BIT(23);
+ *     gfladj |= 200 << 8;
+ *
+ * The controller uses REFCLKPER to time UTMI signalling; with the field left at zero the
+ * controller's idea of a bit period is wrong and it will not recognise a device attach -- which
+ * matches the measured state exactly: PHY powered, terminated, PLL locked, link U0, CONNECT clear.
+ *
+ * Register and field definitions from dwc3/core.h on this tree:
+ *     DWC3_GUCTL               0xc12c     DWC3_GUCTL_REFCLKPER   0x3FF << 22
+ *     DWC3_GFLADJ              0xc630     REFCLK_240MHZ_DECR     0x7F  << 24
+ *                                        REFCLK_240MHZDECR_PLS1 1     << 31
+ *                                        REFCLK_LPM_SEL         1     << 23
+ *                                        REFCLK_FLADJ           0x3FFF<< 8
+ *
+ * chiron's QUSB2 reference is 19.2 MHz, so the 19200000 branch applies.
+ */
+static void
+chiron_update_ref_clk(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t guctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC12C);
+	uint32_t gsnps = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC120);
+	uint32_t gfladj = 0;
+	uint32_t guctl_new;
+
+	guctl_new = (guctl & ~(0x3ffu << 22)) | (52u << 22);
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC12C) = guctl_new;
+
+	/* GFLADJ exists from DWC3 revision 2.50a; guard on GSNPSID as the reference does */
+	if (gsnps >= 0x5533250au) {
+		gfladj = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC630);
+		gfladj &= ~((0x7fu << 24) | (1u << 31) | (1u << 23) | (0x3fffu << 8));
+		gfladj |= (12u << 24) | (1u << 31) | (1u << 23) | (200u << 8);
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC630) = gfladj;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(100);
+
+	print("refclk: gsnps %x guctl %x -> %x | gfladj %x | DSTS %x conn %x lkst %x\n",
+	    (uint64_t)gsnps, (uint64_t)guctl, (uint64_t)guctl_new, (uint64_t)gfladj,
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C),
+	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) & 7u),
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) >> 18) & 0xfu));
+}
+
 static void
 chiron_power_up_phy(void)
 {
@@ -9395,6 +9454,7 @@ usb_start(void)
 
 	chiron_pullup_audit("before");
 	chiron_power_up_phy();
+	chiron_update_ref_clk();
 	chiron_enable_termination();
 	chiron_clear_disconnect();
 	chiron_pullup_audit("after-disc");

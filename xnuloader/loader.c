@@ -11061,35 +11061,42 @@ usb_start(void)
 	 */
 	print("usb: device presented (start_ex ok); waiting for the host\n");
 	/*
-	 * CHIRON_ALLOCATE_IS_OUT_OF_TABLE
+	 * CHIRON_TWO_DIFFERENT_PROTOCOLS
 	 *
-	 * This driver publishes nine entry points, ending at EventHandler in slot 0x48.  Everything
-	 * from 0x50 onwards -- transfer, get_max_transfer_size, allocate_transfer_buffer,
-	 * free_transfer_buffer, start_controller, stop_controller and the rest -- is adjacent
-	 * memory that happens to sit after the table.
+	 * An earlier version of this block treated USB as if it were the UsbFnIo table and checked
+	 * slot 0x60 before calling allocate_transfer_buffer.  That was wrong, and worth writing down
+	 * so it is not repeated:
 	 *
-	 * Two things tonight were this exact mistake: calling slot 0x50 executed the string
-	 * "DEV_STATE_DETACHED", and calling slot 0x68 was the fault that ended nearly every run.
-	 * allocate_transfer_buffer is slot 0x60, and it is the last thing usb_start() does:
+	 *   efi_usbfn_io        (the `fn` / `pfn` pointers) -- revision + 9 reachable entries
+	 *   usb_device_protocol (the `USB` pointer)        -- a DIFFERENT protocol, laid out:
 	 *
-	 *     if (EFI_ERROR(USB->allocate_transfer_buffer(...)) || ...) return 0;
+	 *       +0x00 revision
+	 *       +0x08 start
+	 *       +0x10 send
+	 *       +0x18 handle_event
+	 *       +0x20 allocate_transfer_buffer
+	 *       +0x28 free_transfer_buffer
+	 *       +0x30 stop
+	 *       +0x38 abort_xfer
+	 *       +0x40 set_endpoint_stall_state
+	 *       +0x48 start_ex
 	 *
-	 * so a call into adjacent memory is also the most likely reason usb_start() kept returning
-	 * 0 even after start_ex was made to succeed.  A zero return there means the command loop --
-	 * the only place enumeration happens -- is never entered.
+	 * So allocate_transfer_buffer is 0x20 here, not 0x60.  Reading 0x60 read past the end of
+	 * this structure entirely, which would have made the guard reject a perfectly good call.
 	 *
-	 * Check the slot before using it.  If it is not a function, the control path's own buffers
-	 * are used instead: the loop never needs the transfer buffers to poll the controller, only
-	 * to move bulk data, and enumeration comes before any of that.
+	 * The UsbFnIo analysis stands on its own -- that table really does hold nine entries, and
+	 * calling slot 0x50 really did execute "DEV_STATE_DETACHED".  It simply does not describe
+	 * this pointer.
 	 */
-	if (chiron_fnio_slot_is_callable(USB, 0x60)) {
+	if (USB->allocate_transfer_buffer != NULL) {
 		if (EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_rx_buf)) ||
 		    EFI_ERROR(USB->allocate_transfer_buffer(USB_CHUNK, (void **)&usb_tx_buf))) {
-			print("usb: no transfer buffers\n");
-			return 0;
+			print("usb: no transfer buffers; falling back to static ones\n", 0);
+			usb_rx_buf = usb_static_rx;
+			usb_tx_buf = usb_static_tx;
 		}
 	} else {
-		print("usb: allocate_transfer_buffer is slot 0x60, outside the table; using static buffers\n", 0);
+		print("usb: no allocate_transfer_buffer in UsbDevice; using static buffers\n", 0);
 		usb_rx_buf = usb_static_rx;
 		usb_tx_buf = usb_static_tx;
 	}

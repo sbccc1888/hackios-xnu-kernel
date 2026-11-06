@@ -4161,6 +4161,9 @@ static int usb_diag_mode;
 static int usb_no_epcfg_mode;
 /* usb_extra_start=1: also call UsbFnIo::StartController ourselves. */
 static int usb_probe_steps_mode;          /* usb_probe_steps=1: run StartEx's steps one by one */
+static int usb_state_force;              /* usb_state_force=1: force UsbConfig state to 0xf (proven harmful) */
+static int usb_start_first = 1;          /* usb_start_first=0: do not stop/start here, let start_ex do it */
+static int usb_no_ring;                  /* usb_no_ring=1: do not program the event ring, leave it to the driver */
 static int usb_clean_mode;               /* usb_clean=1: let start_ex own the whole bring-up */
 static int usb_rebind_off;              /* usb_rebind=0: do not disconnect before connect */
 static int usb_extra_start_mode;
@@ -4904,6 +4907,219 @@ usb_config_is_peripheral(efi_handle h)
 		return 0;
 	}
 	return cfg->mode_type == UsbModePeripheral || cfg->mode_type == UsbModePeripheralAlt;
+}
+
+/*
+ * CHIRON_USBCONFIG_STATE
+ *
+ * UsbConfigDxe's StartController (RVA 0x4a68) gates everything on a state word it reads at
+ * [module .data + 0x4d0]:
+ *
+ *     4a78:  ldr  x8,  [x0, #0x78]      Dev->Base
+ *     4a7c:  cbz  x8,  0x4ae0           Base NULL -> ASSERT + infinite loop
+ *     4a84:  ldr  w9,  [x9, #0x4d0]     the state word
+ *     4a88:  cmp  w9,  #0xf
+ *     4a8c:  b.ne 0x4b1c               not 15 -> skips the DCTL soft reset
+ *     4a90:  mov  w9,  #0xc704          DCTL
+ *     4a98:  orr  w1,  wzr, #0x40000000 CSFTRST
+ *     ...
+ *     4ab4:  bl   0x4134               the rest of the start sequence
+ *
+ * In the image that word's initial value is 0 and no instruction in UsbConfigDxe writes it, so
+ * something else is supposed to.  Reading it at runtime says whether that something ran:
+ * 15 means the core is in the state StartController expects, 0 means it never will be.
+ *
+ * Also reads [self+0x78], the Base pointer the same code dereferences, so a null there is visible
+ * instead of presenting as a firmware fault.
+ */
+/*
+ * Find UsbConfigDxe by its own .data signature instead of by image size or by the protocol table.
+ *
+ * chiron_is_usb_config() requires image_size == 0x13000 and three exact method RVAs; it matches
+ * when HK6 runs, and returned NULL when called here, which says the loaded image list changed
+ * shape between the two points and the size test is too brittle to rely on twice.  The .data
+ * signature is unambiguous: revision 0x10003 at RVA 0xc160 and the static mode word 4 at 0xc1ec
+ * appear together only in this module.
+ */
+static uint64_t
+chiron_find_usbconfig_base(void)
+{
+	efi_handle *handles = NULL;
+	uint64_t count = 0;
+	uint64_t found = 0;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &EFI_LOADED_IMAGE_GUID, NULL,
+	    &count, &handles))) {
+		return 0;
+	}
+	for (uint64_t i = 0; i < count && found == 0; i++) {
+		efi_loaded_image *li = NULL;
+		uintptr_t base;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &EFI_LOADED_IMAGE_GUID,
+		    (void **)&li)) || li == NULL || li->image_base == NULL) {
+			continue;
+		}
+		base = (uintptr_t)li->image_base;
+		if (li->image_size < 0xc200) {
+			continue;
+		}
+		if (*(volatile uint32_t *)(uintptr_t)(base + 0xc160) == 0x10003u &&
+		    *(volatile uint32_t *)(uintptr_t)(base + 0xc1ec) == 4u) {
+			found = (uint64_t)base;
+		}
+	}
+	if (handles != NULL) {
+		BS->free_pool(handles);
+	}
+	return found;
+}
+
+static void
+chiron_usbconfig_state(const char *when, efi_handle image, uint32_t *out_state, uint64_t *out_base)
+{
+	uintptr_t base;
+	uint32_t st = 0xffffffffu;
+
+	(void)image;
+	base = (uintptr_t)chiron_find_usbconfig_base();
+	if (base == 0) {
+		print("usbcfg ", 0);
+		print((char *)when, 0);
+		print(": UsbConfigDxe not found by signature\n", 0);
+		return;
+	}
+
+	/* .data is at RVA 0xc000 in this build; the word is at +0x4d0 */
+	st = *(volatile uint32_t *)(uintptr_t)(base + 0xc4d0);
+
+	print("usbcfg ", 0);
+	print((char *)when, 0);
+	print(": state %x (~%x) at base %x\n", (uint64_t)st, (uint64_t)(~st), (uint64_t)base);
+
+	/*
+	 * CHIRON_FORCE_CONFIG_STATE
+	 *
+	 * UsbConfigDxe's StartController (0x4a68) reads this word and only takes the real
+	 * start path when it equals 0xf:
+	 *
+	 *     4a84:  ldr  w9, [x9, #0x4d0]
+	 *     4a88:  cmp  w9, #0xf
+	 *     4a8c:  b.ne 0x4b1c        <- not 15: writes GUSB2PHYCFG |= 0x100 and RETURNS SUCCESS
+	 *     4a90:  mov  w9, #0xc704   <- 15: DCTL soft reset, then bl 0x4134
+	 *
+	 * At runtime it reads 0x20, so every StartController call has been taking the do-nothing
+	 * branch -- which is exactly what the logs showed: "start_controller 0" and no effect.
+	 *
+	 * The word is written once by an external protocol callback at 0x1728, whose value we do
+	 * not control.  0xf is what the driver's own start path expects, so set it here and see
+	 * whether the real path then runs.  It does run, and it breaks the link, so this is now
+	 * opt-in: usb_state_force=1.
+	 */
+	if (usb_state_force) {
+		*(volatile uint32_t *)(uintptr_t)(base + 0xc4d0) = 0xfu;
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		print("usbcfg: forced state %x -> %x\n",
+		    (uint64_t)st, (uint64_t)*(volatile uint32_t *)(uintptr_t)(base + 0xc4d0));
+	}
+
+	if (out_state != NULL) {
+		*out_state = st;
+	}
+	if (out_base != NULL) {
+		*out_base = (uint64_t)base;
+	}
+}
+
+/*
+ * CHIRON_PLATFORMINFO_VIEW
+ *
+ * UsbfnDwc3Dxe's own messages say where its failures come from:
+ *
+ *     "%a: Failed to get gEfiPlatformInfoProtocolGuid"
+ *     "%a: Failed to get PlatformInfo"
+ *     "%a: failed to get USB core base address"
+ *
+ * and the shims showed StopController and StartController both returning
+ * EFI_OUT_OF_RESOURCES (7), which is the status those three messages carry.  No core base means
+ * no register access, which means every start path fails while pure lookups still work -- the
+ * exact pattern of every run.
+ *
+ * This reads PlatformInfo from each standpoint that matters, so the question "can the DWC3
+ * driver see it?" becomes a printed fact instead of an assumption:
+ *
+ *   * globally, via locate_protocol          -- does the protocol exist at all
+ *   * on the handle HK6 bound the driver to  -- does THAT handle carry it
+ */
+static void
+chiron_platforminfo_view(void)
+{
+	static const efi_guid pi_guid = {
+		0x157a5c45, 0x21b2, 0x43c5,
+		{0xba, 0x7c, 0x82, 0x2f, 0xee, 0x5f, 0xe5, 0x99}
+	};
+	void *pi = NULL;
+
+	if (EFI_ERROR(BS->locate_protocol(&pi_guid, NULL, &pi)) || pi == NULL) {
+		print("pinfo: locate_protocol -> not found\n", 0);
+	} else {
+		uint64_t ver = *(volatile uint64_t *)(uintptr_t)pi;
+
+		print("pinfo: global %x version %x\n", (uint64_t)(uintptr_t)pi, ver);
+	}
+
+	if (usb_dev_handle == NULL) {
+		print("pinfo: no usb handle yet\n", 0);
+		return;
+	}
+	pi = NULL;
+	if (EFI_ERROR(BS->handle_protocol(usb_dev_handle, &pi_guid, &pi)) || pi == NULL) {
+		/*
+		 * CHIRON_PLATFORMINFO_ON_THE_HANDLE
+		 *
+		 * This is the one thing every failed run tonight had in common.  UsbfnDwc3Dxe's
+		 * own messages name it:
+		 *
+		 *     "%a: Failed to get gEfiPlatformInfoProtocolGuid"
+		 *     "%a: Failed to get PlatformInfo"
+		 *     "%a: failed to get USB core base address"
+		 *
+		 * and the shims measured the consequence: StopController and StartController both
+		 * return EFI_OUT_OF_RESOURCES, ConfigureEnableEndpoints is never reached, and the
+		 * link only stays alive because this loader brought it up by hand.
+		 *
+		 * PlatformInfo does exist globally, so the driver is failing the per-handle lookup.
+		 * Install the global instance on the handle the driver bound to.  Nothing is
+		 * modified -- the same interface pointer is attached to one more handle, which is
+		 * exactly what the driver is asking for.
+		 */
+		void *global_pi = NULL;
+
+		if (!EFI_ERROR(BS->locate_protocol(&pi_guid, NULL, &global_pi)) && global_pi != NULL) {
+			/* EFI_NATIVE_INTERFACE == 0 */
+			efi_status ins = BS->install_protocol_interface(&usb_dev_handle, &pi_guid,
+			    0, global_pi);
+
+			print("pinfo: installed global %x on the usb handle -> %x\n",
+			    (uint64_t)(uintptr_t)global_pi, (uint64_t)ins);
+
+			pi = NULL;
+			if (!EFI_ERROR(BS->handle_protocol(usb_dev_handle, &pi_guid, &pi)) &&
+			    pi != NULL) {
+				print("pinfo: verified, handle now reports %x\n",
+				    (uint64_t)(uintptr_t)pi);
+			} else {
+				print("pinfo: install did not take\n", 0);
+			}
+		} else {
+			print("pinfo: no global PlatformInfo to lend\n", 0);
+		}
+	} else {
+		uint64_t ver = *(volatile uint64_t *)(uintptr_t)pi;
+
+		print("pinfo: on usb handle %x version %x\n", (uint64_t)(uintptr_t)pi, ver);
+	}
 }
 
 static int
@@ -6485,7 +6701,7 @@ chiron_event_arm(void)
 	 * So try to give it one here, before anything is armed.  chiron_ring_takeover() tests
 	 * whether the register is writable and says so either way.
 	 */
-	if (!usb_clean_mode) {
+	if (!usb_clean_mode && !usb_no_ring) {
 		chiron_ring_takeover();
 	}
 
@@ -6966,7 +7182,7 @@ chiron_usbfn_endpoints(void)
 	 * would return early.  The right place is before: stop clears any stale state, then
 	 * configure builds a fresh one.  Nothing may stop the controller afterwards.
 	 */
-	if (fn->stop_controller != NULL) {
+	if (usb_start_first && fn->stop_controller != NULL) {
 		efi_status st = fn->stop_controller(fn);
 
 		print("usbfn: stop_controller ", 0);
@@ -6999,7 +7215,7 @@ chiron_usbfn_endpoints(void)
 	 * configure had just started.  That is why every snapshot read run 0 hlt 1 with a ring
 	 * of zero: the ring was programmed, then wiped by the next soft reset.
 	 */
-	if (fn->start_controller != NULL) {
+	if (usb_start_first && fn->start_controller != NULL) {
 		es = fn->start_controller(fn);
 		print("usbfn: start_controller ", 0);
 		print("%x", (uint64_t)es);
@@ -7368,6 +7584,134 @@ static int usb_force_sdp_off;
  * chiron's DTB says maximum-speed = high-speed and the link measured conn 0 (HighSpeed), so
  * HighSpeed is the right answer for this port.  Answer from the table instead of failing.
  */
+/*
+ * CHIRON_SHIMS
+ *
+ * Probing these from outside the driver is not safe: calling ConfigureEnableEndpoints directly
+ * faulted inside the firmware at elr=0x9bfa6600 far=0x50, because it depends on state the
+ * driver's own startup establishes first.
+ *
+ * A shim avoids that.  It is installed in the copied table, logs, and then calls the vendor
+ * implementation with the arguments it was given -- so the call still runs exactly where and
+ * when the driver intended, and only the return value becomes visible.
+ *
+ * This is how the last unknown steps of StartEx get names instead of guesses.
+ */
+static efi_status (EFIAPI *orig_cfg_eps)(efi_usbfn_io *, efi_usb_device_info *);
+static efi_status (EFIAPI *orig_start_ctrl)(efi_usbfn_io *);
+static efi_status (EFIAPI *orig_stop_ctrl)(efi_usbfn_io *);
+static efi_status (EFIAPI *orig_evt_handler)(efi_usbfn_io *, void *, uint64_t *, void *);
+
+/*
+ * Recorded, not printed.
+ *
+ * The first version of these shims called print() straight from the wrapped entry point, and the
+ * run faulted at elr=0xa100c540 esr=0x96000007 far=0xaf -- inside print's own string handling,
+ * with a garbage pointer.  event_handler in particular runs from the driver's event dispatch,
+ * where calling into this loader's logging is not safe.
+ *
+ * So each shim only stores its status in a static, and the caller prints the whole record once
+ * start_ex has returned and the call stack is back in loader code.
+ */
+static efi_status rec_cfg_eps = 0xdeadbeefull;
+static efi_status rec_start_ctrl = 0xdeadbeefull;
+static efi_status rec_stop_ctrl = 0xdeadbeefull;
+static uint32_t rec_evt_count;
+static uint32_t rec_evt_pending_last;
+
+static efi_status EFIAPI
+shim_cfg_eps(efi_usbfn_io *self, efi_usb_device_info *info)
+{
+	rec_cfg_eps = orig_cfg_eps(self, info);
+	return rec_cfg_eps;
+}
+
+static efi_status EFIAPI
+shim_start_ctrl(efi_usbfn_io *self)
+{
+	rec_start_ctrl = orig_start_ctrl(self);
+	return rec_start_ctrl;
+}
+
+static efi_status EFIAPI
+shim_stop_ctrl(efi_usbfn_io *self)
+{
+	rec_stop_ctrl = orig_stop_ctrl(self);
+	return rec_stop_ctrl;
+}
+
+static efi_status EFIAPI
+shim_evt_handler(efi_usbfn_io *self, void *evt, uint64_t *size, void *data)
+{
+	rec_evt_pending_last = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C);
+	rec_evt_count++;
+	return orig_evt_handler(self, evt, size, data);
+}
+
+static void
+chiron_shim_report(void)
+{
+	print("shim: StopController %x | StartController %x | ConfigureEnableEndpoints %x\n",
+	    (uint64_t)rec_stop_ctrl, (uint64_t)rec_start_ctrl, (uint64_t)rec_cfg_eps);
+	print("shim: EventHandler calls %d last pending %x\n",
+	    (uint64_t)rec_evt_count, (uint64_t)rec_evt_pending_last);
+}
+
+/*
+ * CHIRON_USBFN_HANDLES
+ *
+ * chiron_usbfn_endpoints() calls stop_controller and start_controller on the instance HK6 bound,
+ * and both return 0.  UsbDeviceDxe's StartEx calls the same two functions and both return 7
+ * (EFI_OUT_OF_RESOURCES).  Same driver, same functions, different answers -- so StartEx is
+ * talking to a different instance than the one this loader started.
+ *
+ * That is the same mistake as the original picker, which took locate_protocol's first handle and
+ * got the host controller.  This lists every handle that carries UsbFnIo, with its revision, so
+ * the instance StartEx finds can be identified instead of assumed.
+ */
+static void
+chiron_usbfn_handles(void)
+{
+	static const efi_guid fguid = QCOM_USBFN_IO_GUID;
+	efi_handle *handles = NULL;
+	uint64_t count = 0;
+
+	if (EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &fguid, NULL, &count, &handles))) {
+		print("fnio: no handles\n", 0);
+		return;
+	}
+	print("fnio: %d handle(s) carry UsbFnIo\n", (uint64_t)count);
+
+	for (uint64_t i = 0; i < count; i++) {
+		efi_usbfn_io *fn = NULL;
+		void *first = NULL;
+
+		if (EFI_ERROR(BS->handle_protocol(handles[i], &fguid, (void **)&fn)) ||
+		    fn == NULL) {
+			continue;
+		}
+		first = (void *)(uintptr_t)fn->revision;
+		print("fnio[%d]: handle %x instance %x rev %x %s\n",
+		    i, (uint64_t)(uintptr_t)handles[i], (uint64_t)(uintptr_t)fn,
+		    (uint64_t)(uintptr_t)first,
+		    (handles[i] == usb_dev_handle) ? "<- ours" : "");
+	}
+	if (handles != NULL) {
+		BS->free_pool(handles);
+	}
+
+	/* what locate_protocol -- which StartEx uses -- actually returns */
+	{
+		efi_usbfn_io *by_locate = NULL;
+
+		if (!EFI_ERROR(BS->locate_protocol(&fguid, NULL, (void **)&by_locate)) &&
+		    by_locate != NULL) {
+			print("fnio: locate_protocol gives %x <-- what StartEx will use\n",
+			    (uint64_t)(uintptr_t)by_locate);
+		}
+	}
+}
+
 static efi_status EFIAPI
 usbfn_mps_hs(efi_usbfn_io *self, uint32_t type, uint32_t speed, uint32_t *size)
 {
@@ -7433,6 +7777,16 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 		memcpy(&copy, orig, sizeof(copy));
 		copy.detect_port = usbfn_detect_sdp;
 		copy.get_endpoint_max_packet_size = usbfn_mps_hs;
+
+		orig_cfg_eps = orig->configure_enable_endpoints;
+		orig_start_ctrl = orig->start_controller;
+		orig_stop_ctrl = orig->stop_controller;
+		orig_evt_handler = orig->event_handler;
+
+		copy.configure_enable_endpoints = shim_cfg_eps;
+		copy.start_controller = shim_start_ctrl;
+		copy.stop_controller = shim_stop_ctrl;
+		copy.event_handler = shim_evt_handler;
 		done = 1;
 		print("usbfn: DetectPort replaced with SDP (copy of the vendor table)\n", 0);
 	}
@@ -7559,9 +7913,9 @@ usb_start(void)
 				    (c[11] == 0 || c[11] == ' ')) {
 					usb_sweep_mode = 1;
 				}
-				/* "usb_hk6_only=1" is 15 characters */
+				/* "usb_hk6_only=1" is 14 characters */
 				if (starts_with(c, "usb_hk6_only=1") &&
-				    (c[15] == 0 || c[15] == ' ')) {
+				    (c[14] == 0 || c[15] == ' ')) {
 					usb_hk6_only_mode = 1;
 				}
 				/* "usb_diag=1" is 10 characters */
@@ -7578,6 +7932,29 @@ usb_start(void)
 				if (starts_with(c, "usb_probe_steps=1") &&
 				    (c[17] == 0 || c[17] == ' ')) {
 					usb_probe_steps_mode = 1;
+				}
+				/* "usb_start_first=0" is 17 characters */
+				if (starts_with(c, "usb_start_first=0") &&
+				    (c[17] == 0 || c[17] == ' ')) {
+					usb_start_first = 0;
+					print("usb: stop/start left entirely to start_ex\n", 0);
+				}
+				/* "usb_no_ring=1" is 13 characters */
+				if (starts_with(c, "usb_no_ring=1") &&
+				    (c[13] == 0 || c[13] == ' ')) {
+					usb_no_ring = 1;
+					print("usb: ring takeover disabled -- driver must allocate it\n", 0);
+				}
+				/* "usb_clean=1" is 11 characters */
+				if (starts_with(c, "usb_clean=1") &&
+				    (c[11] == 0 || c[11] == ' ')) {
+					usb_clean_mode = 1;
+					print("usb: clean mode -- ring takeover and RunStop left to the driver\n", 0);
+				}
+				/* "usb_state_force=1" is 17 characters */
+				if (starts_with(c, "usb_state_force=1") &&
+				    (c[17] == 0 || c[17] == ' ')) {
+					usb_state_force = 1;
 				}
 				/* "usb_extra_start=1" is 17 characters */
 				/* "usb_skip_start=1" is 16 characters */
@@ -7928,6 +8305,15 @@ usb_start(void)
 		chiron_pll_resume();
 	}
 
+	{
+		efi_handle cfgimg = chiron_find_image_by_sig(chiron_is_usb_config, NULL);
+
+		chiron_usbconfig_state("pre-start_ex", cfgimg, NULL, NULL);
+	}
+
+	chiron_usbfn_handles();
+	chiron_platforminfo_view();
+
 	chiron_dwc3_snap("A-before-start_ex");
 	/*
 	 * CHIRON_SKIP_START_EX
@@ -8090,6 +8476,7 @@ usb_start(void)
 		}
 
 		s = USB->start_ex(&set);
+		chiron_shim_report();
 	} else {
 		/*
 		 * CHIRON_HK6_ONLY_STARTS_ITSELF
@@ -8143,6 +8530,79 @@ usb_start(void)
 	 * DEVTEN is a controller register; it does not require a running core, so there is
 	 * no reason to arm it afterwards.
 	 */
+
+	/*
+	 * CHIRON_RUNSTOP_AFTER_START_EX
+	 *
+	 * UsbConfigDxe's StartController (0x4a68) does, on the 0xf path:
+	 *
+	 *     DCTL.CSFTRST = 1, wait for the bit to clear   (core soft reset)
+	 *     bl 0x4134                                     (PHY init sequence)
+	 *     return EFI_SUCCESS
+	 *
+	 * and nothing in it sets RunStop.  RunStop comes from ConfigureEnableEndpoints,
+	 * which StartEx calls BEFORE StartController -- so the soft reset stops the core
+	 * that ConfigureEnableEndpoints had just started, and nothing starts it again.
+	 *
+	 * That is exactly what the forced-state run showed:
+	 *     late: driver left the core HALTED  run 0 hlt 1 lkst 4 spd 4
+	 *
+	 * So set RunStop once more after StartEx returns.  It is one bit on a controller
+	 * that has just been fully reset and whose PHY the driver has just programmed.
+	 */
+	if (!usb_pure_mode && !usb_skip_start_mode) {
+		const uint64_t dwc = 0xA800000ULL;
+		uint32_t d = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+
+		/*
+		 * CHIRON_REAPPLY_AFTER_RESET
+		 *
+		 * On the 0xf path, StartController soft-resets the core (DCTL.CSFTRST) and then
+		 * runs the PHY init sequence at 0x4134.  That happens AFTER everything this loader
+		 * programs beforehand, so the clock configuration, the PHY tuning, the VBUS
+		 * override and the DCFG speed correction are all wiped by it.
+		 *
+		 * The forced-state run shows the consequence plainly:
+		 *     snap A   lkst 0 conn 0      <- before start_ex, link up at HighSpeed
+		 *     late     lkst 4 spd 4       <- after start_ex, link down, SuperSpeed
+		 *
+		 * so re-apply the corrections here, after the driver's reset, in the same order
+		 * that produced lkst 0 earlier tonight.
+		 */
+		/*
+		 * The soft reset in StartController returns the PHY to power-on state:
+		 * r04 reads 0x03 instead of 0x13, i.e. PLL_ANALOG_CTRL_TWO lost its value.
+		 * chiron_qusb2_resume() only restores the clock-bypass bit, so run the full
+		 * init sequence again -- the same one that runs before HK6 -- and then the
+		 * corrections on top of it.
+		 */
+		print("post-start_ex: full PHY re-init after the driver's soft reset\n", 0);
+		chiron_qusb2_init();
+		chiron_dwc3_highspeed();
+		chiron_qusb2_resume();
+		chiron_vbus_override();
+		chiron_qusb2_reassert();
+		chiron_pll_resume();
+		uint32_t st2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+
+		if (((d >> 31) & 1) == 0 || ((st2 >> 22) & 1) != 0) {
+			uint32_t reg = d | (1u << 31);
+
+			reg &= ~(0x1fu << 24);
+			reg |= (0x10u << 24);
+			*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = reg;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			chiron_udelay(2000);
+
+			print("post-start_ex RunStop: DCTL %x run %x | DSTS %x hlt %x lkst %x conn %x\n",
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704),
+			    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) >> 31) & 1),
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C),
+			    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) >> 22) & 1),
+			    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) >> 18) & 0xf),
+			    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) & 7));
+		}
+	}
 
 	if (usb_pure_mode) {
 		/*

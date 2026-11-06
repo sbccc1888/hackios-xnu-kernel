@@ -219,7 +219,11 @@ struct efi_driver_binding {
 	efi_handle image_handle;
 	efi_handle driver_binding_handle;
 	efi_status (EFIAPI *supported)(efi_driver_binding *self, efi_handle controller, void *remaining);
-	void *start, *stop;
+	efi_status (EFIAPI *start)(efi_driver_binding *self, efi_handle controller,
+	    const void *path);
+	efi_status (EFIAPI *stop)(efi_driver_binding *self, efi_handle controller,
+	    uint64_t children, efi_handle *child);
+	efi_handle driver_binding_handle2;
 	uint32_t version2;
 };
 

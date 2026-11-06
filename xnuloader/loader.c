@@ -4163,6 +4163,7 @@ static int usb_no_epcfg_mode;
 static int usb_probe_steps_mode;          /* usb_probe_steps=1: run StartEx's steps one by one */
 static int usb_state_force;              /* usb_state_force=1: force UsbConfig state to 0xf (proven harmful) */
 static int usb_stop_before_start_ex;        /* usb_stop_before_start_ex=1: stop once before StartEx */
+static int usb_force_bind;                 /* usb_force_bind=1: call binding->start() directly */
 static int usb_hk6_no_start;               /* usb_hk6_no_start=1: do not start the controller in HK6 */
 static int usb_prestart_ring;              /* usb_prestart_ring=1: let the driver allocate the ring, then hand over */
 static int usb_no_qualifier;              /* usb_no_qualifier=1: omit the device qualifier */
@@ -8453,6 +8454,11 @@ usb_start(void)
 				    (c[26] == 0 || c[26] == ' ')) {
 					usb_stop_before_start_ex = 1;
 				}
+				/* "usb_force_bind=1" is 16 characters */
+				if (starts_with(c, "usb_force_bind=1") &&
+				    (c[16] == 0 || c[16] == ' ')) {
+					usb_force_bind = 1;
+				}
 				/* "usb_hk6_no_start=1" is 18 characters */
 				if (starts_with(c, "usb_hk6_no_start=1") &&
 				    (c[18] == 0 || c[18] == ' ')) {
@@ -8876,6 +8882,43 @@ usb_start(void)
 		efi_handle cfgimg = chiron_find_image_by_sig(chiron_is_usb_config, NULL);
 
 		chiron_usbconfig_state("pre-start_ex", cfgimg, NULL, NULL);
+	}
+
+	/*
+	 * CHIRON_FORCE_BINDING_START
+	 *
+	 * DwcConfigureEventBuffer has never run in any boot, which is why the driver has never
+	 * programmed GEVNTADR and why its event handler has an internal buffer pointer it never
+	 * filled.  That function is reached only from UsbFnDriverBindingStart, and HK6 gets its
+	 * UsbFnIo by connecting the driver to a config record this loader installed -- a path
+	 * that starts the controller but does not necessarily re-enter binding start with
+	 * Dev->Started clear.
+	 *
+	 * So call binding->start() directly, on the handle the driver is bound to.  supported()
+	 * is deliberately not called first: it faults on firmware-created handles (elr=0x30,
+	 * far=0x30) and was removed for that reason.  If the driver is already started, a
+	 * well-behaved binding returns EFI_ALREADY_STARTED and nothing changes; if it is not,
+	 * this is the call that allocates the ring.
+	 *
+	 * usb_force_bind=1 selects it.
+	 */
+	if (usb_force_bind && usb_dev_handle != NULL) {
+		efi_handle dwc3_img = chiron_find_image_by_sig(chiron_is_dwc3, NULL);
+		efi_driver_binding *b = NULL;
+
+		if (dwc3_img != NULL &&
+		    !EFI_ERROR(BS->handle_protocol(dwc3_img, &EFI_DRIVER_BINDING_GUID,
+		    (void **)&b)) && b != NULL && b->start != NULL) {
+			efi_status bst = b->start(b, usb_dev_handle, NULL);
+
+			print("forcebind: binding->start -> %x | ring adr %x sz %x count %x\n",
+			    (uint64_t)bst,
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400),
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408),
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C));
+		} else {
+			print("forcebind: no driver binding available\n", 0);
+		}
 	}
 
 	if (usb_prestart_ring) {

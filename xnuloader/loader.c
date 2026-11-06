@@ -9648,6 +9648,32 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 	return &copy;
 }
 
+
+/*
+ * CHIRON_RING_HAS_EVENTS
+ *
+ * Every USB->handle_event() call in this file was made unconditionally, and the comment at the top
+ * of the type says plainly that it "does not return when no event is pending".  A call that never
+ * returns cannot be recovered from by a budget checked after it, and five of the six call sites had
+ * no budget at all.
+ *
+ * GEVNTCOUNT is this loader's own programming and can be read at any moment.  Zero means there is
+ * nothing for the driver to report, so asking can only cost a call that may never come back.  Check
+ * it before every one of those calls.
+ */
+static int
+chiron_ring_has_events(void)
+{
+	uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C) & 0xfffcu;
+	uint32_t adr = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400);
+	uint32_t siz = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408) & 0xffffu;
+
+	if (cnt != 0 && adr != 0 && siz != 0) {
+		/* the controller DMAs into the ring; the CPU must not read a stale line */
+		chiron_invalidate((void *)(uintptr_t)adr, siz);
+	}
+	return cnt != 0;
+}
 static int
 usb_start(void)
 {
@@ -10906,7 +10932,9 @@ usb_start(void)
 			}
 
 			memset(&d, 0, sizeof(d));
-			USB->handle_event(&m, &sz, &d);
+			if (chiron_ring_has_events()) {
+				USB->handle_event(&m, &sz, &d);
+			}
 			pumped++;
 
 			if (m != UsbDeviceEventNoEvent) {
@@ -10990,7 +11018,9 @@ usb_start(void)
 				}
 
 				memset(&d, 0, sizeof(d));
-				USB->handle_event(&m, &sz, &d);
+				if (chiron_ring_has_events()) {
+					USB->handle_event(&m, &sz, &d);
+				}
 				pumped++;
 
 				if (m != UsbDeviceEventNoEvent) {
@@ -11093,7 +11123,9 @@ usb_wait(uint8_t endpoint)
 			}
 			return -1;
 		}
-		USB->handle_event(&msg, &size, &data);
+		if (chiron_ring_has_events()) {
+			USB->handle_event(&msg, &size, &data);
+		}
 		if (msg == UsbDeviceEventDeviceStateChange) {
 			usb_connected = (data.device_state == UsbDeviceStateConnected);
 			return -1;
@@ -11525,7 +11557,9 @@ usb_poll_command(void)
 		uint64_t freq = READ_SYSREG(CNTFRQ_EL0);
 
 		(void)freq;
-		USB->handle_event(&msg, &size, &data);
+		if (chiron_ring_has_events()) {
+			USB->handle_event(&msg, &size, &data);
+		}
 
 		/*
 		 * If that call was slow, do not compound it; a single call per pass is
@@ -11681,7 +11715,9 @@ usb_command_loop(void)
 			}
 
 			memset(&d, 0, sizeof(d));
-			USB->handle_event(&m, &sz, &d);
+			if (chiron_ring_has_events()) {
+				USB->handle_event(&m, &sz, &d);
+			}
 			pumped++;
 
 			if (m == UsbDeviceEventDeviceStateChange) {

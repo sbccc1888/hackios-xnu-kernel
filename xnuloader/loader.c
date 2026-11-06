@@ -8563,8 +8563,19 @@ chiron_fnio_slot_is_callable(const efi_usbfn_io *fn, unsigned slot_offset)
 	 * shims -- so a legitimate slot was reported "not a function" even though calling it is
 	 * exactly what this loader intends.
 	 */
-	if (!((target >= 0x9b000000ULL && target < 0x9c000000ULL) ||
-	      (target >= 0x10000000ULL && target < 0x20000000ULL))) {
+	/*
+	 * Two ranges are legitimate targets:
+	 *
+	 *   a1xxxxxx  this loader's own code and its shims -- we installed these, they are code
+	 *   9bxxxxxx  the firmware image the vendor's functions live in
+	 *
+	 * Anything else is neither, and returning 0 for it costs one skipped optional call rather
+	 * than a jump into whatever happens to be there.
+	 */
+	if (target >= 0xa1000000ULL && target < 0xa2000000ULL) {
+		return 1;             /* our own code; no need to inspect it */
+	}
+	if (target < 0x9b000000ULL || target >= 0x9c000000ULL) {
 		return 0;
 	}
 

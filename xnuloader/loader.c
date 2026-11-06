@@ -7975,6 +7975,37 @@ static efi_status rec_get_vid_pid = 0xdeadbeefull;
 static efi_status rec_ep_stall = 0xdeadbeefull;
 static uint32_t rec_alloc_xfer_calls;
 
+static efi_status (EFIAPI *orig_transfer)(efi_usbfn_io *, uint32_t, uint32_t,
+    uint64_t *, void *);
+static efi_status (EFIAPI *orig_get_max_sz)(efi_usbfn_io *, uint32_t, uint64_t *);
+static efi_status rec_transfer = 0xdeadbeefull;
+static uint32_t rec_xfer_ep, rec_xfer_dir, rec_xfer_len;
+static uint32_t rec_transfer_calls;
+
+/*
+ * CHIRON_TRANSFER_SHIM
+ *
+ * The event path in UsbfnDwc3Dxe switches on an index in w1 and only accepts 1, 2 or 3; anything
+ * else returns EFI_DEVICE_ERROR before Message is written, which is the 0x2 seen from the event
+ * handler shim all session.  Slot 10 of the protocol table is Transfer, and its vendor address is
+ * the same 0x9bfab924 that appears in the crash traces, so the two are related.
+ *
+ * Recording the arguments of every call through this slot says what the driver is actually being
+ * asked to do, instead of leaving the 1/2/3 constraint as a reading of disassembly.
+ */
+static efi_status EFIAPI
+shim_transfer(efi_usbfn_io *self, uint32_t ep, uint32_t dir, uint64_t *len, void *buf)
+{
+	rec_transfer_calls++;
+	rec_xfer_ep = ep;
+	rec_xfer_dir = dir;
+	rec_xfer_len = (len != NULL) ? (uint32_t)*len : 0xffffffffu;
+
+	rec_transfer = (orig_transfer != NULL) ? orig_transfer(self, ep, dir, len, buf)
+	                                       : 0x8000000000000002ull;
+	return rec_transfer;
+}
+
 static efi_status EFIAPI
 shim_alloc_xfer(efi_usbfn_io *self, uintptr_t size, void **buf)
 {
@@ -8109,6 +8140,9 @@ chiron_shim_report(void)
 	    (uint64_t)rec_alloc_xfer_calls, (uint64_t)rec_alloc_xfer,
 	    (uint64_t)rec_get_dev_info, (uint64_t)rec_get_vid_pid);
 	print("shim: EndpointStallState %x\n", (uint64_t)rec_ep_stall);
+	print("shim: Transfer calls %d ep %x dir %x len %x -> %x\n",
+	    (uint64_t)rec_transfer_calls, (uint64_t)rec_xfer_ep, (uint64_t)rec_xfer_dir,
+	    (uint64_t)rec_xfer_len, (uint64_t)rec_transfer);
 	print("shim: GetEndpointMaxPacketSize calls %d type %x speed %x -> mps %x\n",
 	    (uint64_t)rec_mps_calls, (uint64_t)rec_mps_type, (uint64_t)rec_mps_speed,
 	    (uint64_t)rec_mps_result);
@@ -8282,6 +8316,11 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 		memcpy(&copy, orig, sizeof(copy));
 		copy.detect_port = usbfn_detect_sdp;
 		copy.get_endpoint_max_packet_size = usbfn_mps_hs;
+
+		orig_transfer = orig->transfer;
+		orig_get_max_sz = orig->get_max_transfer_size;
+
+		copy.transfer = shim_transfer;
 
 		orig_alloc_xfer = orig->allocate_transfer_buffer;
 		orig_free_xfer = orig->free_transfer_buffer;

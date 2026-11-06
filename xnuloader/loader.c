@@ -11586,6 +11586,40 @@ efi_main(efi_handle image, efi_system_table *st)
 		} else {
 			print("ENTRY ring: empty or absent\n");
 		}
+
+		/*
+		 * CHIRON_ENTRY_LISTEN
+		 *
+		 * The port at this moment is the one fastboot was using: a ring is programmed, DEVTEN
+		 * is 0x277, a device address is assigned, and the core is idle.  If the host is still
+		 * polling -- and a host with a cable connected generally is -- events will arrive in
+		 * that ring without this loader doing anything at all.
+		 *
+		 * Watch GEVNTCOUNT for a couple of seconds before touching any register.  This is the
+		 * only measurement in the whole investigation taken before the driver resets the
+		 * controller, and it decides whether the work is "keep a live session" or "build a new
+		 * one".
+		 */
+		if (g_entry_evtadr != 0) {
+			uint32_t first = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC40C) & 0xfffcu;
+			uint32_t moved = 0;
+			unsigned polls = 0;
+
+			for (; polls < 2000; polls++) {
+				uint32_t c = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC40C) & 0xfffcu;
+
+				if (c != first) {
+					moved = c;
+					break;
+				}
+				chiron_udelay(1000);
+			}
+
+			print("ENTRY listen: count %x -> %x after %d poll(s)%s\n",
+			    (uint64_t)first, (uint64_t)moved, (uint64_t)polls,
+			    (moved == first) ? " -- host silent" : " -- HOST IS TALKING");
+			flush_log();
+		}
 		g_entry_gctl = gctl0;
 		g_entry_qc1 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x70);
 

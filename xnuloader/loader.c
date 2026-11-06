@@ -11648,6 +11648,38 @@ usb_command_loop(void)
 				break;
 			}
 
+			/*
+			 * CHIRON_DO_NOT_CALL_HANDLE_EVENT_BLIND
+			 *
+			 * The time budget above is checked before this call, which protects against a slow
+			 * call but not against one that never returns.  If handle_event blocks -- and this
+			 * driver has answered every poll tonight with EFI_DEVICE_ERROR or by not coming
+			 * back at all -- then the loop never reaches the check again and the phone goes
+			 * silent with no further log.
+			 *
+			 * So look at the event ring first.  GEVNTCOUNT is this loader's own programming and
+			 * it is readable at any time: if it is zero there is nothing for the driver to
+			 * report, and asking anyway can only cost a call that may not return.  Poll the
+			 * counter cheaply and call the driver only when it has something to say.
+			 */
+			{
+				uint32_t cnt = *(volatile uint32_t *)(uintptr_t)
+				    (0xA800000ULL + 0xC40C) & 0xfffcu;
+
+				if (cnt == 0) {
+					pumped++;
+					if ((pumped % 2000) == 0) {
+						wdt_pet();
+						chiron_invalidate((void *)(uintptr_t)
+						    (*(volatile uint32_t *)(uintptr_t)
+						    (0xA800000ULL + 0xC400)),
+						    *(volatile uint32_t *)(uintptr_t)
+						    (0xA800000ULL + 0xC408) & 0xffffu);
+					}
+					continue;
+				}
+			}
+
 			memset(&d, 0, sizeof(d));
 			USB->handle_event(&m, &sz, &d);
 			pumped++;

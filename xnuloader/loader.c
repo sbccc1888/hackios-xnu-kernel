@@ -4174,6 +4174,8 @@ static int usb_prestart_ring;              /* usb_prestart_ring=1: let the drive
 static int usb_no_qualifier;              /* usb_no_qualifier=1: omit the device qualifier */
 static int usb_no_recover;                /* usb_no_recover=1: return on start_ex failure, no endpoint retry */
 static int usb_noop_startstop;            /* usb_noop_startstop=1: report success for stop/start, let StartEx continue */
+static uint32_t rec_evt_none_taken;
+static int usb_evt_none;               /* usb_evt_none=1: answer success with MsgNone when no events pending */
 static int usb_start_first = 1;          /* usb_start_first=0: do not stop/start here, let start_ex do it */
 static int usb_no_ring;                  /* usb_no_ring=1: do not program the event ring, leave it to the driver */
 static int usb_clean_mode;               /* usb_clean=1: let start_ex own the whole bring-up */
@@ -9303,6 +9305,34 @@ shim_evt_handler(efi_usbfn_io *self, void *evt, uint64_t *size, void *data)
 
 	r = orig_evt_handler(self, evt, size, data);
 
+	/*
+	 * CHIRON_EVT_NONE_IS_NOT_AN_ERROR
+	 *
+	 * StartEx's only use of this call before it gives up is a single poll, and the driver answers
+	 * EFI_DEVICE_ERROR.  Its device status register says why: GEVNTCOUNT is 0, so there is nothing
+	 * to report.  "No events pending" has a defined answer in this protocol -- EFI_SUCCESS with
+	 * EfiUsbMsgNone in *Message -- and erroring instead is what makes StartEx conclude the
+	 * controller is unusable and return without ever configuring endpoints.
+	 *
+	 * So when the vendor function fails and the ring is genuinely empty, say "no event" the way
+	 * the protocol defines it.  This is not papering over a fault: the ring is read here, and the
+	 * answer given matches its contents.
+	 *
+	 * usb_evt_none=1 selects it.
+	 */
+	if (usb_evt_none && EFI_ERROR(r)) {
+		uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C) & 0xfffcu;
+
+		if (cnt == 0 && evt != NULL) {
+			*(uint32_t *)evt = 0;         /* EfiUsbMsgNone */
+			if (size != NULL) {
+				*size = 0;
+			}
+			r = 0;
+			rec_evt_none_taken++;
+		}
+	}
+
 	rec_evt_type = (evt != NULL) ? *(volatile uint32_t *)evt : 0xffffffffu;
 	rec_evt_size_out = (size != NULL) ? (uint32_t)*size : 0xffffffffu;
 	if (data != NULL) {
@@ -9794,6 +9824,12 @@ usb_start(void)
 				    (c[20] == 0 || c[20] == ' ')) {
 					usb_noop_startstop = 1;
 					print("usb: stop/start shimmed to success\n", 0);
+				}
+
+				/* "usb_evt_none=1" is 14 characters */
+				if (starts_with(c, "usb_evt_none=1") &&
+				    (c[14] == 0 || c[14] == ' ')) {
+					usb_evt_none = 1;
 				}
 				/* "usb_start_first=0" is 17 characters */
 				if (starts_with(c, "usb_start_first=0") &&

@@ -8350,6 +8350,56 @@ chiron_power_up_phy(void)
  *
  * CLAMP_N_EN and every other bit in 0x210 are left as found.
  */
+/*
+ * CHIRON_ENABLE_DP_PULLUP
+ *
+ * The measurement that ends the search:
+ *
+ *     level: low 3 high 0  Dp=0 Dm=0
+ *
+ * Both single-ended receivers latch at the low trigger and neither at the high trigger, so D+ and
+ * D- are both solidly low -- driven low, not floating.  A USB2 device announces itself by holding
+ * D+ high through a 1.5k pull-up, so with D+ low there is nothing for any host to detect, and every
+ * other symptom follows from it: no attach, no reset, no SETUP, no SOF, DEVADDR 0.
+ *
+ * The pull-up is a PHY bit, and it had never been set.  From phy-msm-qusb.c:
+ *
+ *     QUSB2PHY_PORT_QC2  0x74
+ *     RDM_UP_EN          BIT(1)    D- pull-up
+ *     RDP_UP_EN          BIT(3)    D+ pull-up
+ *     RPUM_LOW_EN        BIT(4)
+ *     RPUP_LOW_EN        BIT(5)
+ *
+ * The entry snapshot reads "70 ff 74 0": 0x74 is zero, because fastboot had already released the
+ * pull-up on its way out.  That is correct for an idle port and it is the state this loader
+ * inherited.  Nothing in the bring-up ever turned it back on -- the init sequence, the reassert and
+ * the resume path all work on PLL, TUNE and termination, none of which is the pull-up.
+ *
+ * So: for a full-speed device, enable the D+ pull-up.  RDP_UP_EN for FS; RDM_UP_EN is the low-speed
+ * arrangement and is left clear.
+ */
+static void
+chiron_enable_dp_pullup(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+	uint8_t before = *(volatile uint8_t *)(uintptr_t)(phy + 0x74);
+	uint8_t want = (uint8_t)((before | (1u << 3)) & ~(1u << 1));   /* RDP_UP_EN, RDM_UP_EN off */
+
+	if (want == before) {
+		print("dpup: 74 already %x\n", (uint64_t)before);
+		return;
+	}
+
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x74) = want;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(2000);
+
+	print("dpup: 74 %x -> %x (RDP_UP_EN %x)\n",
+	    (uint64_t)before, (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x74),
+	    (uint64_t)((*(volatile uint8_t *)(uintptr_t)(phy + 0x74) >> 3) & 1u));
+	flush_log();
+}
+
 static void
 chiron_phy_follows_core(void)
 {
@@ -8402,12 +8452,24 @@ chiron_sof_watch(const char *when, unsigned ms)
 		chiron_udelay(10000);
 	}
 
+	/*
+	 * CHIRON_SOFN_READS_BACKWARDS
+	 *
+	 * This used to conclude "host cannot see us" when the frame counter did not move.
+	 * That does not follow.  A USB host only emits SOFs while it believes a device is
+	 * attached, so a stationary SOFFN means the host is not transmitting at all -- it
+	 * cannot separate "the host has not noticed us" from "the host is asleep".
+	 *
+	 * Worse, the entry snapshot read SOFFN as 4995 and this reads 0.  A live frame
+	 * counter does not run backwards; that value is a latched remnant of the session
+	 * fastboot left behind.
+	 *
+	 * Report the number and draw no conclusion from it.
+	 */
 	print("sof ", 0);
 	print((char *)when, 0);
-	print(": frame %x -> %x over %d ms%s | DSTS %x\\n",
-	    (uint64_t)f0, (uint64_t)f1, (uint64_t)waited,
-	    (f1 == f0) ? " -- NO SOF, host cannot see us" : " -- SOF ARRIVING, host sees us",
-	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C));
+	print(": frame %x -> %x over %d ms (moved %s)\n",
+	    (uint64_t)f0, (uint64_t)f1, (uint64_t)waited, (f1 == f0) ? "no" : "yes");
 	flush_log();
 }
 
@@ -10363,7 +10425,18 @@ usb_start(void)
 		chiron_shim_report();
 		chiron_ring_dump("post-start_ex");
 	chiron_phy_follows_core();
-	chiron_sof_watch("after-phyup", 500);
+	/*
+	 * CHIRON_LEVEL_IS_HOST_INDEPENDENT
+	 *
+	 * chiron_qusb2_report_levels() had been written and never called.  Unlike SOFFN it needs
+	 * nothing from the host: the QUSB2 single-ended receivers latch each data line's level by
+	 * themselves, so this answers "is D+ being pulled up" whether or not a PC has noticed.
+	 * That is the question the SOF counter was asked and could not answer.
+	 */
+	chiron_qusb2_report_levels();
+	chiron_enable_dp_pullup();
+	chiron_qusb2_report_levels();
+	chiron_sof_watch("after-dpup", 500);
 		chiron_raw_pump("post-start_ex", 32);
 	} else {
 		/*

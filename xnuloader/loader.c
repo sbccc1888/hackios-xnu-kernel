@@ -4163,7 +4163,8 @@ static int usb_no_epcfg_mode;
 static int usb_probe_steps_mode;          /* usb_probe_steps=1: run StartEx's steps one by one */
 static int usb_state_force;              /* usb_state_force=1: force UsbConfig state to 0xf (proven harmful) */
 static int usb_stop_before_start_ex;        /* usb_stop_before_start_ex=1: stop once before StartEx */
-static uint8_t g_entry_tune1, g_entry_qc1;   /* PHY values as the firmware left them */
+static uint8_t g_entry_tune1, g_entry_qc1;
+static uint32_t g_entry_gctl;   /* PHY values as the firmware left them */
 static int usb_force_bind;                 /* usb_force_bind=1: call binding->start() directly */
 static int usb_hk6_no_start;               /* usb_hk6_no_start=1: do not start the controller in HK6 */
 static int usb_prestart_ring;              /* usb_prestart_ring=1: let the driver allocate the ring, then hand over */
@@ -6076,12 +6077,23 @@ chiron_qusb2_resume(void)
 static void
 chiron_qusb2_reassert(void)
 {
+		/*
+		 * CHIRON_REASSERT_NO_TUNE1
+		 *
+		 * The TUNE1 entry is gone.  This table used to write 0xa5 into 0x23C on every
+		 * reassert, which is the same value chiron_efuse_tune1() then folds into 0x45 --
+		 * while the entry snapshot consistently reads 0xf0, the value a working fastboot
+		 * session leaves behind.  So the reassert was undoing, once per pass, the
+		 * restoration done right after init.
+		 *
+		 * The rest of the sequence stays: it re-establishes the PLL programming after a
+		 * driver soft reset, which is what this function exists for.
+		 */
 		static const uint32_t seq[][2] = {
 		{0x13, 0x004},   /* analog_controls_two */
 		{0x7c, 0x18c},   /* pll_clock_inverter */
 		{0x80, 0x02c},   /* pll_cmode */
 		{0x0a, 0x184},   /* pll_lock_delay */
-		{0xa5, 0x23c},   /* tune1, efuse trim folded in afterwards */
 		{0x09, 0x240},   /* tune2 */
 		/*
 		 * 0xB4 omitted here for the same reason it was removed from
@@ -6109,6 +6121,10 @@ chiron_qusb2_reassert(void)
 	*(volatile uint8_t *)(uintptr_t)(phy + 0x24C) = 0x90;
 	__asm__ volatile ("dsb sy" ::: "memory");
 
+	if (g_entry_tune1 != 0) {
+		*(volatile uint8_t *)(uintptr_t)(phy + 0x23C) = g_entry_tune1;
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
 	print("phy: reasserted, tune ", 0);
 	print("%x", (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x23C));
 	print(" ", 0);
@@ -8183,6 +8199,39 @@ chiron_reattach(void)
 	flush_log();
 }
 
+/*
+ * CHIRON_RESTORE_GCTL
+ *
+ * Comparing GCTL at entry against GCTL after the driver starts the core shows one bit lost:
+ *
+ *     entry 0x00112000   bits 13 (PRTCAP high), 16, 20
+ *     after 0x00102000   bits 13, 20
+ *
+ * bit 16 is DWC3_GCTL_U2RSTECN.  PRTCAP (bits 13:12) reads 2 = device in both, so the mode is
+ * not in question; the difference is this one USB2 timing control, which the firmware had set and
+ * the driver's start path cleared.  It is a USB2-only bit, and this port is USB2-only, so put back
+ * whatever the entry snapshot had rather than letting a start path written for SuperSpeed decide.
+ */
+static void
+chiron_restore_gctl(uint32_t entry_gctl)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t now = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC110);
+	uint32_t want;
+
+	/* only bit 16 is in scope: PRTCAP and the rest are left as the driver set them */
+	if ((entry_gctl & (1u << 16)) == 0 || (now & (1u << 16)) != 0) {
+		return;
+	}
+
+	want = now | (1u << 16);
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC110) = want;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("gctl: U2RSTECN %x -> %x\n",
+	    (uint64_t)now, (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC110));
+}
+
 static void
 chiron_step(const char *what)
 {
@@ -8201,32 +8250,31 @@ chiron_step(const char *what)
 static void
 chiron_match_speed(void)
 {
+	/*
+	 * CHIRON_SPEED_IS_A_RESULT_NOT_A_TARGET
+	 *
+	 * This used to read DSTS.CONNECTSPD and force DCFG.DevSpd to match it.  The entry
+	 * snapshot shows why that is backwards:
+	 *
+	 *     entry   DCFG 0x00480890  speed = 0 (HighSpeed)   devaddr = 0x12
+	 *             DSTS 0x00d2c4c1  conn 1  lkst 4  CONNECTSPD = 1 (FullSpeed)
+	 *
+	 * DCFG said HighSpeed, and the device nevertheless connected at FullSpeed -- the core
+	 * tried the high-speed chirp, the host or the cable could not answer it, and the device
+	 * fell back to full speed exactly as USB2 requires.  A working session, address assigned.
+	 *
+	 * CONNECTSPD is the *outcome* of that fallback.  Copying it into DCFG turns a derived
+	 * value into a command, and it also undoes chiron_dwc3_highspeed(), which had correctly
+	 * left DCFG at HighSpeed.  So this now reports and leaves DCFG alone: HighSpeed in DCFG
+	 * means "chirp, then fall back", which is the behaviour that works here.
+	 */
 	const uint64_t dwc = 0xA800000ULL;
-	uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
-	uint32_t want = dsts & 7u;
 	uint32_t dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
-	uint32_t now = dcfg & 7u;
+	uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
 
-	if (want > 3u) {
-		print("speed: DSTS speed %x not usable, left DCFG at %x\n",
-		    (uint64_t)want, (uint64_t)now);
-		return;
-	}
-
-	if (want == now) {
-		print("speed: DCFG already %x\n", (uint64_t)now);
-		return;
-	}
-
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) = (dcfg & ~7u) | want;
-	__asm__ volatile ("dsb sy" ::: "memory");
-	chiron_udelay(100);
-
-	print("speed: DSTS said %x, DCFG %x -> %x | DSTS now %x conn %x\n",
-	    (uint64_t)want, (uint64_t)now,
-	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC700) & 7u),
-	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C),
-	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) & 1u));
+	print("speed: DCFG %x (speed %x) left alone | DSTS CONNECTSPD %x conn %x\n",
+	    (uint64_t)dcfg, (uint64_t)(dcfg & 7u),
+	    (uint64_t)(dsts & 7u), (uint64_t)(dsts & 1u));
 }
 
 static void
@@ -9861,6 +9909,7 @@ usb_start(void)
 	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB8) = 0x00;
 	__asm__ volatile ("dsb sy" ::: "memory");
 	chiron_linestate("after-clear");
+	chiron_restore_gctl(g_entry_gctl);
 	chiron_update_ref_clk();
 	chiron_step("after-refclk");
 	chiron_enable_termination();
@@ -11362,6 +11411,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		 * with.  Keep both, so the init can put back what was actually there.
 		 */
 		g_entry_tune1 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x23C);
+		g_entry_gctl = gctl0;
 		g_entry_qc1 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x70);
 
 		print("ENTRY: phy f4 %x f0 %x d+ %x d- %x | 210 %x 1a0 %x c0 %x\n",

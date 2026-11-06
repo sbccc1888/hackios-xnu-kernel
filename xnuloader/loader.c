@@ -7801,6 +7801,143 @@ chiron_fw_vbus(efi_qcom_usb_config *cfg)
  * Clearing it is a single bit.  The comment records the decode because "0x90f00000 looks fine"
  * was the reading that let this survive every earlier pass over DCTL.
  */
+/*
+ * CHIRON_DEVICE_PULLUP_AUDIT
+ *
+ * The controller reports CONNECT clear while the link reads U0, and DCTL.DISCONNECT is no longer
+ * the reason.  For a USB2 device to be seen at all, the PHY has to be driving the D+ pull-up, and
+ * that depends on three independent things this loader can read:
+ *
+ *   GUSB2PHYCFG (0xC200)  bit 6 SUSPHY   -- 1 parks the PHY in suspend, which drops D+
+ *                         bit 8 ULPIAUTOABSUSP / bit 12 PHYSLEEP-ish bits also matter
+ *   DCFG         (0xC700) bits 2:0 speed -- must be 0 (HighSpeed) on this port
+ *   QUSB2 UTMI_CTRL1 (0xC0)
+ *                         bit 4 TERM_SELECT -- 1 enables the HS termination, which is what puts
+ *                         a current through D+ and lets a host notice
+ *
+ * An earlier log line, "port: c0 0->0", says UTMI_CTRL1 bit 4 has been 0 throughout.  Print all
+ * three so the state is a number instead of a recollection.
+ */
+/*
+ * CHIRON_ENABLE_TERMINATION
+ *
+ * The one thing missing for the device to be visible at all.  Measured, twice per run:
+ *
+ *     pull before:  utmi1 0  term 0 xcvr 0
+ *     pull after:   utmi1 0  term 0 xcvr 0
+ *
+ * QUSB2 UTMI_CTRL1 (PHY + 0xC0):
+ *     bit 4  TERM_SELECT      HS termination enabled -- the current through D+ that a host
+ *                             sees as an attached device
+ *     bit 2  XCVR_SELECT_FS   1 selects the full-speed transceiver
+ *     bit 0  OP_MODE_NON_DRIVE
+ *
+ * With TERM_SELECT clear the PHY never drives the pull-up, so DCTL.DISCONNECT, RunStop, the link
+ * state and every PHY init step are irrelevant: there is nothing on the wire to detect.  That is
+ * consistent with the controller's own device events reporting CONNECT clear, and with every
+ * snapshot reading conn 0 while lkst showed U0 -- U0 is the internal state, not a host handshake.
+ *
+ * phy-msm-qusb-v2.c sets TERM_SELECT for high-speed operation; this port never did.
+ */
+/*
+ * CHIRON_POWER_UP_PHY
+ *
+ * PORT_POWERDOWN (PHY + 0xB4) has been 0x23 every time it was read:
+ *
+ *     bit 0  POWER_DOWN   1 = the PHY is powered down
+ *     bit 1  SLEEP_B      1 = sleep
+ *     bit 5  CLAMP_N_EN   1 = clamp enabled
+ *
+ * 0x23 = 0b0010_0011 sets POWER_DOWN, SLEEP_B and CLAMP_N_EN together.  A powered-down, clamped
+ * PHY cannot drive D+ no matter what TERM_SELECT says, which is why setting the termination bit
+ * changed utmi1 but not CONNECT.
+ *
+ * chiron_port_powerdown() in this loader deliberately asserts this state as part of the init
+ * sequence, and nothing ever takes the PHY back out of it.  Clear POWER_DOWN and SLEEP_B and drop
+ * the clamp, then let the caller re-check the link.
+ */
+static void
+chiron_power_up_phy(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+	uint8_t before = *(volatile uint8_t *)(uintptr_t)(phy + 0xB4);
+	uint8_t value = before & ~((1u << 0) | (1u << 1) | (1u << 5));
+	uint8_t after;
+	unsigned i;
+
+	if (value == before) {
+		return;
+	}
+
+	*(volatile uint8_t *)(uintptr_t)(phy + 0xB4) = value;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(2000);
+
+	after = *(volatile uint8_t *)(uintptr_t)(phy + 0xB4);
+
+	print("pwrup: b4 %x -> %x (pdown %x) | pll %x utmi1 %x\n",
+	    (uint64_t)before, (uint64_t)after, (uint64_t)(after & 1u),
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x1A0),
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xC0));
+
+	/* let the PHY settle and watch the controller for the attach while it does */
+	for (i = 0; i < 20; i++) {
+		uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC70C);
+
+		if ((dsts & 7u) != 4u) {          /* not DISCONNECT any more */
+			print("pwrup: link changed after %d ms -> DSTS %x conn %x lkst %x\n",
+			    (uint64_t)(i * 5), (uint64_t)dsts,
+			    (uint64_t)(dsts & 7u), (uint64_t)((dsts >> 18) & 0xfu));
+			break;
+		}
+		chiron_udelay(5000);
+	}
+}
+
+static void
+chiron_enable_termination(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+	uint8_t before = *(volatile uint8_t *)(uintptr_t)(phy + 0xC0);
+	uint8_t value = before | (1u << 4);        /* TERM_SELECT */
+
+	if ((before & (1u << 4)) != 0) {
+		return;
+	}
+
+	*(volatile uint8_t *)(uintptr_t)(phy + 0xC0) = value;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(100);
+
+	print("term: utmi1 %x -> %x (TERM_SELECT)\n",
+	    (uint64_t)before, (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xC0));
+}
+
+static void
+chiron_pullup_audit(const char *when)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	const uint64_t phy = 0xC012000ULL;
+	uint32_t phycfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC200);
+	uint32_t dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
+	uint8_t utmi1 = *(volatile uint8_t *)(uintptr_t)(phy + 0xC0);
+	uint8_t utmi2 = *(volatile uint8_t *)(uintptr_t)(phy + 0xC4);
+	uint8_t pwrdn = *(volatile uint8_t *)(uintptr_t)(phy + 0xB4);
+	uint8_t tune1 = *(volatile uint8_t *)(uintptr_t)(phy + 0x23C);
+
+	print("pull ", 0);
+	print((char *)when, 0);
+	print(": phycfg %x susphy %x | dcfg %x spd %x | utmi1 %x term %x xcvr %x\n",
+	    (uint64_t)phycfg, (uint64_t)((phycfg >> 6) & 1u),
+	    (uint64_t)dcfg, (uint64_t)(dcfg & 7u),
+	    (uint64_t)utmi1, (uint64_t)((utmi1 >> 4) & 1u), (uint64_t)((utmi1 >> 2) & 1u));
+	print("pull ", 0);
+	print((char *)when, 0);
+	print(": utmi2 %x ulpi %x | pwrdn %x pdown %x | tune1 %x\n",
+	    (uint64_t)utmi2, (uint64_t)((utmi2 >> 7) & 1u),
+	    (uint64_t)pwrdn, (uint64_t)(pwrdn & 1u), (uint64_t)tune1);
+}
+
 static void
 chiron_clear_disconnect(void)
 {
@@ -9256,7 +9393,11 @@ usb_start(void)
 		}
 	}
 
+	chiron_pullup_audit("before");
+	chiron_power_up_phy();
+	chiron_enable_termination();
 	chiron_clear_disconnect();
+	chiron_pullup_audit("after-disc");
 
 	chiron_ring_dump("pre-start_ex");
 

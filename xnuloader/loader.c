@@ -7623,7 +7623,11 @@ chiron_ring_dump(const char *when)
 	}
 }
 
+/* CHIRON_FNIO_SLOT_IS_CALLABLE is defined later; the configure path needs it first. */
+static int chiron_fnio_slot_is_callable(const efi_usbfn_io *fn, unsigned slot_offset);
+
 static int
+
 chiron_usbfn_configure_only(void)
 {
 	static const efi_guid usbfn_guid = QCOM_USBFN_IO_GUID;
@@ -7693,6 +7697,39 @@ chiron_usbfn_configure_only(void)
 
 	dev_info.device_descriptor = &dev_desc;
 	dev_info.config_info_table = cfg_table;
+
+	/*
+	 * CHIRON_CFGONLY_CHECKS_THE_SLOT
+	 *
+	 * Slot 0x10 is inside the nine entries this driver publishes, so it is a real function and
+	 * the call is legitimate.  What makes it fault is the state: according to the probe, StartEx
+	 * returns EFI_DEVICE_ERROR before ever reaching this call, and the comment at the probe says
+	 * ConfigureEnableEndpoints is not re-entrant -- it relies on state only the driver's own start
+	 * path establishes.
+	 *
+	 * So check the slot is callable, then make the call, and if it faults the exception handler
+	 * reports where rather than taking the whole run with it.  The check below is cheap and stops
+	 * the case that cost the last several runs: a table that is shorter than the header claims,
+	 * with adjacent data in the slot.
+	 */
+	{
+		uint64_t tgt = *(volatile uint64_t *)(const void *)((const uint8_t *)fn + 0x10);
+		uint32_t w = 0;
+
+		if (tgt >= 0x1000ULL && tgt < 0x8000000000ULL) {
+			w = *(volatile uint32_t *)(uintptr_t)tgt;
+		}
+		print("cfgonly: fn %x slot10 %x word %x\n",
+		    (uint64_t)(uintptr_t)fn, tgt, (uint64_t)w);
+
+		if (!chiron_fnio_slot_is_callable(fn, 0x10)) {
+			print("cfgonly: ConfigureEnableEndpoints slot 0x10 is not a function, skipped\n", 0);
+			return 0;
+		}
+	}
+
+	print("cfgonly: calling ConfigureEnableEndpoints on %x\n", (uint64_t)(uintptr_t)fn);
+	flush_log();
 
 	ce = fn->configure_enable_endpoints(fn, &dev_info);
 	print("cfgonly: ConfigureEnableEndpoints %x\n", (uint64_t)ce);
@@ -8464,6 +8501,113 @@ chiron_enable_dp_pullup(void)
 	    (uint64_t)before, (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x74),
 	    (uint64_t)((*(volatile uint8_t *)(uintptr_t)(phy + 0x74) >> 3) & 1u));
 	flush_log();
+}
+
+/*
+ * CHIRON_FNIO_SLOT_IS_CALLABLE
+ *
+ * This driver's UsbFnIo table is shorter than EFIUsbfnIo.h describes, and calling past its end is
+ * what faults.
+ *
+ * Dumping the table slot by slot and looking at the bytes each pointer targets showed where it
+ * stops:
+ *
+ *     +0x00 10000001   revision
+ *     +0x08 9bfa6478   [fc 6f ba a9]  DetectPort
+ *     +0x10 9bfa65cc   [f4 4f be a9]  ConfigureEnableEndpoints
+ *     +0x18 9bfa6660   [f8 5f bc a9]  GetEndpointMaxPacketSize
+ *     +0x20 9bfa69ec   [f6 57 bd a9]  GetDeviceInfo
+ *     +0x28 9bfa6a6c   [f4 4f be a9]  GetVendorIdProductId
+ *     +0x30 9bfa6ac8   [f4 4f be a9]  AbortTransfer
+ *     +0x38 9bfa6b9c   [f4 4f be a9]  GetEndpointStallState
+ *     +0x40 9bfa6bf8   [f4 4f be a9]  SetEndpointStallState
+ *     +0x48 9bfa6c5c   [f6 57 bd a9]  EventHandler
+ *     +0x50 9bfab924   [44 45 56 5f]  "DEV_..."  <- a string, so the table ends here
+ *
+ * Nine function pointers, then a literal pool.
+ *
+ * Everything at +0x50 and beyond is therefore somebody else's memory.  The earlier reading of
+ * "free_transfer_buffer is 9bfa7500, same as start_controller and stop_controller, so those must be
+ * shared stubs" was wrong: 9bfa7500 is simply what the adjacent data happens to hold, and it does
+ * point at real code, which is why it looked plausible.  Calling it hands a function an argument list
+ * it was never written for.
+ *
+ * That is precisely how this run died.  The step probe finishes with
+ *
+ *     if (cbuf != NULL) { pfn->free_transfer_buffer(pfn, cbuf); }
+ *
+ * free_transfer_buffer is slot 0x68 -- past the end -- so the fault at elr=0x9bfab924 came from
+ * calling data, not from anything wrong with the buffer.
+ *
+ * So: before calling through a slot, check that its target really is code in the firmware image.  A
+ * real entry point begins with an AArch64 prologue (stp x29/x30 or a stp of callee-saved registers);
+ * a string literal begins with a length byte and ASCII.  Testing the first word and requiring it to
+ * look like a prologue is enough to tell "function" from "adjacent data".
+ */
+static int
+chiron_fnio_slot_is_callable(const efi_usbfn_io *fn, unsigned slot_offset)
+{
+	uint64_t target;
+	const uint8_t *p;
+	uint32_t insn, opc;
+
+	if (fn == NULL) {
+		return 0;
+	}
+
+	target = *(const uint64_t *)(const void *)((const uint8_t *)fn + slot_offset);
+	/*
+	 * Accept both the firmware image and this loader's own code, because the table handed to
+	 * StartEx is a copy whose entries point at loader-side shims (a100xxxx) as well as at the
+	 * vendor's functions (9bfa).  An earlier version only accepted 9b......, which rejected the
+	 * shims -- so a legitimate slot was reported "not a function" even though calling it is
+	 * exactly what this loader intends.
+	 */
+	if (!((target >= 0x9b000000ULL && target < 0x9c000000ULL) ||
+	      (target >= 0x10000000ULL && target < 0x20000000ULL))) {
+		return 0;
+	}
+
+	p = (const uint8_t *)(uintptr_t)target;
+	insn = *(const uint32_t *)p;
+
+	/*
+	 * AArch64 prologue as clang emits it here: ble/msvcvault variants aside, the first
+	 * instructions are stp x29, x30, [sp, #-N]!  or stp x19..x28 into [sp, #..].  Both encode
+	 * with bits 30:27 = 1010 (STP) after the 01 prefix.  Check the top byte loosely: 0xa9xxxxxx
+	 * covers stp/ldp pre/post-index forms, 0xf4/0xf6/0xf8/0xfc cover the stp rN,rM,[sp,#..]
+	 * forms this build actually uses.
+	 */
+	/*
+	 * CHIRON_PROLOGUE_TEST_TOO_NARROW
+	 *
+	 * The first version of this required the first instruction to look like a stp prologue.  That
+	 * rejected a legitimate entry: the shim table's ConfigureEnableEndpoints slot points at
+	 * a100f578, one of this loader's own functions, whose first word is 0xf81f0ffe -- a store,
+	 * not a prologue, because a leaf function saves nothing.
+	 *
+	 * So the test cannot be "does it start like a prologue".  What actually distinguishes a
+	 * function from the data that follows the table is range plus a coarse sanity check on the
+	 * word: real AArch64 instructions are never all-printable ASCII, and the word sitting at
+	 * 0x9bfab924 is 0x5f564544 -- "DEV_" -- whose four bytes are all in the printable range.
+	 *
+	 * Reject that pattern specifically, and accept everything else inside a code range.
+	 */
+	{
+		unsigned printable = 0;
+
+		for (unsigned k = 0; k < 4; k++) {
+			unsigned ch = (insn >> (k * 8)) & 0xffu;
+
+			if (ch >= 0x20 && ch <= 0x7e) {
+				printable++;
+			}
+		}
+		if (printable == 4) {
+			return 0;             /* all four bytes printable ASCII: a string, not code */
+		}
+	}
+	return 1;
 }
 
 static void
@@ -10433,8 +10577,19 @@ usb_start(void)
 					print("step: StartController %x\n", (uint64_t)ps);
 				}
 
-				if (cbuf != NULL) {
+				/*
+				 * CHIRON_FREE_IS_OUT_OF_TABLE
+				 *
+				 * free_transfer_buffer lives at slot 0x68, past the nine entries this
+				 * driver actually publishes.  Calling it reads adjacent memory and jumps
+				 * to whatever it holds -- the fault at elr=0x9bfab924 recorded by this
+				 * probe.  Skip it unless the slot really holds code.
+				 */
+				if (cbuf != NULL &&
+				    chiron_fnio_slot_is_callable(pfn, 0x68)) {
 					pfn->free_transfer_buffer(pfn, cbuf);
+				} else if (cbuf != NULL) {
+					print("step: FreeTransferBuffer slot 0x68 is not a function, skipped\n", 0);
 				}
 			}
 		}

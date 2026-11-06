@@ -4165,7 +4165,9 @@ static int usb_state_force;              /* usb_state_force=1: force UsbConfig s
 static int usb_stop_before_start_ex;        /* usb_stop_before_start_ex=1: stop once before StartEx */
 static uint8_t g_entry_tune1, g_entry_qc1;
 static uint32_t g_entry_gctl;
-static uint8_t g_entry_p210;   /* PHY values as the firmware left them */
+static uint8_t g_entry_p210;
+static uint32_t g_entry_evtadr, g_entry_evtsiz, g_entry_evtcnt, g_entry_devten;
+static uint32_t g_entry_dctl, g_entry_dcfg;   /* PHY values as the firmware left them */
 static int usb_force_bind;                 /* usb_force_bind=1: call binding->start() directly */
 static int usb_hk6_no_start;               /* usb_hk6_no_start=1: do not start the controller in HK6 */
 static int usb_prestart_ring;              /* usb_prestart_ring=1: let the driver allocate the ring, then hand over */
@@ -6711,6 +6713,60 @@ chiron_ring_takeover(void)
 	uint32_t siz   = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC408);
 	uint32_t probe;
 
+	/*
+	 * CHIRON_KEEP_THE_FIRMWARE_RING
+	 *
+	 * The entry snapshot shows the firmware had already built a working event ring:
+	 *
+	 *     ENTRY: evtadr 99f2a000 evtsiz 80001000 evtcnt 0 devten 277
+	 *
+	 * 0x99f2a000 is a real DMA buffer the firmware allocated, GEVNTSIZ is the vendor pattern
+	 * (INTMASK | 4096), and DEVTEN is 0x277 -- bits 0,1,2,4,5,9.  This loader's own arming
+	 * writes 0xf, which covers bits 0,1,2,3: it drops bit 4 (LKSTS, link state change) and
+	 * bit 5 (SOF), exactly the two the port needs to report that a host is talking to it.
+	 *
+	 * Replacing that ring with a static array and a narrower DEVTEN was the ordering mistake:
+	 * the working configuration existed first, and this program threw it away and rebuilt a
+	 * weaker one.  Keep what is there.
+	 *
+	 * The write test is skipped entirely when a ring is already present, because it overwrites
+	 * GEVNTADR with a magic value -- a destructive probe of a register the controller is
+	 * actively using.
+	 */
+	if (adrlo != 0 && (siz & 0xffffu) != 0) {
+		print("ring: firmware ring already present, adr %x siz %x cnt %x -- left alone\n",
+		    (uint64_t)adrlo, (uint64_t)siz,
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C));
+		return;
+	}
+
+	/*
+	 * CHIRON_RESTORE_FIRMWARE_RING
+	 *
+	 * GEVNTADR reads 0 here because HK6's StartController cleared it, but the entry snapshot
+	 * caught the firmware's own ring before that happened:
+	 *
+	 *     ENTRY: evtadr 99f28000 evtsiz 80001000 devten 277
+	 *
+	 * That buffer is the one the working fastboot session was using -- allocated by the
+	 * firmware, sized the way the vendor driver sizes it, and still mapped.  Putting it back
+	 * restores the configuration instead of substituting this loader's static array for it.
+	 *
+	 * The static array is kept as the fallback for the case where there was no ring at entry.
+	 */
+	if (g_entry_evtadr != 0 && (g_entry_evtsiz & 0xffffu) != 0) {
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400) = g_entry_evtadr;
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC404) = 0;
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408) = g_entry_evtsiz;
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C) = 0;
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		print("ring: restored the firmware's own ring adr %x siz %x\n",
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408));
+		return;
+	}
+
 	/* 1. is the register writable from here at all? */
 	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400) = 0xA5A50000u;
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -6825,7 +6881,24 @@ chiron_event_arm(void)
 	}
 
 	uint32_t before = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC708);
-	uint32_t want = before | (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3);
+	uint32_t want;
+
+	/*
+	 * CHIRON_DEVTEN_FROM_ENTRY
+	 *
+	 * The firmware had DEVTEN = 0x277 at entry -- bits 0, 1, 2, 4, 5 and 9 -- while the host was
+	 * talking to it.  After HK6 starts the controller it reads 0, which is why every log says
+	 * "evt: devten driver had 0".
+	 *
+	 * Rebuilding it from zero with bits 0-3 only left out bit 4 (LKSTS, link state change) and
+	 * bit 5 (SOF).  Those are precisely the events that report a host driving the bus, so the
+	 * arming was unmasking everything except the thing being waited for.
+	 *
+	 * Use the entry value as the base and widen it, rather than starting from whatever the
+	 * driver left and adding a guess.
+	 */
+	want = before | (g_entry_devten != 0 ? g_entry_devten : 0u) |
+	    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5);
 
 	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC708) = want;
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -11452,6 +11525,67 @@ efi_main(efi_handle image, efi_system_table *st)
 		 */
 		g_entry_tune1 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x23C);
 		g_entry_p210 = p210;
+
+		/*
+		 * CHIRON_ENTRY_RING
+		 *
+		 * The ordering question, stated as a measurement.  This loader takes the port over by
+		 * calling HK6, which starts the controller and resets GCTL -- and only then tries to
+		 * put back what was there.  But the state it is overwriting is the state a host was
+		 * just talking through.
+		 *
+		 * If the firmware's own event ring is live at entry, with events pending, then the
+		 * working session is right there and the correct order is to service it, not to
+		 * reset it and rebuild.
+		 *
+		 * GEVNTADR/GEVNTSIZ/GEVNTCOUNT/DEVTEN/DCTL are captured here, before anything runs.
+		 */
+		g_entry_evtadr = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC400);
+		g_entry_evtsiz = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC408);
+		g_entry_evtcnt = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC40C);
+		g_entry_devten = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC708);
+		g_entry_dctl = dctl0;
+		g_entry_dcfg = dcfg0;
+
+		print("ENTRY: evtadr %x evtsiz %x evtcnt %x devten %x\n",
+		    (uint64_t)g_entry_evtadr, (uint64_t)g_entry_evtsiz,
+		    (uint64_t)g_entry_evtcnt, (uint64_t)g_entry_devten);
+
+		/*
+		 * If the firmware left a ring, read what is in it.  Any pending record means the host
+		 * was mid-conversation when control reached this program.
+		 */
+		if (g_entry_evtadr != 0 && (g_entry_evtcnt & 0xfffcu) >= 4) {
+			uint32_t n = (g_entry_evtcnt & 0xfffcu) / 4u;
+			unsigned shown = 0;
+
+			chiron_invalidate((void *)(uintptr_t)g_entry_evtadr,
+			    g_entry_evtsiz & 0xffffu);
+
+			for (uint32_t i = 0; i < n && shown < 12; i++) {
+				uint32_t raw = *(volatile uint32_t *)(uintptr_t)
+				    (g_entry_evtadr + i * 4u);
+
+				if (raw == 0) {
+					continue;
+				}
+				shown++;
+				if (raw & 1u) {
+					print("ENTRY ring: DEV ev %x info %x\n",
+					    (uint64_t)((raw >> 1) & 0x7fu),
+					    (uint64_t)((raw >> 16) & 0x1ffu));
+				} else {
+					print("ENTRY ring: EP %x ev %x st %x\n",
+					    (uint64_t)((raw >> 1) & 0x1fu),
+					    (uint64_t)((raw >> 6) & 0xfu),
+					    (uint64_t)((raw >> 12) & 0xfu));
+				}
+			}
+			print("ENTRY ring: %x record(s) shown of %x pending\n",
+			    (uint64_t)shown, (uint64_t)n);
+		} else {
+			print("ENTRY ring: empty or absent\n");
+		}
 		g_entry_gctl = gctl0;
 		g_entry_qc1 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x70);
 

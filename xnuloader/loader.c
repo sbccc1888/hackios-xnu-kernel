@@ -4164,7 +4164,8 @@ static int usb_probe_steps_mode;          /* usb_probe_steps=1: run StartEx's st
 static int usb_state_force;              /* usb_state_force=1: force UsbConfig state to 0xf (proven harmful) */
 static int usb_stop_before_start_ex;        /* usb_stop_before_start_ex=1: stop once before StartEx */
 static uint8_t g_entry_tune1, g_entry_qc1;
-static uint32_t g_entry_gctl;   /* PHY values as the firmware left them */
+static uint32_t g_entry_gctl;
+static uint8_t g_entry_p210;   /* PHY values as the firmware left them */
 static int usb_force_bind;                 /* usb_force_bind=1: call binding->start() directly */
 static int usb_hk6_no_start;               /* usb_hk6_no_start=1: do not start the controller in HK6 */
 static int usb_prestart_ring;              /* usb_prestart_ring=1: let the driver allocate the ring, then hand over */
@@ -5773,11 +5774,27 @@ chiron_qusb2_init(void)
 	} else {
 		chiron_efuse_tune1();
 	}
-	/* CHIRON_QUSB2_PWRUP (byte access, same reason): POWR_DOWN clear, CLAMP_N_EN set */
+	/*
+	 * CHIRON_QUSB2_PWRUP_KEEPS_POWR_DOWN
+	 *
+	 * This used to clear PWR_CTRL1.POWR_DOWN (bit 0) on the theory that the PHY must be powered.
+	 * The entry snapshot says otherwise, run after run:
+	 *
+	 *     ENTRY: phy ... 210 23 ...
+	 *
+	 * 0x23 has bit 0 set.  So while fastboot is talking to the host -- enumerated, addressed,
+	 * working -- this PHY reads POWR_DOWN.  Clearing it is the change, not the fix.
+	 *
+	 * Fail-safe cannot tell WP from sabotage without that baseline: the whole point of having
+	 * recorded the entry state is to stop guessing which direction is "up".
+	 *
+	 * So only ensure the clamp is released and leave bit 0 exactly as entry had it.
+	 */
 	{
-		uint8_t pw = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
+		uint8_t pw = (g_entry_p210 != 0) ? g_entry_p210
+		                                 : *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
 
-		pw = (uint8_t)((pw & ~1u) | 2u);
+		pw = (uint8_t)(pw | 2u);
 		*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = pw;
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
@@ -8165,37 +8182,60 @@ chiron_power_up_phy(void)
  * So cycle RUN_STOP once.  The hold time is deliberately generous: a host debounces detach and
  * will ignore a reattach that comes back too quickly.
  */
+/*
+ * CHIRON_REATTACH
+ *
+ * The device address is the problem.  At entry it holds whatever fastboot's session left behind --
+ * 0x12, 0x3e, 0x06 across runs -- and the driver's soft reset clears it to 0.  The host, meanwhile,
+ * still has the old address in its own bookkeeping, so the SETUP packets it sends are addressed to
+ * a device that no longer answers there.  Nothing enumerates until the host is made to forget the
+ * old session and start again, and a host only restarts when it sees a detach.
+ *
+ * Clearing DCTL.RUN_STOP was tried and does not do it: DSTS.CONNSTAT stays 1, because on this core
+ * the pull-up lives in the PHY, not in the controller's run/stop gate.
+ *
+ * What does drop the connection is powering the PHY down.  QUSB2_PWR_CTRL1 (0x210):
+ *
+ *     PWR_CTRL1_POWR_DOWN  BIT(0)
+ *     PWR_CTRL1_CLAMP_N_EN BIT(1)
+ *
+ * Clearing POWR_DOWN is what qusb_phy_init() does last, "Enable the PHY", so setting it puts the
+ * PHY back into the state it was in before init -- no termination, no pull-up, and from the host's
+ * side a cable that has been unplugged.
+ *
+ * The hold is deliberately long: a host debounces a detach, and a reattach that arrives inside that
+ * window is ignored rather than treated as a new device.
+ */
+/*
+ * CHIRON_REATTACH
+ *
+ * Two attempts at making the host see a fresh attach, and what each measurement said.
+ *
+ * Clearing DCTL.RUN_STOP, which is what dwc3_gadget_pullup(0) does in the reference driver, left
+ * DSTS.CONNSTAT at 1: on this core the pull-up is not gated by the controller's run/stop.
+ *
+ * Setting PWR_CTRL1.POWR_DOWN and holding it 250 ms also left CONNSTAT at 1, and the entry snapshot
+ * explains why neither of these can work as a probe: CONNSTAT reads 1 while fastboot owns the port,
+ * and it still reads 1 with the PHY powered down.  It is not tracking what is on the wire at all, so
+ * using it to decide whether a detach happened is not possible.  The same applies to USBLNKST, which
+ * has read 4 in every state this loader has ever captured, including the working one.
+ *
+ * So this function no longer pretends to disconnect anything.  It reports the state the host can
+ * actually be judged by -- DEVADDR and the event ring -- and leaves the PHY alone, because both
+ * earlier versions changed PHY state on the strength of a register that does not mean what it
+ * appeared to.
+ */
 static void
 chiron_reattach(void)
 {
 	const uint64_t dwc = 0xA800000ULL;
-	uint32_t dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-	uint32_t dsts_before = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	uint32_t dcfg = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC700);
 
-	/* drop the pull-up and let the host see a detach */
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl & ~(1u << 31);
-	__asm__ volatile ("dsb sy" ::: "memory");
-	chiron_udelay(200000);          /* 200 ms of nothing on the bus */
-
-	{
-		uint32_t dsts_mid = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
-
-		print("reattach: RUN_STOP cleared, DSTS %x conn %x lkst %x\n",
-		    (uint64_t)dsts_mid, (uint64_t)(dsts_mid & 1u),
-		    (uint64_t)((dsts_mid >> 18) & 0xfu));
-	}
-
-	/* bring it back */
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl | (1u << 31);
-	__asm__ volatile ("dsb sy" ::: "memory");
-	chiron_udelay(100000);          /* 100 ms for the host to start SOFs */
-
-	print("reattach: RUN_STOP set, DSTS %x conn %x lkst %x spd %x | was %x\n",
-	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C),
-	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) & 1u),
-	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) >> 18) & 0xfu),
-	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) & 7u),
-	    (uint64_t)(dsts_before & 7u));
+	print("reattach: no forced detach -- CONNSTAT and USBLNKST do not track the wire\n");
+	print("reattach: DEVADDR %x | DSTS %x conn %x lkst %x | DCFG %x\n",
+	    (uint64_t)((dcfg >> 3) & 0x7fu), (uint64_t)dsts,
+	    (uint64_t)(dsts & 1u), (uint64_t)((dsts >> 18) & 0xfu), (uint64_t)dcfg);
 	flush_log();
 }
 
@@ -11411,6 +11451,7 @@ efi_main(efi_handle image, efi_system_table *st)
 		 * with.  Keep both, so the init can put back what was actually there.
 		 */
 		g_entry_tune1 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x23C);
+		g_entry_p210 = p210;
 		g_entry_gctl = gctl0;
 		g_entry_qc1 = *(volatile uint8_t *)(uintptr_t)(phy0 + 0x70);
 

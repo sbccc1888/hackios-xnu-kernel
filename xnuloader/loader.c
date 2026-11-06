@@ -4162,6 +4162,7 @@ static int usb_no_epcfg_mode;
 /* usb_extra_start=1: also call UsbFnIo::StartController ourselves. */
 static int usb_probe_steps_mode;          /* usb_probe_steps=1: run StartEx's steps one by one */
 static int usb_state_force;              /* usb_state_force=1: force UsbConfig state to 0xf (proven harmful) */
+static int usb_noop_startstop;            /* usb_noop_startstop=1: report success for stop/start, let StartEx continue */
 static int usb_start_first = 1;          /* usb_start_first=0: do not stop/start here, let start_ex do it */
 static int usb_no_ring;                  /* usb_no_ring=1: do not program the event ring, leave it to the driver */
 static int usb_clean_mode;               /* usb_clean=1: let start_ex own the whole bring-up */
@@ -7617,7 +7618,50 @@ static efi_status rec_cfg_eps = 0xdeadbeefull;
 static efi_status rec_start_ctrl = 0xdeadbeefull;
 static efi_status rec_stop_ctrl = 0xdeadbeefull;
 static uint32_t rec_evt_count;
+static uint32_t rec_detect_port_calls, rec_detect_port_result;
+static uint32_t rec_mps_calls, rec_mps_type, rec_mps_speed, rec_mps_result;
 static uint32_t rec_evt_pending_last;
+
+static efi_status (EFIAPI *orig_alloc_xfer)(efi_usbfn_io *, uintptr_t, void **);
+static efi_status (EFIAPI *orig_free_xfer)(efi_usbfn_io *, void *);
+static efi_status (EFIAPI *orig_get_dev_info)(efi_usbfn_io *, void *, uint32_t *);
+static efi_status (EFIAPI *orig_get_vid_pid)(efi_usbfn_io *, uint16_t *, uint16_t *);
+static efi_status (EFIAPI *orig_ep_stall)(efi_usbfn_io *, uint32_t, uint32_t, uint8_t *);
+
+static efi_status rec_alloc_xfer = 0xdeadbeefull;
+static efi_status rec_get_dev_info = 0xdeadbeefull;
+static efi_status rec_get_vid_pid = 0xdeadbeefull;
+static efi_status rec_ep_stall = 0xdeadbeefull;
+static uint32_t rec_alloc_xfer_calls;
+
+static efi_status EFIAPI
+shim_alloc_xfer(efi_usbfn_io *self, uintptr_t size, void **buf)
+{
+	rec_alloc_xfer_calls++;
+	rec_alloc_xfer = orig_alloc_xfer(self, size, buf);
+	return rec_alloc_xfer;
+}
+
+static efi_status EFIAPI
+shim_get_dev_info(efi_usbfn_io *self, void *info, uint32_t *size)
+{
+	rec_get_dev_info = orig_get_dev_info(self, info, size);
+	return rec_get_dev_info;
+}
+
+static efi_status EFIAPI
+shim_get_vid_pid(efi_usbfn_io *self, uint16_t *vid, uint16_t *pid)
+{
+	rec_get_vid_pid = orig_get_vid_pid(self, vid, pid);
+	return rec_get_vid_pid;
+}
+
+static efi_status EFIAPI
+shim_ep_stall(efi_usbfn_io *self, uint32_t ep, uint32_t dir, uint8_t *stalled)
+{
+	rec_ep_stall = orig_ep_stall(self, ep, dir, stalled);
+	return rec_ep_stall;
+}
 
 static efi_status EFIAPI
 shim_cfg_eps(efi_usbfn_io *self, efi_usb_device_info *info)
@@ -7629,6 +7673,10 @@ shim_cfg_eps(efi_usbfn_io *self, efi_usb_device_info *info)
 static efi_status EFIAPI
 shim_start_ctrl(efi_usbfn_io *self)
 {
+	if (usb_noop_startstop) {
+		rec_start_ctrl = 0;
+		return 0;
+	}
 	rec_start_ctrl = orig_start_ctrl(self);
 	return rec_start_ctrl;
 }
@@ -7636,6 +7684,24 @@ shim_start_ctrl(efi_usbfn_io *self)
 static efi_status EFIAPI
 shim_stop_ctrl(efi_usbfn_io *self)
 {
+	/*
+	 * CHIRON_NOOP_STOPSTART
+	 *
+	 * StartEx's first act is StopController, and the driver answers 7
+	 * (EFI_OUT_OF_RESOURCES).  It aborts there, so ConfigureEnableEndpoints -- the step that
+	 * actually makes endpoints -- is never reached, which the shims proved: its sentinel was
+	 * still deadbeef on every run.
+	 *
+	 * This loader has already stopped and started the controller through the same interface,
+	 * and got 0 both times.  So when usb_noop_startstop=1, report success without calling the
+	 * driver and let StartEx continue.  If it then reaches ConfigureEnableEndpoints and beyond,
+	 * these two calls were the whole obstruction; if it stops somewhere else, that place is
+	 * named instead of guessed.
+	 */
+	if (usb_noop_startstop) {
+		rec_stop_ctrl = 0;
+		return 0;
+	}
 	rec_stop_ctrl = orig_stop_ctrl(self);
 	return rec_stop_ctrl;
 }
@@ -7655,6 +7721,15 @@ chiron_shim_report(void)
 	    (uint64_t)rec_stop_ctrl, (uint64_t)rec_start_ctrl, (uint64_t)rec_cfg_eps);
 	print("shim: EventHandler calls %d last pending %x\n",
 	    (uint64_t)rec_evt_count, (uint64_t)rec_evt_pending_last);
+	print("shim: DetectPort calls %d -> port %x\n",
+	    (uint64_t)rec_detect_port_calls, (uint64_t)rec_detect_port_result);
+	print("shim: AllocateTransferBuffer %d calls -> %x | GetDeviceInfo %x | VidPid %x\n",
+	    (uint64_t)rec_alloc_xfer_calls, (uint64_t)rec_alloc_xfer,
+	    (uint64_t)rec_get_dev_info, (uint64_t)rec_get_vid_pid);
+	print("shim: EndpointStallState %x\n", (uint64_t)rec_ep_stall);
+	print("shim: GetEndpointMaxPacketSize calls %d type %x speed %x -> mps %x\n",
+	    (uint64_t)rec_mps_calls, (uint64_t)rec_mps_type, (uint64_t)rec_mps_speed,
+	    (uint64_t)rec_mps_result);
 }
 
 /*
@@ -7731,7 +7806,12 @@ usbfn_mps_hs(efi_usbfn_io *self, uint32_t type, uint32_t speed, uint32_t *size)
 	 *   Low   bulk  64, control  8
 	 *   Super bulk 1024, control 512
 	 */
+	rec_mps_calls++;
+	rec_mps_type = type;
+	rec_mps_speed = speed;
+
 	if (size == NULL || (uintptr_t)size < 0x1000) {
+		rec_mps_result = 0xffffffffu;
 		return 0x8000000000000002ull;       /* EFI_DEVICE_ERROR */
 	}
 
@@ -7751,6 +7831,7 @@ usbfn_mps_hs(efi_usbfn_io *self, uint32_t type, uint32_t speed, uint32_t *size)
 		*size = (type == UsbfnEndpointBulk) ? 512u : 64u;
 		break;
 	}
+	rec_mps_result = *size;
 	return 0;
 }
 
@@ -7758,9 +7839,11 @@ static efi_status EFIAPI
 usbfn_detect_sdp(efi_usbfn_io *self, uint32_t *port_type)
 {
 	(void)self;
+	rec_detect_port_calls++;
 	if (port_type != NULL) {
 		*port_type = UsbfnStandardDownstreamPort;
 	}
+	rec_detect_port_result = UsbfnStandardDownstreamPort;
 	return 0;                       /* EFI_SUCCESS */
 }
 
@@ -7777,6 +7860,17 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 		memcpy(&copy, orig, sizeof(copy));
 		copy.detect_port = usbfn_detect_sdp;
 		copy.get_endpoint_max_packet_size = usbfn_mps_hs;
+
+		orig_alloc_xfer = orig->allocate_transfer_buffer;
+		orig_free_xfer = orig->free_transfer_buffer;
+		orig_get_dev_info = orig->get_device_info;
+		orig_get_vid_pid = orig->get_vendor_id_product_id;
+		orig_ep_stall = orig->get_endpoint_stall_state;
+
+		copy.allocate_transfer_buffer = shim_alloc_xfer;
+		copy.get_device_info = shim_get_dev_info;
+		copy.get_vendor_id_product_id = shim_get_vid_pid;
+		copy.get_endpoint_stall_state = shim_ep_stall;
 
 		orig_cfg_eps = orig->configure_enable_endpoints;
 		orig_start_ctrl = orig->start_controller;
@@ -7932,6 +8026,12 @@ usb_start(void)
 				if (starts_with(c, "usb_probe_steps=1") &&
 				    (c[17] == 0 || c[17] == ' ')) {
 					usb_probe_steps_mode = 1;
+				}
+				/* "usb_noop_startstop=1" is 20 characters */
+				if (starts_with(c, "usb_noop_startstop=1") &&
+				    (c[20] == 0 || c[20] == ' ')) {
+					usb_noop_startstop = 1;
+					print("usb: stop/start shimmed to success\n", 0);
 				}
 				/* "usb_start_first=0" is 17 characters */
 				if (starts_with(c, "usb_start_first=0") &&
@@ -8471,6 +8571,54 @@ usb_start(void)
 
 				if (cbuf != NULL) {
 					pfn->free_transfer_buffer(pfn, cbuf);
+				}
+			}
+		}
+
+		/*
+		 * CHIRON_SHIM_MUST_SURVIVE_THE_REPICK
+		 *
+		 * The shimmed UsbFnIo table is built and installed where the table is prepared,
+		 * but the controller is re-picked afterwards (USB = again), and that happens
+		 * BEFORE this call.  So USB no longer pointed at the copy, StartEx got the
+		 * vendor table, and its calls ran unwrapped -- which is why DetectPort showed 0
+		 * calls even though the shims were installed and the reinstall reported success.
+		 *
+		 * Take the copy back here, immediately before StartEx, so the wrapped table is
+		 * what StartEx calls through.
+		 */
+		if (!usb_force_sdp_off) {
+			static const efi_guid fg = QCOM_USBFN_IO_GUID;
+			efi_usbfn_io *cur = NULL;
+
+			USB = usbfn_with_sdp_detect(USB);
+
+			/*
+			 * Print every step.  The earlier version only printed inside a branch that
+			 * turned out to be false, so a silent run looked like success.  Now the value
+			 * handle_protocol actually returns is visible, which is the only thing that
+			 * says whether the driver will reach the shims.
+			 */
+			if (usb_dev_handle != NULL &&
+			    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &fg, (void **)&cur)) &&
+			    cur != NULL) {
+				print("usbfn: before start_ex handle gives %x, our copy is %x (%s)\n",
+				    (uint64_t)(uintptr_t)cur, (uint64_t)(uintptr_t)USB,
+				    (cur == USB) ? "same" : "DIFFERENT");
+
+				if (cur != USB) {
+					efi_status rs = BS->reinstall_protocol_interface(usb_dev_handle,
+					    &fg, cur, USB);
+
+					print("usbfn: reinstall %x\n", (uint64_t)rs);
+
+					cur = NULL;
+					if (!EFI_ERROR(BS->handle_protocol(usb_dev_handle, &fg,
+					    (void **)&cur)) && cur != NULL) {
+						print("usbfn: after reinstall handle gives %x (%s)\n",
+						    (uint64_t)(uintptr_t)cur,
+						    (cur == USB) ? "our copy" : "still vendor");
+					}
 				}
 			}
 		}

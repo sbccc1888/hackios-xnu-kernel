@@ -7954,6 +7954,37 @@ chiron_fw_vbus(efi_qcom_usb_config *cfg)
  * If the byte write does not read back, every 0xC0/0xC4 write in this file is suspect and the fix
  * is a width change, not a sequencing change.
  */
+/*
+ * CHIRON_LINESTATE
+ *
+ * PORT_UTMI_STATUS (0xF4) carries the raw line levels:
+ *
+ *     LINESTATE_DP   BIT(0)
+ *     LINESTATE_DM   BIT(1)
+ *
+ * phy-msm-qusb.c reads exactly this register to decide whether the data lines are being driven,
+ * and only then enables auto-resume.  A previous pass wrote F0/F4 off as "unimplemented on this
+ * part" and stopped reading them, which removed the only direct view of the wire this loader has.
+ *
+ * Print them, and also under three conditions that should differ, so a constant zero can be told
+ * apart from a real reading: as found, after forcing the PHY into a known driven state via
+ * PORT_TEST_CTRL, and back in normal operation.
+ */
+static void
+chiron_linestate(const char *when)
+{
+	const uint64_t phy = 0xC012000ULL;
+
+	print("line ", 0);
+	print((char *)when, 0);
+	print(": f4 %x f0 %x istat %x | d+ %x d- %x\n",
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xF4),
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0xF0),
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x230),
+	    (uint64_t)(*(volatile uint8_t *)(uintptr_t)(phy + 0xF4) & 1u),
+	    (uint64_t)((*(volatile uint8_t *)(uintptr_t)(phy + 0xF4) >> 1) & 1u));
+}
+
 static void
 chiron_byte_write_test(void)
 {
@@ -9633,6 +9664,21 @@ usb_start(void)
 	 * POWR_DOWN), matching qusb_phy_init() line for line.
 	 */
 	chiron_byte_write_test();
+
+	/*
+	 * Read the line levels three ways.  If 0xF4 never changes across these, the register really
+	 * is inert here; if it moves, it is a live view of the wire and every earlier conclusion
+	 * that skipped it needs revisiting.
+	 */
+	chiron_linestate("as-found");
+	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB8) = 0x0C;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB8) = 0x04;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_linestate("after-test-ctrl");
+	*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xB8) = 0x00;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_linestate("after-clear");
 	chiron_update_ref_clk();
 	chiron_enable_termination();
 	chiron_clear_disconnect();

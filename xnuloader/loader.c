@@ -8132,6 +8132,57 @@ chiron_power_up_phy(void)
  * USB steps below is disconnecting a working port.  Snapshot DSTS after each one and the culprit
  * is whichever step flips conn from 1 to 0.
  */
+/*
+ * CHIRON_REATTACH
+ *
+ * CONNECTSTAT survives the entire bring-up now, but the device address stays 0, so the host never
+ * enumerates.  The reason is that the port never looks new: D+ has been pulled up since the
+ * fastboot session, the host already saw this device attach, and nothing signals a disconnect.  A
+ * host only starts enumeration on the edge of an attach.
+ *
+ * dwc3_gadget_pullup() does exactly this in the reference driver -- it is the gadget's attach
+ * control, and it works through dwc3_gadget_run_stop(), i.e. DCTL.RUN_STOP:
+ *
+ *     pullup(0)  ->  clear RUN_STOP  ->  the PHY releases D+, host sees a detach
+ *     pullup(1)  ->  set RUN_STOP    ->  the PHY drives D+, host sees an attach and enumerates
+ *
+ * So cycle RUN_STOP once.  The hold time is deliberately generous: a host debounces detach and
+ * will ignore a reattach that comes back too quickly.
+ */
+static void
+chiron_reattach(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	uint32_t dsts_before = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+
+	/* drop the pull-up and let the host see a detach */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl & ~(1u << 31);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(200000);          /* 200 ms of nothing on the bus */
+
+	{
+		uint32_t dsts_mid = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+
+		print("reattach: RUN_STOP cleared, DSTS %x conn %x lkst %x\n",
+		    (uint64_t)dsts_mid, (uint64_t)(dsts_mid & 1u),
+		    (uint64_t)((dsts_mid >> 18) & 0xfu));
+	}
+
+	/* bring it back */
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl | (1u << 31);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(100000);          /* 100 ms for the host to start SOFs */
+
+	print("reattach: RUN_STOP set, DSTS %x conn %x lkst %x spd %x | was %x\n",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C),
+	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) & 1u),
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) >> 18) & 0xfu),
+	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) & 7u),
+	    (uint64_t)(dsts_before & 7u));
+	flush_log();
+}
+
 static void
 chiron_step(const char *what)
 {
@@ -8239,24 +8290,26 @@ chiron_pullup_audit(const char *when)
 static void
 chiron_clear_disconnect(void)
 {
-	const uint64_t dwc = 0xA800000ULL;
-	uint32_t before = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-	uint32_t after;
-
-	if ((before & (1u << 28)) == 0) {
-		return;
-	}
-
-	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = before & ~(1u << 28);
-	__asm__ volatile ("dsb sy" ::: "memory");
-	chiron_udelay(1000);
-
-	after = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
-	print("dctl: clear DISCONNECT %x -> %x | DSTS %x conn %x lkst %x\n",
-	    (uint64_t)before, (uint64_t)after,
-	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C),
-	    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) & 7),
-	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C) >> 18) & 0xf));
+	/*
+	 * CHIRON_NO_DCTL_DISCONNECT_BIT
+	 *
+	 * This function used to clear DCTL bit 28, described as DISCONNECT.  There is no such bit.
+	 * From dwc3/core.h:
+	 *
+	 *     DWC3_DCTL_RUN_STOP        (1 << 31)
+	 *     DWC3_DCTL_CSFTRST         (1 << 30)
+	 *     DWC3_DCTL_LSFTRST         (1 << 29)
+	 *     DWC3_DCTL_HIRD_THRES_MASK (0x1f << 24)     <-- bit 28 lives here
+	 *     DWC3_DCTL_LPM_ERRATA(n)   ((n) << 20)
+	 *
+	 * DCTL reads 0x90f00000 in this port: RUN_STOP set, HIRD_THRES = 0x10, LPM_ERRATA = 0xf.
+	 * Bit 28 is the high bit of HIRD_THRES, so clearing it changed the HIRD threshold from 16 to
+	 * 0 -- a timing parameter, not a connection control -- and every reading of "DISCONNECT was
+	 * set" was reading a threshold field.
+	 *
+	 * Left as a named no-op rather than deleted so the call sites and this explanation stay
+	 * together.
+	 */
 }
 
 static void
@@ -9816,6 +9869,8 @@ usb_start(void)
 	chiron_step("after-speed");
 	chiron_clear_disconnect();
 	chiron_step("after-cleardisc");
+	chiron_reattach();
+	chiron_step("after-reattach");
 	chiron_pullup_audit("after-disc");
 
 	chiron_ring_dump("pre-start_ex");

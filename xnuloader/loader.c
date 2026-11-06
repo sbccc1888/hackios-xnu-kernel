@@ -8298,6 +8298,107 @@ chiron_power_up_phy(void)
  * earlier versions changed PHY state on the strength of a register that does not mean what it
  * appeared to.
  */
+/*
+ * CHIRON_SOF_WATCH
+ *
+ * Whether the host sees this device at all, measured without relying on the event ring, DEVTEN, or
+ * any interrupt path -- all of which this loader has already caught itself misreading.
+ *
+ * DSTS.SOFFN is the frame number the host is currently on:
+ *
+ *     DWC3_DSTS_SOFFN_MASK  (0x3fff << 3)
+ *
+ * A host that has enumerated a device sends a SOF every millisecond, so over one second this field
+ * advances by about 1000.  A device the host cannot see sits at whatever value it had and never
+ * moves, no matter how long it is watched.
+ *
+ * That makes it the cleanest possible yes/no on the physical attach, and it is the question every
+ * other measurement has been circling: if SOFFN moves, the wire is live and the remaining work is
+ * protocol.  If it does not, nothing above the PHY matters yet.
+ */
+/*
+ * CHIRON_PHY_FOLLOWS_CORE
+ *
+ * The entry snapshot was taken after fastboot had already exited, and that matters:
+ *
+ *     entry:  DCTL RUN_STOP 0, DSTS hlt 1,  PWR_CTRL1 0x23  (POWR_DOWN set)
+ *     ours:   DCTL RUN_STOP 1, DSTS hlt 0,  PWR_CTRL1 0x23  (POWR_DOWN set)
+ *
+ * At entry the core was stopped and the PHY was powered down.  Those two agree: nothing is
+ * running, nothing is driving the wire, and fastboot's host has been told the cable is gone.
+ *
+ * Preserving 0x23 was therefore wrong for the state this loader puts the port in.  It made the
+ * core run while leaving its PHY powered down, and a powered-down QUSB2 phy cannot hold the D+
+ * pull-up.  That is precisely what the SOF measurement reports: run 1, hlt 0, and no SOF at all.
+ *
+ * So the two belong together and this enforces the pairing:
+ *
+ *     RUN_STOP 1 -> POWR_DOWN 0   phy powered, pull-up driven, host can see us
+ *     RUN_STOP 0 -> POWR_DOWN 1   idle, as the firmware left it
+ *
+ * CLAMP_N_EN and every other bit in 0x210 are left as found.
+ */
+static void
+chiron_phy_follows_core(void)
+{
+	const uint64_t phy = 0xC012000ULL;
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	uint8_t before = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
+	uint8_t want;
+
+	if ((dctl & (1u << 31)) != 0) {
+		want = (uint8_t)(before & ~1u);      /* core running -> phy powered */
+	} else {
+		want = (uint8_t)(before | 1u);       /* core stopped -> phy down */
+	}
+	want = (uint8_t)(want | 2u);             /* clamp stays released */
+
+	if (want == before) {
+		print("phycore: 210 already %x for RUN_STOP %x\n",
+		    (uint64_t)before, (uint64_t)((dctl >> 31) & 1u));
+		return;
+	}
+
+	*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = want;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(5000);
+
+	print("phycore: RUN_STOP %x -> 210 %x -> %x (pwrdn %x)\n",
+	    (uint64_t)((dctl >> 31) & 1u), (uint64_t)before,
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x210),
+	    (uint64_t)(*(volatile uint8_t *)(uintptr_t)(phy + 0x210) & 1u));
+	flush_log();
+}
+
+static void
+chiron_sof_watch(const char *when, unsigned ms)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t d0 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+	uint32_t f0 = (d0 >> 3) & 0x3fffu;
+	uint32_t f1 = f0;
+	unsigned waited = 0;
+
+	for (; waited < ms; waited += 10) {
+		uint32_t d = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+
+		f1 = (d >> 3) & 0x3fffu;
+		if (f1 != f0) {
+			break;
+		}
+		chiron_udelay(10000);
+	}
+
+	print("sof ", 0);
+	print((char *)when, 0);
+	print(": frame %x -> %x over %d ms%s | DSTS %x\\n",
+	    (uint64_t)f0, (uint64_t)f1, (uint64_t)waited,
+	    (f1 == f0) ? " -- NO SOF, host cannot see us" : " -- SOF ARRIVING, host sees us",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C));
+	flush_log();
+}
+
 static void
 chiron_reattach(void)
 {
@@ -10249,6 +10350,8 @@ usb_start(void)
 		s = USB->start_ex(&set);
 		chiron_shim_report();
 		chiron_ring_dump("post-start_ex");
+	chiron_phy_follows_core();
+	chiron_sof_watch("after-phyup", 500);
 		chiron_raw_pump("post-start_ex", 32);
 	} else {
 		/*

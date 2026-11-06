@@ -6678,7 +6678,15 @@ chiron_ring_takeover(void)
 		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC400) = (uint32_t)(phys & 0xFFFFFFFFu);
 		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC404) = (uint32_t)(phys >> 32);
 		/* size in 4-byte words is bits 19:0; INTMASK (bit 31) clear so events interrupt */
-		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408) = (uint32_t)(sizeof(chiron_evt_ring) >> 2);
+		/*
+		 * CHIRON_GEVNTSIZ_IS_BYTES
+		 *
+		 * GEVNTSIZ holds the size of the event buffer in bytes, not in dwords.  This
+		 * wrote sizeof(ring) >> 2, so a 4096-byte ring was advertised to the controller
+		 * as 1024 bytes.  Event count is GEVNTSIZ / 4, so the controller believed it had
+		 * 256 slots when this loader had allocated 1024.
+		 */
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408) = (uint32_t)sizeof(chiron_evt_ring);
 		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C) = 0;
 		__asm__ volatile ("dsb sy" ::: "memory");
 
@@ -7160,6 +7168,30 @@ chiron_stop_before_start_ex(void)
  * even signalled, and at what speed -- all of which the shim's single EventHandler call never
  * got to report because it returned DEVICE_ERROR.
  */
+/*
+ * CHIRON_INVALIDATE
+ *
+ * If the controller posted events and the CPU reads zeroes anyway, the likely reason is the
+ * cache: the loader zeroed its own ring through the cache earlier, those lines are resident, and
+ * a read after the controller DMA'd into the same physical memory hits the stale copy.  GEVNTCOUNT
+ * is a register, so it is never stale -- which is exactly the shape of the measurement, count 0x18
+ * with every dword reading zero.
+ *
+ * Clean and invalidate by VA to the point of coherency across the region, so the next read comes
+ * from memory.
+ */
+static void
+chiron_invalidate(void *addr, uint64_t len)
+{
+	uintptr_t p = (uintptr_t)addr & ~(uintptr_t)63;
+	uintptr_t end = ((uintptr_t)addr + len + 63) & ~(uintptr_t)63;
+
+	for (; p < end; p += 64) {
+		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
 static void
 chiron_ring_dump(const char *when)
 {
@@ -7183,6 +7215,12 @@ chiron_ring_dump(const char *when)
 	 * at dead space.  Print every non-zero dword with its offset, which locates the live
 	 * region without needing to know the current pointer.
 	 */
+	/*
+	 * Invalidate first: the controller writes this memory, the CPU has no idea, and a
+	 * resident cache line would hide every event while GEVNTCOUNT keeps counting.
+	 */
+	chiron_invalidate((void *)(uintptr_t)adr, siz);
+
 	{
 		const uint32_t *p = (const uint32_t *)(uintptr_t)adr;
 		uint32_t words = siz / 4;
@@ -7983,7 +8021,7 @@ shim_stop_ctrl(efi_usbfn_io *self)
 	return rec_stop_ctrl;
 }
 
-static uint32_t rec_evt_type, rec_evt_size_in, rec_evt_size_out, rec_evt_ret;
+static uint32_t rec_evt_type, rec_evt_ptr, rec_evt_size_in, rec_evt_size_out, rec_evt_ret;
 static uint8_t rec_evt_data0, rec_evt_data1;
 
 static efi_status EFIAPI
@@ -8000,16 +8038,31 @@ shim_evt_handler(efi_usbfn_io *self, void *evt, uint64_t *size, void *data)
 	 * the wrong size, or because it returned an error decides what to fix, and the log so
 	 * far only said "calls 1".
 	 */
-	rec_evt_type = (uint32_t)(uintptr_t)evt;
+	/*
+	 * evt is EFI_USBFN_MESSAGE*, not the message.  Recording the pointer (0x9c382524) as
+	 * "type" for several rounds made it look like garbage, while the driver was in fact
+	 * handing over a perfectly good stack address.  Dereference it.
+	 *
+	 * On the way in, *size is the caller's buffer capacity, so a large value there is normal
+	 * and is not evidence of a bad argument.
+	 */
+	/*
+	 * Message is an OUT parameter: before the call the driver's stack slot holds whatever
+	 * was there, which is why reading it first produced 0xa9bf7bfd and looked like garbage.
+	 * Take both values AFTER the call, which is when they mean something.
+	 */
+	rec_evt_ptr = (uint32_t)(uintptr_t)evt;
 	rec_evt_size_in = (size != NULL) ? (uint32_t)*size : 0xffffffffu;
+	rec_evt_ret = 0;
+
+	r = orig_evt_handler(self, evt, size, data);
+
+	rec_evt_type = (evt != NULL) ? *(volatile uint32_t *)evt : 0xffffffffu;
+	rec_evt_size_out = (size != NULL) ? (uint32_t)*size : 0xffffffffu;
 	if (data != NULL) {
 		rec_evt_data0 = ((const uint8_t *)data)[0];
 		rec_evt_data1 = ((const uint8_t *)data)[1];
 	}
-
-	r = orig_evt_handler(self, evt, size, data);
-
-	rec_evt_size_out = (size != NULL) ? (uint32_t)*size : 0xffffffffu;
 	rec_evt_ret = (uint32_t)r;
 	return r;
 }
@@ -8019,9 +8072,10 @@ chiron_shim_report(void)
 {
 	print("shim: StopController %x | StartController %x | ConfigureEnableEndpoints %x\n",
 	    (uint64_t)rec_stop_ctrl, (uint64_t)rec_start_ctrl, (uint64_t)rec_cfg_eps);
-	print("shim: EventHandler calls %d pending %x type %x size %x->%x ret %x data %x%x\n",
+	print("shim: EventHandler calls %d pending %x msg %x (at %x) size %x->%x ret %x data %x%x\n",
 	    (uint64_t)rec_evt_count, (uint64_t)rec_evt_pending_last,
-	    (uint64_t)rec_evt_type, (uint64_t)rec_evt_size_in, (uint64_t)rec_evt_size_out,
+	    (uint64_t)rec_evt_type, (uint64_t)rec_evt_ptr,
+	    (uint64_t)rec_evt_size_in, (uint64_t)rec_evt_size_out,
 	    (uint64_t)rec_evt_ret, (uint64_t)rec_evt_data0, (uint64_t)rec_evt_data1);
 	print("shim: DetectPort calls %d -> port %x\n",
 	    (uint64_t)rec_detect_port_calls, (uint64_t)rec_detect_port_result);
@@ -8757,6 +8811,45 @@ usb_start(void)
 
 	chiron_usbfn_handles();
 	chiron_platforminfo_view();
+
+	/*
+	 * CHIRON_RING_CLEAN_BEFORE_START_EX
+	 *
+	 * This is the fix the whole session was missing.  chiron_ring_takeover() zeroes the ring
+	 * through the cache, so those lines are dirty in the CPU's view; the controller then
+	 * writes events into the same physical memory, and any read -- the loader's or the
+	 * driver's -- hits the stale zeroed copy.  GEVNTCOUNT is a register, so it kept counting
+	 * correctly while the buffer looked empty, which is exactly the contradiction that was
+	 * measured:
+	 *
+	 *     ringdump ... count 18    nonzero dwords: 0 of 256
+	 *
+	 * Cleaning and invalidating the region before handing it over makes the controller's
+	 * writes visible.  After adding the invalidate to the dump alone, the same ring showed
+	 *
+	 *     +18: 50301   +1c: 101   +20: 201   +24: 301     nonzero dwords: 4 of 1024
+	 *
+	 * so events had been arriving all along and were simply invisible.
+	 *
+	 * Do it here, before StartEx, so the driver's own reads see them too.
+	 */
+	{
+		uint32_t radr = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400);
+		uint32_t rsiz = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408);
+
+		if (radr != 0 && rsiz != 0 && rsiz <= 0x10000) {
+			uintptr_t q = (uintptr_t)radr;
+
+			for (uint64_t i = 0; i < rsiz; i += 64) {
+				/* clean (write back) then invalidate, so neither side sees stale data */
+				__asm__ volatile ("dc cvac, %0" :: "r"(q + i) : "memory");
+			}
+			__asm__ volatile ("dsb sy" ::: "memory");
+			chiron_invalidate((void *)(uintptr_t)radr, rsiz);
+			print("ring: cleaned+invalidated %x bytes at %x before start_ex\n",
+			    (uint64_t)rsiz, (uint64_t)radr);
+		}
+	}
 
 	chiron_ring_dump("pre-start_ex");
 

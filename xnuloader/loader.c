@@ -4176,6 +4176,8 @@ static int usb_hk6_no_start;               /* usb_hk6_no_start=1: do not start t
 static int usb_prestart_ring;              /* usb_prestart_ring=1: let the driver allocate the ring, then hand over */
 static int usb_no_qualifier;              /* usb_no_qualifier=1: omit the device qualifier */
 static int usb_no_recover;                /* usb_no_recover=1: return on start_ex failure, no endpoint retry */
+/* the driver publishes revision + nine entry points; see the shim copy below */
+#define CHIRON_USBFN_REAL_SIZE  0x50u
 static int usb_noop_startstop;            /* usb_noop_startstop=1: report success for stop/start, let StartEx continue */
 static uint32_t rec_evt_none_taken;
 static int usb_evt_none;               /* usb_evt_none=1: answer success with MsgNone when no events pending */
@@ -9532,7 +9534,27 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 		return orig;
 	}
 	if (!done) {
-		memcpy(&copy, orig, sizeof(copy));
+		/*
+		 * CHIRON_MEMCPY_SIZE_IS_A_LIE
+		 *
+		 * sizeof(efi_usbfn_io) is 0x98 -- revision plus eighteen function pointers, because
+		 * this header declares the whole protocol EFIUsbfnIo.h describes.  The driver
+		 * publishes nine of them: the table ends at 0x48, and offset 0x50 holds the string
+		 * "DEV_STATE_DETACHED" rather than a function.
+		 *
+		 * memcpy(&copy, orig, sizeof(copy)) therefore copied 72 bytes past the end of the real
+		 * table, and the nine slots it filled are adjacent memory.  That alone would be
+		 * harmless if those slots were never used -- but the shim then replaced several of
+		 * them, and the copy is handed to StartEx as if it were the vendor table.  So a driver
+		 * whose nine real entry points all work gets handed a table whose remaining entries
+		 * are whatever happened to follow it in memory.
+		 *
+		 * Copy only what exists.  The slots past 0x48 are left NULL in the copy, which is the
+		 * truthful answer: this driver does not implement them, and a NULL is checkable where
+		 * a garbage pointer is not.
+		 */
+		memset(&copy, 0, sizeof(copy));
+		memcpy(&copy, orig, CHIRON_USBFN_REAL_SIZE);
 		copy.detect_port = usbfn_detect_sdp;
 		copy.get_endpoint_max_packet_size = usbfn_mps_hs;
 

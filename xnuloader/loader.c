@@ -7139,6 +7139,68 @@ chiron_stop_before_start_ex(void)
 	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC408));
 }
 
+/*
+ * CHIRON_RING_DUMP
+ *
+ * The ring has held events all session and nothing has ever looked at them.  GEVNTCOUNT has
+ * been read many times and reported "6 events pending", but the DWC3 event headers themselves
+ * were never decoded, so the actual bus state the controller is reporting is unknown.
+ *
+ * Each DWC3 event starts with a 32-bit header:
+ *     bits  0..7   event type (1 = Device, 2 = Cmd completion, 3 = Transfer, ...)
+ *     bits  8..15  multicast / reserved
+ *     bits 16..31  event-specific flags
+ * A Device event (type 1) carries, in its params word (second dword):
+ *     bit 0  ERR
+ *     bit 1  CONNECT
+ *     bits 2..3  LINK_STATE
+ *     bits 4..7  SPEED (0 = HighSpeed on a USB2 core)
+ *
+ * Decoding the first events says whether the host has reset the device, whether a connect was
+ * even signalled, and at what speed -- all of which the shim's single EventHandler call never
+ * got to report because it returned DEVICE_ERROR.
+ */
+static void
+chiron_ring_dump(const char *when)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t adr = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC400);
+	uint32_t siz = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC408);
+	uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC40C);
+
+	print("ringdump ", 0);
+	print((char *)when, 0);
+	print(": adr %x siz %x count %x\n", (uint64_t)adr, (uint64_t)siz, (uint64_t)cnt);
+
+	if (adr == 0 || siz == 0 || siz > 0x1000) {
+		return;
+	}
+
+	/*
+	 * Scan the whole ring rather than assuming the events begin at offset zero.  GEVNTCOUNT
+	 * says bytes are outstanding; if the first words read as zero then the write pointer has
+	 * already moved past a region the driver has consumed, and indexing from the start looks
+	 * at dead space.  Print every non-zero dword with its offset, which locates the live
+	 * region without needing to know the current pointer.
+	 */
+	{
+		const uint32_t *p = (const uint32_t *)(uintptr_t)adr;
+		uint32_t words = siz / 4;
+		uint32_t nz = 0;
+
+		for (uint32_t i = 0; i < words; i++) {
+			if (p[i] == 0) {
+				continue;
+			}
+			if (nz < 24) {
+				print("  +%x: %x\n", (uint64_t)(i * 4), (uint64_t)p[i]);
+			}
+			nz++;
+		}
+		print("  nonzero dwords: %d of %d\n", (uint64_t)nz, (uint64_t)words);
+	}
+}
+
 static int
 chiron_usbfn_configure_only(void)
 {
@@ -8696,6 +8758,8 @@ usb_start(void)
 	chiron_usbfn_handles();
 	chiron_platforminfo_view();
 
+	chiron_ring_dump("pre-start_ex");
+
 	chiron_dwc3_snap("A-before-start_ex");
 	/*
 	 * CHIRON_SKIP_START_EX
@@ -8907,6 +8971,7 @@ usb_start(void)
 
 		s = USB->start_ex(&set);
 		chiron_shim_report();
+		chiron_ring_dump("post-start_ex");
 	} else {
 		/*
 		 * CHIRON_HK6_ONLY_STARTS_ITSELF

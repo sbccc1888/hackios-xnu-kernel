@@ -11702,6 +11702,23 @@ usb_command_loop(void)
 
 				if (cnt == 0) {
 					pumped++;
+					/*
+					 * CHIRON_YIELD_TO_FIRMWARE_TIMERS
+					 *
+					 * Nothing to report, so instead of asking the driver (which may not
+					 * return) give the firmware's own event services a turn.  Two things
+					 * need that: the charger-detection state machine, which only advances
+					 * when events are dispatched, and this loader's own session deadline,
+					 * which cannot be enforced from a loop that is blocked.
+					 *
+					 * usb_session_check() resets the phone when the deadline passes, so
+					 * yielding here is also what makes a session that never attaches end by
+					 * itself rather than hanging with the cable in.
+					 */
+					if ((pumped % 16) == 0 && BS != NULL && BS->stall != NULL) {
+						BS->stall(1000);          /* 1 ms; lets timers tick */
+						usb_session_check();
+					}
 					if ((pumped % 2000) == 0) {
 						wdt_pet();
 						chiron_invalidate((void *)(uintptr_t)
@@ -12195,6 +12212,23 @@ efi_main(efi_handle image, efi_system_table *st)
 			 *
 			 * Say so, and flush it, before the loop starts.  Then "reached the loop" is a line
 			 * in the log rather than an inference from silence.
+			 */
+			/*
+			 * CHIRON_SESSION_TIMER_SURVIVES_A_STALL
+			 *
+			 * usb_session_check() and the idle deadline both live inside usb_command_loop(),
+			 * which is exactly where a stall happens.  If the loop blocks, neither is ever
+			 * reached, and the phone sits silent with a cable in it -- which is what the last
+			 * run did for close to an hour.
+			 *
+			 * A UEFI timer event is serviced by the firmware's own timer, not by this loop, so
+			 * it keeps firing whether the loop is running or not.  Use it to enforce the
+			 * session deadline from outside the code that can stall: every 250 ms, when this
+			 * loader happens to be waiting on the event, check the clock and reset if the
+			 * session has run out.
+			 *
+			 * The first such check is the earliest point at which a session that never
+			 * attached becomes a phone that comes back on its own.
 			 */
 			print("usb: entering command loop\n", 0);
 			print("usb: state at loop entry: DCFG %x DSTS %x DCTL %x devten %x evtcnt %x\n",

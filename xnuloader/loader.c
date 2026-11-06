@@ -5701,7 +5701,12 @@ chiron_qusb2_init(void)
 		{0x0a, 0x184},   /* pll_lock_delay */
 		{0xa5, 0x23c},   /* tune1, efuse trim folded in afterwards */
 		{0x09, 0x240},   /* tune2 */
-		{0x19, 0x0b4},   /* digital_timers_two */
+		/*
+		 * 0xB4 removed: PORT_POWERDOWN exists only in the v1 driver
+		 * (phy-msm-qusb.c).  chiron uses the v2 PHY (msm8998-v2.dtsi), whose driver
+		 * never references 0xB4 at all, so writing it here was programming a register
+		 * this PHY does not define.
+		 */
 	};
 	const uint64_t phy = 0xC012000ULL;
 	const uint64_t bcr = 0x112000ULL;
@@ -6061,7 +6066,11 @@ chiron_qusb2_reassert(void)
 		{0x0a, 0x184},   /* pll_lock_delay */
 		{0xa5, 0x23c},   /* tune1, efuse trim folded in afterwards */
 		{0x09, 0x240},   /* tune2 */
-		{0x19, 0x0b4},   /* digital_timers_two */
+		/*
+		 * 0xB4 omitted here for the same reason it was removed from
+		 * chiron_qusb2_init(): PORT_POWERDOWN is a v1-driver register and this PHY uses
+		 * the v2 driver, which never references it.
+		 */
 	};
 	const uint64_t phy = 0xC012000ULL;
 
@@ -7038,8 +7047,18 @@ chiron_port_powerdown(void)
 	uint8_t c4_before = *(volatile uint8_t *)(uintptr_t)(phy + 0xC4);
 	uint8_t st_f0, st_f4;
 
-	/* power down, clamp asserted, IO frozen */
-	*(volatile uint8_t *)(uintptr_t)(phy + 0xB4) = 0x23;
+	/*
+	 * CHIRON_B4_NOT_OURS
+	 *
+	 * This used to write 0xB4 = 0x23, described as "power down, clamp asserted, IO frozen".
+	 * 0xB4 is QUSB2PHY_PORT_POWERDOWN and it exists in the v1 driver only
+	 * (phy-msm-qusb.c:57); chiron runs the v2 PHY, whose driver never mentions the offset.
+	 * Writing it here set three bits in a register this PHY does not define, and every later
+	 * reader then reported the PHY as powered down and clamped when nothing of the sort was
+	 * happening.  That is where the "PORT_POWERDOWN 0x23" in the logs came from.
+	 *
+	 * The v2 power control is PWR_CTRL1 at 0x210, and chiron_qusb2_init() handles it.
+	 */
 	__asm__ volatile ("dsb sy" ::: "memory");
 
 	/*
@@ -9453,7 +9472,17 @@ usb_start(void)
 	}
 
 	chiron_pullup_audit("before");
-	chiron_power_up_phy();
+	/*
+	 * chiron_power_up_phy() used to run here, clearing POWER_DOWN / SLEEP_B / CLAMP_N_EN
+	 * from PHY 0xB4.  That register belongs to the v1 driver (phy-msm-qusb.c); the v2 driver
+	 * chiron actually uses (msm8998-v2.dtsi, phy-msm-qusb-v2.c) never touches 0xB4, and
+	 * grepping it for "0xb4" returns nothing.  So those bits meant nothing on this part and
+	 * the whole function was acting on a register that is not part of this PHY's map.
+	 *
+	 * The real power control is PWR_CTRL1 at 0x210, which chiron_qusb2_init() already
+	 * sequences correctly (assert POWR_DOWN, write the init seq, write TUNE1, clear
+	 * POWR_DOWN), matching qusb_phy_init() line for line.
+	 */
 	chiron_update_ref_clk();
 	chiron_enable_termination();
 	chiron_clear_disconnect();

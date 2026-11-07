@@ -13748,6 +13748,67 @@ efi_main(efi_handle image, efi_system_table *st)
 			}
 
 			/*
+			 * CHIRON_SUBMIT_A_TRANSFER
+			 *
+			 * An exhaustive search of UsbfnDwc3Dxe for writes to GEVNTADR, GEVNTSIZ and GEVNTCOUNT
+			 * finds exactly two sites, and neither is initialisation:
+			 *
+			 *   8b14/8b30/8b50   inside the routine at 0x8a40, which appends a 0x18-byte TRB and
+			 *                    hands it to the controller -- a transfer submission
+			 *   a45c/a460/a464   inside the event handler, on the acknowledge path
+			 *
+			 * So the ring registers are only ever programmed as part of submitting a transfer.  On
+			 * this port no transfer has ever been submitted, which is why GEVNTADR reads 0 and
+			 * GEVNTCOUNT never moves -- and why restoring a ring from the entry snapshot and then
+			 * waiting for events asked for something the driver only sets up during a transfer.
+			 *
+			 * The interface is the one in efi.h:541, whose order matches the disassembly of
+			 * UsbFnIo+0x50 at 0x3088 exactly:
+			 *
+			 *     Transfer(This, EndpointIndex, Direction, UINTN *BufferSize, VOID *Buffer)
+			 *     309c: mov w19, w2        Direction, validated <= 1
+			 *     30a0: mov w20, w1        EndpointIndex, validated <= 0xf
+			 *     30b4: mov x22, x3        BufferSize, must be non-null
+			 *     30bc: mov x21, x4        Buffer, must be non-null
+			 *
+			 * Submit a zero-length IN on endpoint 0.  A length of 0 is a legal USB control transfer
+			 * and asks the controller to produce a packet, which is what exercises the path that
+			 * programs the ring.  Whatever comes back is reported rather than interpreted.
+			 */
+			{
+				efi_usbfn_io *tfn = NULL;
+				static const efi_guid tg = QCOM_USBFN_IO_GUID;
+				uint64_t tsize = 0;
+				uint8_t *tbuf;
+
+				/* A buffer the controller can DMA to: the loader's own static area is fine. */
+				static uint8_t xfer_buf[512];
+
+				if (usb_dev_handle != NULL &&
+				    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &tg, (void **)&tfn)) &&
+				    tfn != NULL && tfn->transfer != NULL) {
+					efi_status ts;
+					uint64_t ring_before =
+					    *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400);
+
+					tbuf = xfer_buf;
+					tsize = 0;
+					ts = tfn->transfer(tfn, 0, 0, &tsize, tbuf);
+
+					print("xfer: transfer ep0 in size %x -> %x | adr %x->%x siz %x cnt %x\n",
+					    (uint64_t)tsize, (uint64_t)ts,
+					    ring_before,
+					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400),
+					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408),
+					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C));
+					flush_log();
+				} else {
+					print("xfer: no transfer method\n", 0);
+					flush_log();
+				}
+			}
+
+			/*
 			 * CHIRON_GEVNTCOUNT_PROBE
 			 *
 			 * GEVNTCOUNT (0xC40C) is a live DMA byte counter: the driver writes 0 when it

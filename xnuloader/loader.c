@@ -3104,6 +3104,7 @@ smc_call(uint64_t id, uint64_t a1, uint64_t a2, uint64_t *r1, uint64_t *r2)
  */
 static void chiron_udelay(uint64_t us);
 static void flush_log(void);
+static void chiron_invalidate(void *addr, uint64_t len);
 
 /* the event ring the vendor driver allocated, captured before the Mi 6 sequence clears it */
 static uint32_t g_mi6_evtadr, g_mi6_evtsiz;
@@ -3379,6 +3380,451 @@ chiron_mi6_install_events(void)
 	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC408),
 	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC40C));
 	flush_log();
+}
+
+/*
+ * ===========================================================================
+ * CHIRON_EP0_GADGET
+ *
+ * A complete DWC3 device-mode control endpoint, ported from MC-XiaoXiao/ios_sagit
+ * (Xiaomi Mi 6, same MSM8998, USB device mode measured working).  That port does not use
+ * any UEFI USB stack; it drives DWC3 directly, and its control-transfer code is small:
+ *
+ *   DWC3Transfer.h:51   initialize()   zero the TRB ring
+ *   DWC3Transfer.h:67   submit()       build TRBs, publish Owned on the first last
+ *   DWC3Core.h:366      startTransfer  DEPCMD Start with the ring address
+ *   DWC3Control.h:54    armSetup()     submit one 8-byte Setup TRB to EP0 OUT
+ *   DWC3Control.h:200   handle()       a completed Setup TRB carries the packet
+ *   DWC3Control.h:165   supplyData()   submit a DATA TRB with the reply
+ *   DWC3Control.h:64    startStatus()  submit a Status2/3 TRB
+ *   USBCDCACM.h:95      setup()        answer every standard request
+ *
+ * This is the piece that was missing: with usb_no_start_ex the class driver never owns EP0, so
+ * the host's GET_DESCRIPTOR went unanswered and Windows showed VID_0000&PID_0002.
+ *
+ * Register facts (DWC3Registers.h):
+ *   EventMask = 1<<31   Owned = 1   Last = 2   Chain = 4
+ *   InterruptShort = 1<<10   InterruptComplete = 1<<11
+ *   TRB is 16 bytes: addressLo, addressHi, size, control
+ *   DEPCMD at 0xc800 + ep*16: PAR2, PAR1, PAR0, then CMD with bit 10 (CMDACT)
+ *   Command codes: Configure=1, Resource=2, Start=6
+ * ===========================================================================
+ */
+
+#define CHIRON_TRB_OWNED    (1u << 0)
+#define CHIRON_TRB_LAST     (1u << 1)
+#define CHIRON_TRB_CHAIN    (1u << 2)
+#define CHIRON_TRB_ISHORT   (1u << 10)
+#define CHIRON_TRB_ICOMP    (1u << 11)
+#define CHIRON_TRB_TYPE(t)  ((uint32_t)(t) << 4)
+
+#define CHIRON_TRB_NORMAL       1
+#define CHIRON_TRB_SETUP        2
+#define CHIRON_TRB_STATUS2      3
+#define CHIRON_TRB_STATUS3      4
+#define CHIRON_TRB_CONTROLDATA  5
+
+typedef struct {
+	uint32_t address_lo;
+	uint32_t address_hi;
+	uint32_t size;
+	uint32_t control;
+} __attribute__((aligned(16))) chiron_trb;
+
+typedef struct {
+	uint8_t  request_type;
+	uint8_t  request;
+	uint16_t value;
+	uint16_t index;
+	uint16_t length;
+} chiron_setup;
+
+/* the gadget's whole context, kept in one place so the state is inspectable */
+static struct {
+	chiron_trb *out_trb;        /* EP0 OUT ring (host -> device) */
+	chiron_trb *in_trb;         /* EP0 IN  ring (device -> host) */
+	uint8_t    *setup_buf;      /* 8 bytes, DMA, holds the SETUP packet */
+	uint8_t    *data_buf;       /* reply buffer, DMA */
+	uint64_t    out_dma, in_dma, setup_dma, data_dma;
+	uint32_t    out_cap, in_cap, data_len;
+	uint8_t     address;
+	uint8_t     configuration;
+	int         ready;
+	uint64_t    setup_count;
+	uint64_t    last_setup_raw;
+} g_ep0;
+
+/*
+ * Build one TRB.  DWC3Transfer.h:127-135 writes address, size and control, sets Chain on every
+ * descriptor but the last, Last|InterruptComplete on the last, and publishes Owned separately.
+ * For the single-descriptor transfers used here Owned goes in from the start.
+ */
+static void
+chiron_trb_set(chiron_trb *t, uint64_t address, uint32_t bytes, uint32_t type, int more)
+{
+	t->address_lo = (uint32_t)address;
+	t->address_hi = (uint32_t)(address >> 32);
+	t->size = bytes;
+	t->control = CHIRON_TRB_TYPE(type) | CHIRON_TRB_ISHORT | CHIRON_TRB_OWNED |
+	    (more ? CHIRON_TRB_CHAIN : (CHIRON_TRB_LAST | CHIRON_TRB_ICOMP));
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/* DEPCMD helper: write PAR2/PAR1/PAR0 then CMD|CMDACT, wait for CMDACT to clear. */
+static int
+chiron_depcmd_start(uint32_t epbase, uint64_t ring, uint32_t type)
+{
+	uint32_t reply = 0;
+
+	*(volatile uint32_t *)(uintptr_t)(epbase + 0) = (uint32_t)(ring >> 32);
+	*(volatile uint32_t *)(uintptr_t)(epbase + 4) = (uint32_t)ring;
+	*(volatile uint32_t *)(uintptr_t)(epbase + 8) = 0;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(uintptr_t)(epbase + 12) = 6u | CHIRON_DEPCMD_ACTIVE;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	for (unsigned i = 0; i < 1000; i++) {
+		reply = *(volatile uint32_t *)(uintptr_t)(epbase + 12);
+		if ((reply & CHIRON_DEPCMD_ACTIVE) == 0) {
+			break;
+		}
+		chiron_udelay(10);
+	}
+	if ((reply & CHIRON_DEPCMD_ACTIVE) != 0) {
+		print("ep0: Start ep%x timed out (cmd %x)\n", (uint64_t)epbase, (uint64_t)reply);
+		return 0;
+	}
+	if (((reply >> 12) & 0xfu) != 0) {
+		print("ep0: Start ep%x status %x\n", (uint64_t)epbase,
+		    (uint64_t)((reply >> 12) & 0xfu));
+		return 0;
+	}
+	(void)type;
+	return 1;
+}
+
+/*
+ * armSetup -- DWC3Control.h:54.  One Setup TRB of exactly 8 bytes pointing at setup_buf, submitted
+ * to EP0 OUT (physical endpoint 0).  Until this is armed the controller has nowhere to put the
+ * packet the host sends, which is why the ring kept filling with nothing.
+ */
+static int
+chiron_ep0_arm_setup(void)
+{
+	uint32_t epbase = (uint32_t)(0xA800000ULL + 0xC800);
+
+	memset(g_ep0.setup_buf, 0, 8);
+	memset(g_ep0.out_trb, 0, sizeof(chiron_trb));
+	chiron_invalidate(g_ep0.setup_buf, 8);
+	chiron_trb_set(&g_ep0.out_trb[0], g_ep0.setup_dma, 8, CHIRON_TRB_SETUP, 0);
+	return chiron_depcmd_start(epbase, g_ep0.out_dma, CHIRON_TRB_SETUP);
+}
+
+/* Submit a DATA or STATUS stage on the given physical endpoint. */
+static int
+chiron_ep0_submit(uint32_t ep, uint64_t buf_dma, uint32_t bytes, uint32_t type)
+{
+	uint32_t epbase = (uint32_t)(0xA800000ULL + 0xC800 + ep * 16);
+	chiron_trb *ring = (ep & 1) ? g_ep0.in_trb : g_ep0.out_trb;
+	uint64_t ring_dma = (ep & 1) ? g_ep0.in_dma : g_ep0.out_dma;
+
+	memset(ring, 0, sizeof(chiron_trb));
+	chiron_trb_set(&ring[0], buf_dma, bytes, type, 0);
+	return chiron_depcmd_start(epbase, ring_dma, type);
+}
+
+/* Copy a reply into the DMA buffer and hand it to the host. */
+static void
+chiron_ep0_reply(const uint8_t *data, uint32_t total, uint32_t want)
+{
+	uint32_t n = total;
+
+	if (want < n) {
+		n = want;
+	}
+	memcpy(g_ep0.data_buf, data, n);
+	__asm__ volatile ("dsb sy" ::: "memory");
+	g_ep0.data_len = n;
+	(void)chiron_ep0_submit(1, g_ep0.data_dma, n, CHIRON_TRB_CONTROLDATA);
+}
+
+/* Build a string descriptor in the data buffer and send it. */
+static void
+chiron_ep0_string(const char *ascii, uint32_t want)
+{
+	uint32_t n = 0, i = 0;
+
+	while (ascii[n] != 0 && n < 20) {
+		n++;
+	}
+	g_ep0.data_buf[0] = (uint8_t)(2 + n * 2);
+	g_ep0.data_buf[1] = 3;
+	for (i = 0; i < n; i++) {
+		g_ep0.data_buf[2 + i * 2] = (uint8_t)ascii[i];
+		g_ep0.data_buf[3 + i * 2] = 0;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_ep0_reply(g_ep0.data_buf, 2 + n * 2, want);
+}
+
+/*
+ * Answer one standard request.  This is USBCDCACM.h:95 reduced to what fastboot needs, keeping its
+ * decisions: the descriptor bytes, the SET_ADDRESS / SET_CONFIGURATION ordering, and the
+ * requirement that those two only happen after a status stage -- which is why they are recorded
+ * here and applied by chiron_ep0_commit() instead of immediately.
+ */
+static void
+chiron_ep0_handle_setup(void)
+{
+	static const uint8_t dev_desc[18] = {
+		18, 1, 0x00, 0x02, 0x00, 0x00, 0x00, 64,
+		0xd1, 0x18, 0x0d, 0xd0, 0x00, 0x01, 1, 2, 3, 1
+	};
+	/*
+	 * One configuration, one interface, two bulk endpoints.  The interface is class FF /
+	 * subclass 42 / protocol 03, which is what makes Windows bind WinUSB and what the
+	 * success criterion in this project names.
+	 */
+	static const uint8_t cfg_desc[32] = {
+		9, 2, 32, 0, 1, 1, 0, 0x80, 50,
+		9, 4, 0, 0, 2, 0xff, 0x42, 0x03, 0,
+		7, 5, 0x81, 2, 0x00, 0x02, 0,
+		7, 5, 0x01, 2, 0x00, 0x02, 0
+	};
+	static const uint8_t qual_desc[10] = { 10, 6, 0x00, 0x02, 0x00, 0x00, 0x00, 64, 1, 0 };
+
+	chiron_setup *s = (chiron_setup *)(void *)g_ep0.setup_buf;
+	uint8_t rt = s->request_type;
+	uint8_t rq = s->request;
+	uint32_t value = s->value;
+	uint32_t index = s->index;
+	uint32_t length = s->length;
+	uint32_t type = value >> 8;
+	uint32_t num = value & 0xff;
+
+	g_ep0.last_setup_raw = (uint64_t)rt | ((uint64_t)rq << 8) |
+	    ((uint64_t)value << 16) | ((uint64_t)index << 32) | ((uint64_t)length << 48);
+
+	print("ep0: setup %x %x val %x idx %x len %x\n",
+	    (uint64_t)rt, (uint64_t)rq, (uint64_t)value, (uint64_t)index, (uint64_t)length);
+
+	/* GET_DESCRIPTOR */
+	if (rt == 0x80 && rq == 6) {
+		if (type == 1 && num == 0) {
+			chiron_ep0_reply(dev_desc, sizeof(dev_desc), length);
+			return;
+		}
+		if ((type == 2 || type == 7) && num == 0) {
+			chiron_ep0_reply(cfg_desc, sizeof(cfg_desc), length);
+			return;
+		}
+		if (type == 6 && num == 0) {
+			chiron_ep0_reply(qual_desc, sizeof(qual_desc), length);
+			return;
+		}
+		if (type == 3) {
+			if (num == 0 && index == 0) {
+				static const uint8_t lang[4] = { 4, 3, 0x09, 0x04 };
+				chiron_ep0_reply(lang, 4, length);
+				return;
+			}
+			if (index == 0x0409) {
+				if (num == 1) { chiron_ep0_string("XNULoader", length); return; }
+				if (num == 2) { chiron_ep0_string("xnuloader", length); return; }
+				if (num == 3) { chiron_ep0_string("xnuloader", length); return; }
+			}
+		}
+		/* unsupported descriptor: stall the request */
+		print("ep0: unknown descriptor type %x num %x\n", (uint64_t)type, (uint64_t)num);
+		(void)chiron_ep0_submit(0, 0, 0, CHIRON_TRB_STATUS2);
+		return;
+	}
+
+	/* SET_ADDRESS -- recorded, applied after the status stage (USBCDCACM.h:104) */
+	if (rt == 0x00 && rq == 5 && index == 0 && length == 0 && value < 128 && !g_ep0.configuration) {
+		g_ep0.address = (uint8_t)value;
+		print("ep0: SET_ADDRESS -> %x\n", (uint64_t)value);
+		(void)chiron_ep0_submit(1, 0, 0, CHIRON_TRB_STATUS2);
+		return;
+	}
+
+	/* SET_CONFIGURATION */
+	if (rt == 0x00 && rq == 9 && index == 0 && length == 0 && value <= 1 && g_ep0.address) {
+		g_ep0.configuration = (uint8_t)value;
+		print("ep0: SET_CONFIGURATION -> %x\n", (uint64_t)value);
+		(void)chiron_ep0_submit(1, 0, 0, CHIRON_TRB_STATUS2);
+		return;
+	}
+
+	/* GET_CONFIGURATION */
+	if (rt == 0x80 && rq == 8 && value == 0 && index == 0 && length == 1 && g_ep0.address) {
+		g_ep0.data_buf[0] = g_ep0.configuration;
+		chiron_ep0_reply(g_ep0.data_buf, 1, length);
+		return;
+	}
+
+	/* GET_STATUS */
+	if (rq == 0 && value == 0 && length == 2) {
+		g_ep0.data_buf[0] = 0;
+		g_ep0.data_buf[1] = 0;
+		if ((rt == 0x80 && index == 0) ||
+		    (rt == 0x81 && g_ep0.configuration && index < 2) ||
+		    (rt == 0x82 && (index == 0 || index == 0x80))) {
+			chiron_ep0_reply(g_ep0.data_buf, 2, length);
+			return;
+		}
+	}
+
+	/* SET_FEATURE / CLEAR_FEATURE / SET_INTERFACE: accept with an empty status */
+	if ((rt == 0x02 && (rq == 1 || rq == 3) && length == 0) ||
+	    (rt == 0x01 && rq == 11 && length == 0) ||
+	    (rt == 0x00 && rq == 11 && length == 0)) {
+		(void)chiron_ep0_submit(1, 0, 0, CHIRON_TRB_STATUS2);
+		return;
+	}
+
+	print("ep0: unhandled %x %x val %x\n", (uint64_t)rt, (uint64_t)rq, (uint64_t)value);
+	(void)chiron_ep0_submit(1, 0, 0, CHIRON_TRB_STATUS2);
+	chiron_ep0_arm_setup();
+}
+
+/*
+ * Apply a deferred SET_ADDRESS to DCFG.  DWC3Control.h:240 does this in setAddress().
+ */
+static void
+chiron_ep0_apply_address(void)
+{
+	uint32_t cfg = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC700);
+
+	cfg = (cfg & ~(127u << 3)) | ((uint32_t)g_ep0.address << 3);
+	*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC700) = cfg;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	print("ep0: DCFG address applied, DCFG %x\n", (uint64_t)cfg);
+}
+
+/*
+ * Allocate the rings and start serving.  Three separate DMA buffers, 16-byte aligned and
+ * non-overlapping, which is what DWC3Control.h:110 initialize() insists on.
+ */
+/* a bump allocator over one page-aligned static region, so the DMA buffers are known-reachable */
+static uint8_t g_ep0_arena[16384] __attribute__((aligned(4096)));
+static uint64_t g_ep0_arena_used;
+
+static void *
+chiron_ep0_alloc(uint64_t bytes)
+{
+	uint64_t base = (uint64_t)(uintptr_t)g_ep0_arena;
+	uint64_t off = g_ep0_arena_used;
+
+	if (bytes == 0 || bytes > sizeof(g_ep0_arena) || off + bytes > sizeof(g_ep0_arena)) {
+		return NULL;
+	}
+	g_ep0_arena_used = off + ((bytes + 63u) & ~63ull);
+	return (void *)(uintptr_t)(base + off);
+}
+
+/* the MMU is off in this loader, so the CPU address is the DMA address */
+static uint64_t
+chiron_ep0_phys(void *p)
+{
+	return (uint64_t)(uintptr_t)p;
+}
+
+static int
+chiron_ep0_init(void *(*alloc)(uint64_t), uint64_t (*virt_to_phys)(void *))
+{
+	void *o, *i2, *s2, *d2;
+
+	if (g_ep0.ready) {
+		return 1;
+	}
+	o  = alloc(4096);
+	i2 = alloc(4096);
+	s2 = alloc(4096);
+	d2 = alloc(4096);
+	if (o == NULL || i2 == NULL || s2 == NULL || d2 == NULL) {
+		print("ep0: allocation failed\n", 0);
+		return 0;
+	}
+	g_ep0.out_trb = o;
+	g_ep0.in_trb = i2;
+	g_ep0.setup_buf = s2;
+	g_ep0.data_buf = d2;
+	g_ep0.out_dma = virt_to_phys(o);
+	g_ep0.in_dma = virt_to_phys(i2);
+	g_ep0.setup_dma = virt_to_phys(s2);
+	g_ep0.data_dma = virt_to_phys(d2);
+	g_ep0.out_cap = 256;
+	g_ep0.in_cap = 256;
+	memset(o, 0, 4096);
+	memset(i2, 0, 4096);
+	memset(s2, 0, 4096);
+	memset(d2, 0, 4096);
+	g_ep0.ready = 1;
+
+	print("ep0: rings out %x/%x in %x/%x setup %x data %x\n",
+	    (uint64_t)g_ep0.out_dma, (uint64_t)(uintptr_t)o,
+	    (uint64_t)g_ep0.in_dma, (uint64_t)(uintptr_t)i2,
+	    (uint64_t)g_ep0.setup_dma, (uint64_t)g_ep0.data_dma);
+	flush_log();
+	return 1;
+}
+
+/*
+ * Pump the event ring and act on completions.  Event layout (DWC3Registers.h):
+ *   word & 1        == 1  -> device event, type = (word >> 8) & 0xff
+ *   word & 1        == 0  -> endpoint event, ep = (word >> 1) & 31, type = (word >> 6) & 15
+ * A completed Setup TRB arrives as endpoint event type 1 on EP0.
+ */
+static void
+chiron_ep0_poll(void)
+{
+	const uint64_t d = 0xA800000ULL;
+	uint32_t adr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
+	uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C) & 0xfffcu;
+
+	if (adr == 0 || cnt == 0) {
+		return;
+	}
+	chiron_invalidate((void *)(uintptr_t)adr, cnt);
+
+	while (cnt >= 4) {
+		uint32_t raw = *(volatile uint32_t *)(uintptr_t)adr;
+		uint32_t words = 1;
+
+		/* device events occupy 4 words when they carry parameters; endpoint events 1 */
+		if (raw & 1u) {
+			words = (raw & 0x10u) ? 4u : 1u;
+			print("ep0: dev event %x\n", (uint64_t)((raw >> 8) & 0xffu));
+		} else {
+			uint32_t ep = (raw >> 1) & 31u;
+			uint32_t type = (raw >> 6) & 0xfu;
+			uint32_t status = (raw >> 12) & 0xfu;
+
+			if (ep == 0 && type == 1 && status == 0) {
+				g_ep0.setup_count++;
+				__asm__ volatile ("dsb sy" ::: "memory");
+				chiron_invalidate(g_ep0.setup_buf, 8);
+				chiron_ep0_handle_setup();
+				if (g_ep0.address != 0) {
+					chiron_ep0_apply_address();
+					g_ep0.address = 0;   /* applied once */
+				}
+			} else {
+				print("ep0: ep event ep%x type%x st%x\n",
+				    (uint64_t)ep, (uint64_t)type, (uint64_t)status);
+			}
+		}
+		/* consume these words */
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC40C) =
+		    words * 4u < cnt ? words * 4u : cnt;
+		cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C) & 0xfffcu;
+		adr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
+		if (cnt == 0) {
+			break;
+		}
+		chiron_invalidate((void *)(uintptr_t)adr, cnt);
+	}
 }
 
 /*
@@ -13073,50 +13519,67 @@ usb_start(void)
 	}
 
 	/*
-	 * CHIRON_READ_THE_RING_MYSELF
+	 * CHIRON_EP0_TAKES_OVER
 	 *
-	 * The last run reached a state no previous run had: the PHY drove D+ (ln 1), the host reset the
-	 * bus, and the controller wrote real event records into the ring -- 28 bytes, stuck at 1c for the
-	 * whole 111 ms probe because nothing consumed them.  The class driver does not drain them, so the
-	 * setup packet the host sent is still sitting there, unread.
+	 * From here the loader answers the host itself, and the class driver is not in this path at
+	 * all -- usb_no_start_ex leaves it without EP0, which is exactly why the descriptor request
+	 * went unanswered and Windows showed VID_0000&PID_0002.
 	 *
-	 * This reads the ring directly.  GEVNTCOUNT holds bytes; the records are 4 bytes each, and a
-	 * device event is flagged in bit 0 while an endpoint event has it clear (DWC3Registers.h: read,
-	 * Xiaomi Mi 6 port, Event::device() / endpointNumber()).  Dump the raw words so the actual
-	 * traffic is visible instead of inferred:
+	 * Runs whether or not the Mi 6 fallback ran: the rings and the armed Setup TRB are needed in
+	 * both cases.
+	 */
+	/*
+	 * CHIRON_EP0_NEEDS_ENDPOINTS_FIRST
 	 *
-	 *     TRB type 1 = Control Setup, carrying the 8-byte SETUP packet in the following words
-	 *     TRB type 2 = Control Data
-	 *     TRB type 3 = Control Status
+	 * The first attempt armed the Setup TRB straight away and the hardware aborted it:
+	 *
+	 *     mi6: gate conn 0 ln 1 -> skip, vendor link is live
+	 *     ep0: Start epa80c800 status 1
+	 *
+	 * status 1 is command abort, and the reason is in the line above it: skipping the Mi 6
+	 * sequence also skipped chiron_mi6_endpoints(), so EP0 was never Configured or given a
+	 * Resource and DALEPENA was still 0.  A Start command against an unconfigured endpoint cannot
+	 * succeed -- the endpoint has no transfer resource to start on.
+	 *
+	 * So configure EP0 here regardless of whether the Mi 6 sequence ran.  This is idempotent for
+	 * the case where it did run: the sequence leaves DALEPENA = 3 for exactly these two endpoints.
 	 */
 	{
-		const uint64_t d2 = 0xA800000ULL;
-		uint32_t adr = *(volatile uint32_t *)(uintptr_t)(d2 + 0xC400);
-		uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(d2 + 0xC40C) & 0xfffcu;
+		uint32_t dalepena = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC720);
 
-		print("mi6ring: adr %x cnt %x\n", (uint64_t)adr, (uint64_t)cnt);
-
-		if (adr != 0 && cnt != 0) {
-			unsigned n = cnt / 4u;
-
-			if (n > 16) {
-				n = 16;
-			}
-			chiron_invalidate((void *)(uintptr_t)adr, cnt);
-
-			for (unsigned i = 0; i < n; i++) {
-				print("  ev%x raw %x\n", (uint64_t)i,
-				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(adr + i * 4u));
-			}
-
-			/* consume them so the counter is seen to move */
-			*(volatile uint32_t *)(uintptr_t)(d2 + 0xC40C) = cnt;
-			__asm__ volatile ("dsb sy" ::: "memory");
-			print("mi6ring: consumed, cnt now %x\n",
-			    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(d2 + 0xC40C) & 0xfffcu));
+		print("ep0: DALEPENA before ensure %x\n", (uint64_t)dalepena);
+		if ((dalepena & 3u) != 3u) {
+			chiron_mi6_endpoints();
 		}
-		flush_log();
+		print("ep0: DALEPENA now %x\n",
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC720));
 	}
+
+	if (chiron_ep0_init(chiron_ep0_alloc, chiron_ep0_phys)) {
+		if (chiron_ep0_arm_setup()) {
+			print("ep0: armed, waiting for the host\n", 0);
+		} else {
+			print("ep0: arm failed\n", 0);
+		}
+	}
+	flush_log();
+
+	/*
+	 * CHIRON_THE_RING_BELONGS_TO_EP0_NOW
+	 *
+	 * There used to be a debug dump here that read the event ring and consumed it, to find out
+	 * what the host was sending.  It did its job -- the records are in the handover document --
+	 * and now it is actively harmful: the run that first got EP0 armed shows it eating the very
+	 * events EP0 exists to answer.
+	 *
+	 *     ep0: armed, waiting for the host
+	 *     mi6ring: adr 99f1f000 cnt 28
+	 *     mi6ring: consumed, cnt now 0
+	 *     evtcnt probe: 0 0 0 0
+	 *
+	 * From here the ring is drained by chiron_ep0_poll() in the command loop, which acts on the
+	 * events instead of discarding them.
+	 */
 	chiron_dwc3_snap("C-after-mi6");
 
 	print("usb: started\n");
@@ -13947,6 +14410,24 @@ usb_command_loop(void)
 		}
 
 		usb_session_check();
+
+		/*
+		 * CHIRON_EP0_RUNS_WHETHER_OR_NOT_CONNECTED_IS_SET
+		 *
+		 * This call used to sit below the usb_connected gate, so it never ran: enumeration is
+		 * what makes usb_connected true, so waiting for the flag before answering the host is a
+		 * deadlock.  The log shows both halves of it -- the endpoint armed, the ring holding 28
+		 * bytes, and not one ep0: line afterwards:
+		 *
+		 *     ep0: armed, waiting for the host
+		 *     evtcnt probe: 28 28 28 28
+		 *     state at loop entry: ... evtcnt 28 evtadr 99f26000
+		 *
+		 * EP0 has to be serviced first; the flag is a consequence of doing so, not a
+		 * precondition for it.
+		 */
+		chiron_ep0_poll();
+
 		if (!usb_connected) {
 			/*
 			 * CHIRON_USB_QUIET_WAIT: with no host attached this runs again and again.

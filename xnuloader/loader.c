@@ -8217,6 +8217,73 @@ chiron_usbfn_endpoints(void)
 	print("\n", 0);
 
 	/*
+	 * CHIRON_STARTEX_SLOTS
+	 *
+	 * UsbDeviceDxe's StartEx (0x1c5c) does not use the object we hold.  It reads its own cached
+	 * pointer from a module global and calls through it:
+	 *
+	 *     1c80: adrp x21, 0xa000
+	 *     1c84: ldr  x0,  [x21, #0x410]     cached UsbFnIo
+	 *     1c88: ldr  x8,  [x0, #0x78]       slot 0x78
+	 *     1c8c: blr  x8
+	 *     1c94: tbnz x19, #0x3f, 0x1d54     fail -> return
+	 *     1c98: ldr  x0,  [x21, #0x410]
+	 *     1c9c: ldr  x9,  [x0, #0x70]       slot 0x70
+	 *     1ca0: blr  x9
+	 *     1ca8: tbnz x19, #0x3f, 0x1d20     fail -> print and return x19
+	 *
+	 * so the 0x02 StartEx reports comes from one of those two slots on THAT object.  Print both,
+	 * through the driver's own cache, so the responsible one is identified rather than guessed.
+	 */
+	{
+		/*
+		 * There is no signature predicate for UsbDeviceDxe, so reach its module base through the
+		 * loaded image that publishes the UsbDevice protocol instead of scanning for it.
+		 */
+		static const efi_guid dev_guid = QCOM_USB_DEVICE_GUID;
+		efi_handle dh = NULL;
+		uint64_t dbase = 0;
+
+		if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &dev_guid, NULL, &(uint64_t){0}, &dh))) {
+			BS->free_pool(dh);
+		}
+		(void)dh;
+		{
+			efi_handle h1 = NULL;
+			efi_loaded_image *li1 = NULL;
+			efi_handle *hs1 = NULL;
+			uint64_t n1 = 0;
+
+			if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &dev_guid, NULL, &n1, &hs1)) &&
+			    n1 != 0 &&
+			    !EFI_ERROR(BS->handle_protocol(hs1[0], &EFI_LOADED_IMAGE_GUID,
+			    (void **)&li1)) && li1 != NULL) {
+				dbase = (uint64_t)(uintptr_t)li1->image_base;
+			}
+			if (hs1 != NULL) {
+				BS->free_pool(hs1);
+			}
+		}
+
+		if (dbase != 0) {
+			uint64_t cached = *(volatile uint64_t *)(uintptr_t)(dbase + 0xa410);
+
+			print("startex: dev %x cached %x ours %x\n",
+			    dbase, cached, (uint64_t)(uintptr_t)fn);
+			if (cached >= 0x9b000000ULL && cached < 0x9c000000ULL) {
+				print("startex: cached +70 %x +78 %x | ours +70 %x +78 %x\n",
+				    *(volatile uint64_t *)(uintptr_t)(cached + 0x70),
+				    *(volatile uint64_t *)(uintptr_t)(cached + 0x78),
+				    (uint64_t)(uintptr_t)fn->start_controller,
+				    (uint64_t)(uintptr_t)fn->stop_controller);
+			}
+		} else {
+			print("startex: UsbDevice image not found by signature\n", 0);
+		}
+		flush_log();
+	}
+
+	/*
 	 * CHIRON_DRIVER_ORDER
 	 *
 	 * ConfigureEnableEndpoints before StartController, which is the order

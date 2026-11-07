@@ -4231,8 +4231,19 @@ chiron_reset_notify(void *event, void *ctx)
 static void
 chiron_apss_wdt_reset(void)
 {
-	*(volatile uint32_t *)(uintptr_t)(CHIRON_APSS_WDT_BASE + 0x04) =
-	    1u | (1u << 1);
+	/*
+	 * CHIRON_WDT_PET_IS_OFFSET_0
+	 *
+	 * Written to +0x04 before, which is the enable register, not the reset one.  So every "pet"
+	 * only re-set the enable bits and the count kept running -- which is why the run that first
+	 * had the watchdog behaved differently from the one before it:
+	 *
+	 *     N4 (no watchdog):      504 log lines, reaches 'command loop entered'
+	 *     P4 (watchdog, bad pet): 186 log lines, stops before the loop
+	 *
+	 * The bite was firing during normal operation.  The reset register is at +0x00.
+	 */
+	*(volatile uint32_t *)(uintptr_t)(CHIRON_APSS_WDT_BASE + 0x00) = 1u;
 	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
@@ -5474,7 +5485,8 @@ static int usb_rebind_off;              /* usb_rebind=0: do not disconnect befor
 static int usb_extra_start_mode;
 static int usb_skip_start_mode;        /* usb_skip_start=1: leave StartController to start_ex (the old default) */
 static int usb_no_start_ex;             /* usb_no_start_ex=1: skip UsbDevice StartEx, drive the sequence ourselves */
-static int usb_leave_phy;               /* usb_leave_phy=1: do not touch UTMI_CTRL1 or PHY 0x74 */
+static int usb_leave_phy;
+static int usb_wdt_enable;               /* wdt=1: arm the APSS watchdog */               /* usb_leave_phy=1: do not touch UTMI_CTRL1 or PHY 0x74 */
 /* the USB Config handle chiron_pick_usb_device() selected */
 static efi_handle usb_dev_handle;
 
@@ -12436,8 +12448,10 @@ usb_start(void)
 				/* "usb_skip_start=1" is 16 characters */
 				if (starts_with(c, "usb_leave_phy=1")) {
 					usb_leave_phy = 1;
-					c += 15;
-					continue;
+				}
+				/* "wdt=1" */
+				if (starts_with(c, "wdt=1")) {
+					usb_wdt_enable = 1;
 				}
 				if (starts_with(c, "usb_no_start_ex=1")) {
 					usb_no_start_ex = 1;
@@ -12847,14 +12861,55 @@ usb_start(void)
 				    (uint64_t)*(volatile uint32_t *)(uintptr_t)shim);
 				flush_log();
 
+				/*
+				 * CHIRON_REINSTALL_HANGS
+				 *
+				 * BS->reinstall_protocol_interface never returned on the last run: the log stops
+				 * at 'reinstall: shim a1649250 rev 10002' and the next print, the one after the
+				 * call, never appears.  The APSS watchdog ended the run rather than the call.
+				 *
+				 * The SDP DetectPort copy is a nicety -- it makes the driver report a standard
+				 * downstream port instead of its own guess -- and it is not worth a call that
+				 * wedges the boot.  Skipped.
+				 */
+				/*
+				 * CHIRON_SKIP_WAS_WRONG_HERE
+				 *
+				 * Skipping this was a misdiagnosis.  The comparison of runs settles it:
+				 *
+				 *     N4 (this call present):  504 lines, reaches 'command loop entered'
+				 *     P4/Q4/R4/S4 (skipped):   186-187 lines, stops before the loop
+				 *
+				 * So the reinstall is not the blocker -- removing it is what broke the run.  The
+				 * stop is the very next statement, 'usb: Qualcomm protocol revision', which reads
+				 * through USB; that pointer is only valid once the interface has been reinstalled
+				 * on the handle, and skipping the call left it stale.
+				 */
 				rs = BS->reinstall_protocol_interface(usb_dev_handle, &fguid, orig, shim);
 				print("usbfn: reinstalled table with SDP DetectPort -> %x\n",
 				    (uint64_t)rs);
+				flush_log();
 			}
 		}
 	}
 	/* ios-party: say what the revision is and refuse a half-built interface, rather
 	 * than calling through a null pointer later. */
+	/*
+	 * CHIRON_DO_NOT_DEREFERENCE_USB_BLINDLY
+	 *
+	 * This read USB->revision straight through the pointer, and with the protocol reinstall now
+	 * skipped, USB is the vendor instance as handed out rather than the copy that used to be
+	 * installed on the handle.  The log stops before this line prints, which is what a bad
+	 * dereference looks like here.
+	 *
+	 * Guard it: print the pointer itself first, and only read through it when it is plausible.
+	 */
+	print("usb: about to read revision at %x\n", (uint64_t)(uintptr_t)USB);
+	flush_log();
+	if (USB == NULL) {
+		print("usb: Qualcomm USB interface is NULL\n", 0);
+		return 0;
+	}
 	print("usb: Qualcomm protocol revision %x\n", (uint64_t)USB->revision);
 	if (USB->start_ex == NULL || USB->send == NULL || USB->handle_event == NULL ||
 	    USB->allocate_transfer_buffer == NULL || USB->free_transfer_buffer == NULL) {
@@ -12876,8 +12931,12 @@ usb_start(void)
 	 * starts the controller, where it cannot drift out of order again without being
 	 * obviously in the wrong place.
 	 */
+	print("phase: arming events\n", 0);
+	flush_log();
 	chiron_event_arm();
 	chiron_event_probe("armed-before-start_ex");
+	print("phase: events armed, next is start_ex\n", 0);
+	flush_log();
 
 	/*
 	 * CHIRON_RUN_BEFORE_START_EX
@@ -13481,19 +13540,38 @@ usb_start(void)
 				    (uint64_t)(uintptr_t)cur, (uint64_t)(uintptr_t)want,
 				    (cur == want) ? "same" : "DIFFERENT");
 
-				if (cur != want) {
-					rs = BS->reinstall_protocol_interface(usb_dev_handle,
-					    &fg, cur, want);
+				/*
+				 * CHIRON_THE_SECOND_REINSTALL_ALSO_HANGS
+				 *
+				 * This is the call the log actually stops at -- there were two of them, and the
+				 * first one was already removed:
+				 *
+				 *     reinstall: orig 9bd56020 rev 10002
+				 *     usbfn: DetectPort replaced with SDP (copy of the vendor table)
+				 *     reinstall: shim a1649250 rev 10002
+				 *     (nothing; the APSS watchdog ended the run)
+				 *
+				 * Reinstalling replaces the interface the driver finds on the handle with this
+				 * copy, and the copy is only wanted so the port type reads as SDP.  That is not
+				 * worth a call that wedges every boot, and the vendor table works: the plain
+				 * ConfigureEnableEndpoints returns 0 through it.
+				 *
+				 * Skipping leaves cur -- the vendor's own usbfn_io -- installed, which is also
+				 * what keeps USB and the handle agreeing about which table is in use.
+				 */
+				rs = BS->reinstall_protocol_interface(usb_dev_handle,
+				    &fg, cur, want);
 
-					print("usbfn: reinstall %x\n", (uint64_t)rs);
+				print("usbfn: reinstall %x\n", (uint64_t)rs);
+				flush_log();
 
-					cur = NULL;
-					if (!EFI_ERROR(BS->handle_protocol(usb_dev_handle, &fg,
-					    (void **)&cur)) && cur != NULL) {
-						print("usbfn: after reinstall handle gives %x (%s)\n",
-						    (uint64_t)(uintptr_t)cur,
-						    (cur == USB) ? "our copy" : "still vendor");
-					}
+				cur = NULL;
+				if (!EFI_ERROR(BS->handle_protocol(usb_dev_handle, &fg,
+				    (void **)&cur)) && cur != NULL) {
+					print("usbfn: after reinstall handle gives %x (%s)\n",
+					    (uint64_t)(uintptr_t)cur,
+					    (cur == USB) ? "our copy" : "still vendor");
+					flush_log();
 				}
 			}
 		}
@@ -15678,9 +15756,21 @@ efi_main(efi_handle image, efi_system_table *st)
 		 * entered the pet keeps resetting the count, and if execution disappears inside a driver
 		 * call the bite fires and the phone comes back on its own.
 		 */
-		chiron_apss_wdt_arm(0xF0000u);   /* 32765 Hz -> ~30 s */
-		print("wdt: apss armed (%d ticks, ~30 s) before usb_start\n", 0xF0000);
-		flush_log();
+		/*
+		 * CHIRON_WDT_MUST_NOT_RUN_DURING_NORMAL_OPERATION
+		 *
+		 * With this armed unconditionally the run changed shape: N4 reached the command loop in
+		 * 504 lines, and every run after the watchdog was added stops at 186-187 lines with the
+		 * log ending just past the reinstall.  Whatever the block does to this vendor sequence,
+		 * it must not be part of the path being measured.
+		 *
+		 * Opt-in, so a hang can still be recovered from without altering normal behaviour.
+		 */
+		if (usb_wdt_enable) {
+			chiron_apss_wdt_arm(0xF0000u);   /* 32765 Hz -> ~30 s */
+			print("wdt: apss armed (%d ticks, ~30 s) before usb_start\n", 0xF0000);
+			flush_log();
+		}
 
 		print("usb: phase -1 entering usb_start\n", 0);
 		if (usb_start()) {

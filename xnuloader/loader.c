@@ -3450,6 +3450,8 @@ static struct {
 	uint8_t     address;
 	uint8_t     configuration;
 	uint32_t    speed;          /* 0 = high, 1 = full, 2 = super */
+	uint32_t    resource;       /* EP0 OUT transfer resource from Resource */
+	int         armed;          /* a Setup TRB is outstanding */
 	int         connected;
 	int         ready;
 	uint64_t    setup_count;
@@ -3510,10 +3512,53 @@ chiron_depcmd_start(uint32_t epbase, uint64_t ring, uint32_t type)
  * to EP0 OUT (physical endpoint 0).  Until this is armed the controller has nowhere to put the
  * packet the host sends, which is why the ring kept filling with nothing.
  */
+/*
+ * Stop whatever transfer EP0 OUT still has outstanding.  Needed before every re-arm: the
+ * controller refuses Start with status 1 while the endpoint is active, which is exactly what the
+ * first attempt after a bus reset hit --
+ *
+ *     ep0: bus reset, re-arming
+ *     ep0: Start epa80c800 status 1
+ *
+ * DWC3Transfer.h:150 is the reference call, command End with CommandForce and CommandInterrupt and
+ * the transfer resource in bits 22:16.
+ */
+static void
+chiron_ep0_end_out(uint32_t resource)
+{
+	uint32_t epbase = (uint32_t)(0xA800000ULL + 0xC800);
+	uint32_t reply = 0;
+
+	*(volatile uint32_t *)(uintptr_t)(epbase + 0) = 0;
+	*(volatile uint32_t *)(uintptr_t)(epbase + 4) = 0;
+	*(volatile uint32_t *)(uintptr_t)(epbase + 8) = 0;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	/* command 8 = End, Force = 1<<11, Interrupt = 1<<8, resource << 16 */
+	*(volatile uint32_t *)(uintptr_t)(epbase + 12) =
+	    8u | CHIRON_DEPCMD_ACTIVE | (1u << 11) | (1u << 8) | ((resource & 127u) << 16);
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	for (unsigned i = 0; i < 200; i++) {
+		reply = *(volatile uint32_t *)(uintptr_t)(epbase + 12);
+		if ((reply & CHIRON_DEPCMD_ACTIVE) == 0) {
+			break;
+		}
+		chiron_udelay(10);
+	}
+	/* let the controller settle before the next Start */
+	chiron_udelay(200);
+}
+
 static int
 chiron_ep0_arm_setup(void)
 {
 	uint32_t epbase = (uint32_t)(0xA800000ULL + 0xC800);
+
+	/* an outstanding transfer makes Start fail; clear it first if one is running */
+	if (g_ep0.armed) {
+		chiron_ep0_end_out(g_ep0.resource);
+		g_ep0.armed = 0;
+	}
 
 	memset(g_ep0.setup_buf, 0, 8);
 	memset(g_ep0.out_trb, 0, sizeof(chiron_trb));
@@ -3538,6 +3583,9 @@ chiron_ep0_arm_setup(void)
 	{
 		int rc = chiron_depcmd_start(epbase, g_ep0.out_dma, CHIRON_TRB_SETUP);
 
+		if (rc) {
+			g_ep0.armed = 1;
+		}
 		print("ep0: arm rc %d DGTYPE %x PAR0 %x PAR1 %x PAR2 %x\n",
 		    (uint64_t)rc,
 		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(epbase + 12),
@@ -3809,105 +3857,87 @@ static void
 chiron_ep0_poll(void)
 {
 	const uint64_t d = 0xA800000ULL;
-	unsigned drained = 0;
+	static uint32_t event_offset;
 	static uint64_t polls;
-	static uint32_t said_ep[16], said_dev[16];
-	uint32_t adr, cnt;
+	uint32_t adr, raw, count, n;
 
 	polls++;
 	adr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
-	cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C) & 0xfffcu;
+	raw = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C);
 
 	/*
-	 * Dump the raw ring once.  The decoder keeps seeing device type 3 and consuming 16 bytes for
-	 * it, and the same record keeps coming back, so the width is wrong or the acknowledgement is
-	 * not what the controller expects.  The words themselves settle it:
+	 * CHIRON_DRAIN_LIKE_MI6
 	 *
-	 *     quarter 1  low nibble 0x1    -> device event, word 3 = (word >> 8) & 15
-	 *     quarter 1  low nibble 0x0    -> endpoint event
+	 * Mi 6's drainEvents (DWC3Core.h:433-463) does this and nothing else:
+	 *
+	 *     raw = read(eventCount); count = raw & 0xffff;
+	 *     if ((count & 3) || count > eventBytes) return HardwareError;
+	 *     ... walk the snapshot in 4-byte steps, wrapping at eventBytes ...
+	 *     write(eventCount, count);            once, at the end
+	 *
+	 * Three things about that matter here, and the previous version got all three wrong:
+	 *
+	 *   - the step is 4 bytes, not the record's own width.  DWC3 event records are one word at a
+	 *     time; a device-specific event simply occupies four of those steps.
+	 *   - the read offset wraps around the buffer rather than restarting at the base.
+	 *   - the acknowledgement is a single write of the whole count after the snapshot has been
+	 *     walked, not one write per record.  Acknowledging per record advanced the count while the
+	 *     snapshot was still being read, which is why the same event came back every pass:
+	 *
+	 *         ep0: devspec type 3 param 0
+	 *         ep0: link state 0
+	 *         (again, and again, and again)
 	 */
-	if (polls == 1 && adr != 0 && cnt != 0) {
-		unsigned n = cnt / 4u;
-		unsigned shown = 0, i;
-
-		if (n > 14) {
-			n = 14;
-		}
-		chiron_invalidate((void *)(uintptr_t)adr, cnt);
-		for (i = 0; i < n; i++) {
-			print("  ringw%x %x\n", (uint64_t)i,
-			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(adr + i * 4u));
-			shown++;
-		}
-		print("ep0: ring dumped %d words of %x bytes\n",
-		    (uint64_t)shown, (uint64_t)cnt);
-		flush_log();
+	if (raw == 0xffffffffu) {
+		return;
 	}
-
-	if (polls == 1 || polls == 100000) {
-		print("ep0: poll %d adr %x cnt %x\n",
-		    (uint64_t)polls, (uint64_t)adr, (uint64_t)cnt);
-		flush_log();
-	}
-	if (adr == 0 || cnt == 0 || cnt > 0x1000) {
+	count = raw & 0xffffu;
+	if (count == 0 || (count & 3u) != 0u || count > 0x1000u) {
 		return;
 	}
 
-	chiron_invalidate((void *)(uintptr_t)adr, cnt);
+	chiron_invalidate((void *)(uintptr_t)adr, count);
 
-	/*
-	 * Event decoding, from DWC3Registers.h:56-64:
-	 *
-	 *     device()          word & 1
-	 *     deviceSpecific()  (word & 0xff) == 1     -- only these carry 3 parameter words
-	 *     endpointNumber()  (word >> 1) & 31
-	 *     type()            device() ? (word >> 8) & 15 : (word >> 6) & 15
-	 *     status()          (word >> 12) & 15
-	 *     parameters()      word >> 16
-	 *
-	 * Everything is in the first word; the width is 16 bytes only for a device-specific event and
-	 * 4 bytes otherwise.  An earlier version tested bit 4 of the word instead of bits 7:0, and
-	 * consumed the wrong number of bytes for every record after the first.
-	 */
-	while (drained < 256) {
-		uint32_t raw = *(volatile uint32_t *)(uintptr_t)adr;
-		uint32_t bytes = 4;
+	/* validate the snapshot before acting on any of it */
+	{
+		uint32_t off = event_offset;
 
-		drained++;
+		for (n = 0; n < count; n += 4) {
+			uint32_t word = *(volatile uint32_t *)(uintptr_t)(adr + off);
 
-		if ((raw & 0xffu) == 1u) {
-			/*
-			 * A device-specific event, 4 words.  Mi 6 handles these in QcomUSBDevice.cpp:314-335
-			 * and the switch is short:
-			 *
-			 *     case 0: disconnect
-			 *     case 1: beginBusReset()          re-arm EP0 for the new session
-			 *     case 2: read DSTS, decode speed, negotiate EP0, connect
-			 *     case 3: link state; 3 = suspend, 0 = resume
-			 *     case 6: suspend
-			 *
-			 * Only 1 and 2 need doing here: 1 re-arms the Setup TRB so the next control transfer
-			 * has somewhere to land, and 2 re-negotiates EP0's packet size and says the device is
-			 * connected.  Without 1 a bus reset leaves EP0 with no armed TRB and the host's
-			 * follow-up requests are lost, which is what the ring has been showing.
-			 */
-			uint32_t kind = (raw >> 8) & 15u;
-			uint32_t param = raw >> 16;
+			if ((word & 1u) == 0u && (((word >> 1) & 31u) >= 2u)) {
+				print("ep0: bad endpoint %x in event %x\n",
+				    (uint64_t)((word >> 1) & 31u), (uint64_t)word);
+				flush_log();
+				return;
+			}
+			off += 4;
+			if (off >= 0x1000u) {
+				off = 0;
+			}
+		}
+	}
 
-			bytes = 16;
-			print("ep0: devspec type %x param %x\n", (uint64_t)kind, (uint64_t)param);
+	for (n = 0; n < count; n += 4) {
+		uint32_t word = *(volatile uint32_t *)(uintptr_t)(adr + event_offset);
+
+		event_offset += 4;
+		if (event_offset >= 0x1000u) {
+			event_offset = 0;
+		}
+
+		if (word & 1u) {
+			uint32_t kind = (word >> 8) & 15u;
+			uint32_t param = word >> 16;
+
+			print("ep0: dev type %x param %x\n", (uint64_t)kind, (uint64_t)param);
 			flush_log();
 
 			if (kind == 1u) {
-				/* bus reset: the controller discarded its TRBs, so arm a fresh one */
 				print("ep0: bus reset, re-arming\n", 0);
 				flush_log();
 				(void)chiron_ep0_arm_setup();
 			} else if (kind == 2u) {
-				/*
-				 * connect: USBDeviceIsochronous.h:11 decodes DSTS & 7.
-				 *   0 = High, 1 or 3 = Full, 4 = Super
-				 */
 				uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(d + 0xC70C);
 				uint32_t spd = dsts & 7u;
 
@@ -3916,73 +3946,32 @@ chiron_ep0_poll(void)
 				print("ep0: connect DSTS %x spd %x\n",
 				    (uint64_t)dsts, (uint64_t)spd);
 				flush_log();
-				/* the connect follows a reset, so EP0 needs its Setup TRB again */
 				(void)chiron_ep0_arm_setup();
 			} else if (kind == 0u) {
 				g_ep0.connected = 0;
-			} else if (kind == 3u) {
-				/* link state: param & 15, 3 = suspend, 0 = resume */
-				uint32_t link = param & 15u;
-
-				print("ep0: link state %x\n", (uint64_t)link);
-				flush_log();
-			}
-		} else if (raw & 1u) {
-			/* device event, 1 word */
-			uint32_t kind = (raw >> 8) & 15u;
-			unsigned i;
-
-			for (i = 0; i < 16; i++) {
-				if (said_dev[i] == kind + 0x100u) {
-					break;
-				}
-				if (said_dev[i] == 0) {
-					said_dev[i] = kind + 0x100u;
-					print("ep0: devev type %x\n", (uint64_t)kind);
-					flush_log();
-					break;
-				}
 			}
 		} else {
-			uint32_t ep = (raw >> 1) & 31u;
-			uint32_t type = (raw >> 6) & 15u;
-			uint32_t status = (raw >> 12) & 15u;
-			unsigned i;
+			uint32_t ep = (word >> 1) & 31u;
+			uint32_t type = (word >> 6) & 15u;
+			uint32_t status = (word >> 12) & 15u;
 
-			for (i = 0; i < 16; i++) {
-				uint32_t key = (ep << 8) | (type << 4) | status;
+			print("ep0: ep%x type%x st%x\n",
+			    (uint64_t)ep, (uint64_t)type, (uint64_t)status);
+			flush_log();
 
-				if (said_ep[i] == key + 1u) {
-					break;
-				}
-				if (said_ep[i] == 0) {
-					said_ep[i] = key + 1u;
-					print("ep0: epev ep%x type%x st%x\n",
-					    (uint64_t)ep, (uint64_t)type, (uint64_t)status);
-					flush_log();
-					break;
-				}
-			}
-
-			/* a completed Setup TRB on EP0 is endpoint event type 1, status 0 */
 			if (ep == 0 && type == 1 && status == 0) {
 				g_ep0.setup_count++;
+				g_ep0.armed = 0;        /* that TRB has completed */
+				chiron_ep0_end_out(g_ep0.resource);
 				chiron_invalidate(g_ep0.setup_buf, 8);
 				chiron_ep0_handle_setup();
 			}
 		}
-
-		/* acknowledge exactly the words this record occupied */
-		*(volatile uint32_t *)(uintptr_t)(d + 0xC40C) = bytes;
-		__asm__ volatile ("dsb sy" ::: "memory");
-
-		cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C) & 0xfffcu;
-		if (cnt == 0 || cnt > 0x1000) {
-			break;
-		}
-		adr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
-		chiron_invalidate((void *)(uintptr_t)adr, cnt);
 	}
+
+	/* one acknowledgement for the whole snapshot, as Mi 6 does */
+	*(volatile uint32_t *)(uintptr_t)(d + 0xC40C) = count;
+	__asm__ volatile ("dsb sy" ::: "memory");
 }
 
 /*
@@ -14602,6 +14591,52 @@ usb_command_loop(void)
 		 * run ahead of the code that answers the host.
 		 */
 		chiron_ep0_poll();
+
+		/*
+		 * CHIRON_EP0_OWNS_THE_RING
+		 *
+		 * While the gadget is running, nothing else may touch the event ring.  The code below
+		 * calls usb_wait(), which calls USB->handle_event() whenever the ring is non-empty, and
+		 * that hands our endpoint completions to the vendor class driver -- built to own this
+		 * controller, and it discards what it does not recognise.
+		 *
+		 * The raw ring dump shows what that costs.  Fourteen consecutive words:
+		 *
+		 *     ringw0 301  ringw1 50301  ringw2 30301  ringw3 30601
+		 *     ringw4 101  ringw5 201    ringw6 301 ...
+		 *
+		 * every one with bit 0 set, so every record is a device event and not one endpoint event
+		 * survives to be acted on.  EP0's armed Setup TRB therefore never completes and the host
+		 * never gets a descriptor.
+		 *
+		 * So when EP0 is up, this loop does exactly one thing per pass: poll EP0.  The fastboot
+		 * command path below stays reachable only when the gadget did not start.
+		 */
+		if (g_ep0.ready) {
+			/*
+			 * CHIRON_THE_DEADLINE_STILL_RUNS_WHILE_EP0_OWNS_THE_RING
+			 *
+			 * The first version of this branch was a bare continue, and it stranded the phone:
+			 * the session deadline lives further down the loop body, so jumping out here meant
+			 * the idle check never ran and the device sat in the loader until the power button
+			 * was held.  Nothing that services the host may also disable the way out.
+			 *
+			 * Keep the deadline and the watchdog where they are, then loop.
+			 */
+			uint64_t now_ep0 = 0;
+
+			__asm__ volatile ("mrs %0, CNTVCT_EL0" : "=r" (now_ep0));
+			if (now_ep0 - idle_from > idle_limit) {
+				print("\n== USB session idle for %d s (ep0 path); resetting ==\n",
+				    (uint64_t)idle_secs);
+				flush_log();
+				auto_reboot = 1;
+				reboot();
+			}
+			usb_session_check();
+			wdt_pet();
+			continue;
+		}
 
 		/*
 		 * CHIRON_USB_NO_SPAM

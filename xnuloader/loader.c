@@ -8411,10 +8411,27 @@ chiron_usbfn_endpoints(void)
 		 * onward (cbz x1, then ldr from +0x00, +0x08, +0x10).  Try the same structure the plain
 		 * entry accepts, so the two calls differ in nothing but the entry point.
 		 */
+		/*
+		 * CHIRON_SS_INFO_IS_A_CONFIG_INFO
+		 *
+		 * The third argument is not an EFI_USB_DEVICE_INFO.  0x8230 reads it as a
+		 * EFI_USB_CONFIG_INFO:
+		 *
+		 *     83b8: ldr  x3,  [x1]           config_descriptor
+		 *     83bc: cbz  x3,  0x84c0         null -> error
+		 *     83c0: ldr  x10, [x1, #0x8]     interface_info_table
+		 *     83c4: cbz  x10, 0x84dc         null -> error
+		 *     83c8: ldrb w11, [x3, #0x4]     num_interfaces
+		 *     83d0: b    0x8500              walk it
+		 *
+		 * Passing &dev_info (DeviceDescriptor + ConfigInfoTable) therefore puts a device
+		 * descriptor where a config descriptor is expected, and the walk goes wrong.  Pass the
+		 * config_info the plain entry already accepts, which is the right shape.
+		 */
 		{
-			efi_status ex_same = fn->configure_enable_endpoints_ex(fn, &dev_info, &dev_info);
+			efi_status ex_cfg = fn->configure_enable_endpoints_ex(fn, &dev_info, &cfg_info);
 
-			print("usbfn: ConfigureEnableEndpoints_ex(plain struct) %x\n", (uint64_t)ex_same);
+			print("usbfn: ConfigureEnableEndpoints_ex(ss=cfg_info) %x\n", (uint64_t)ex_cfg);
 		}
 		flush_log();
 		flush_log();

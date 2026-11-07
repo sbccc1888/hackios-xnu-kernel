@@ -4190,6 +4190,7 @@ static int usb_clean_mode;               /* usb_clean=1: let start_ex own the wh
 static int usb_rebind_off;              /* usb_rebind=0: do not disconnect before connect */
 static int usb_extra_start_mode;
 static int usb_skip_start_mode;        /* usb_skip_start=1: leave StartController to start_ex (the old default) */
+static int usb_no_start_ex;             /* usb_no_start_ex=1: skip UsbDevice StartEx, drive the sequence ourselves */
 /* the USB Config handle chiron_pick_usb_device() selected */
 static efi_handle usb_dev_handle;
 
@@ -10392,6 +10393,11 @@ usb_start(void)
 				}
 				/* "usb_extra_start=1" is 17 characters */
 				/* "usb_skip_start=1" is 16 characters */
+				if (starts_with(c, "usb_no_start_ex=1")) {
+					usb_no_start_ex = 1;
+					c += 16;
+					continue;
+				}
 				if (starts_with(c, "usb_skip_start=1") &&
 				    (c[16] == 0 || c[16] == ' ')) {
 					usb_skip_start_mode = 1;
@@ -11404,7 +11410,41 @@ usb_start(void)
 			flush_log();
 		}
 
-		s = USB->start_ex(&set);
+		/*
+		 * CHIRON_NO_START_EX
+		 *
+		 * StartEx's endpoint step calls ConfigureEnableEndpointsEx (+0x90 -> RVA 0x2584), which
+		 * walks a second, SuperSpeed three-level descriptor structure inside 0x8230 and answers
+		 * EFI_INVALID_PARAMETER against anything this USB2-only port can supply.  The plain
+		 * ConfigureEnableEndpoints entry succeeds on the same descriptors, and stop_controller
+		 * and start_controller both answer 0 when called directly here.
+		 *
+		 * So with usb_no_start_ex=1 the loader performs that sequence itself and skips StartEx
+		 * entirely, which sidesteps 0x8230 without inventing SuperSpeed descriptors for a port
+		 * that has none.
+		 */
+		if (usb_no_start_ex) {
+			efi_status (*f_stop)(void) = (efi_status (*)(void))USB->stop;
+			efi_status (*f_start)(void) = (efi_status (*)(void))USB->start;
+			efi_status s_stop = (f_stop != NULL) ? f_stop() : 0;
+			efi_status s_ep;
+			efi_status s_start;
+
+			print("nostartex: stop %x\n", (uint64_t)s_stop);
+
+			s_ep = chiron_usbfn_configure_only() ? 0 : 0x8000000000000002ULL;
+			print("nostartex: configure endpoints %x\n", (uint64_t)s_ep);
+
+			s_start = (f_start != NULL) ? f_start() : 0;
+			print("nostartex: start %x\n", (uint64_t)s_start);
+			chiron_ring_dump("post-nostartex");
+			flush_log();
+
+			s = (EFI_ERROR(s_stop) || EFI_ERROR(s_ep) || EFI_ERROR(s_start)) ?
+			    (EFI_ERROR(s_start) ? s_start : (EFI_ERROR(s_ep) ? s_ep : s_stop)) : 0;
+		} else {
+			s = USB->start_ex(&set);
+		}
 		chiron_shim_report();
 		chiron_ring_dump("post-start_ex");
 	chiron_phy_follows_core();

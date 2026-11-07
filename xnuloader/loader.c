@@ -5056,6 +5056,45 @@ chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
 	{
 		s = BS->connect_controller(controller, drivers, NULL, 0);
 		print("hk6: connect DWC3 on %x -> %x\n", (uint64_t)(uintptr_t)controller, (uint64_t)s);
+
+		/*
+		 * CHIRON_FOLLOW_THE_CONTROLLER
+		 *
+		 * usb_dev_handle was chosen by chiron_pick_usb_device() as the handle carrying a
+		 * peripheral UsbConfig, but the binding was started by connecting a different handle.
+		 * The log shows the two apart:
+		 *
+		 *     fnio[0]: handle 9bdaba98 instance 9bdc4020 rev 10002      real usbfn_io
+		 *     fnio[1]: handle 9bd56e98 instance a1648250 rev 10000001   our copy, on the old handle
+		 *     dev: 1 handle(s) carry UsbDevice (ours is 9bd56e98)
+		 *
+		 * and every later handle_protocol(usb_dev_handle, USBFN) therefore returned the shim
+		 * copy rather than the controller the driver actually started.  cfgonly then called
+		 * configure_enable_endpoints on a foreign table and the boot ended there with no fault
+		 * recorded.
+		 *
+		 * If the connect succeeded, follow it: usb_dev_handle becomes the handle that now has a
+		 * working UsbFnIo on it.
+		 */
+		if (!EFI_ERROR(s)) {
+			static const efi_guid ng = QCOM_USBFN_IO_GUID;
+			efi_usbfn_io *now = NULL;
+
+			if (!EFI_ERROR(BS->handle_protocol(controller, &ng, (void **)&now)) &&
+			    now != NULL && *(volatile uint32_t *)(uintptr_t)now == 0x10002u) {
+				print("hk6: usb_dev_handle %x -> %x (rev %x)\n",
+				    (uint64_t)(uintptr_t)usb_dev_handle,
+				    (uint64_t)(uintptr_t)controller,
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)now);
+				usb_dev_handle = controller;
+			} else {
+				print("hk6: connected handle %x has no usbfn_io (rev %x), keeping %x\n",
+				    (uint64_t)(uintptr_t)controller,
+				    (now != NULL) ? (uint64_t)*(volatile uint32_t *)(uintptr_t)now : 0,
+				    (uint64_t)(uintptr_t)usb_dev_handle);
+			}
+			flush_log();
+		}
 	}
 
 	/*
@@ -10040,6 +10079,30 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 		return orig;
 	}
 	/*
+	 * CHIRON_REFUSE_A_FOREIGN_TABLE
+	 *
+	 * The log showed the installed copy carrying the wrong revision:
+	 *
+	 *     fnio[0]: handle 9bdaba98 instance 9bdc4020 rev 10002       real usbfn_io
+	 *     fnio[1]: handle 9bd56e98 instance a1648250 rev 10000001  <- ours
+	 *
+	 * 0x10002 is usbfn_io's revision and 0x10000001 is usb_device_protocol's, so that copy was
+	 * built by memcpy-ing a usb_device_protocol.  Once "done" latches, the bad copy is what every
+	 * later lookup returns, and StartEx then reads usbfn_io offsets out of foreign memory.
+	 *
+	 * Refuse to copy anything that is not a usbfn_io, and say so.
+	 */
+	{
+		uint32_t rev = *(volatile uint32_t *)(uintptr_t)orig;
+
+		if (rev != 0x10002u) {
+			print("shim: refusing to copy %x: revision %x is not usbfn_io (0x10002)\n",
+			    (uint64_t)(uintptr_t)orig, (uint64_t)rev);
+			flush_log();
+			return orig;
+		}
+	}
+	/*
 	 * CHIRON_SHIM_TRACE
 	 *
 	 * g_orig_usbfn is meant to hold the vendor instance captured before the reinstall, yet
@@ -11681,8 +11744,38 @@ usb_start(void)
 			 * configure the endpoints through usbfn_io, which is the step that was missing in
 			 * every previous attempt.  Starting the controller is left to whatever runs afterwards.
 			 */
-			s_start = 0;
-			print("nostartex: endpoints configured, controller start left to the caller\n", 0);
+			/*
+			 * CHIRON_START_VIA_USBFNIO
+			 *
+			 * The usb_hk6_only branch further down already does the right thing for exactly this
+			 * situation -- it starts the controller through UsbFnIo's start_controller instead of
+			 * through UsbDeviceDxe:
+			 *
+			 *     11728: handle_protocol(usb_dev_handle, &usbfn_guid, &fn)
+			 *     11731: s = fn->start_controller(fn);
+			 *
+			 * with the comment: "nothing else starts the controller any more ... so start it
+			 * here, through UsbFnIo, which is what HK6 was previously assumed to have done."
+			 *
+			 * Do the same here rather than leaving the core halted, which would make any
+			 * comparison meaningless.
+			 */
+			{
+				efi_usbfn_io *sfn = NULL;
+				static const efi_guid sguid = QCOM_USBFN_IO_GUID;
+
+				if (usb_dev_handle != NULL &&
+				    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &sguid,
+				    (void **)&sfn)) && sfn != NULL &&
+				    sfn->start_controller != NULL) {
+					s_start = sfn->start_controller(sfn);
+					print("nostartex: start_controller via UsbFnIo %x\n",
+					    (uint64_t)s_start);
+				} else {
+					s_start = 0;
+					print("nostartex: no UsbFnIo start_controller\n", 0);
+				}
+			}
 			chiron_ring_dump("post-nostartex");
 			flush_log();
 

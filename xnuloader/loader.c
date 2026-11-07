@@ -4229,6 +4229,7 @@ static int usb_rebind_off;              /* usb_rebind=0: do not disconnect befor
 static int usb_extra_start_mode;
 static int usb_skip_start_mode;        /* usb_skip_start=1: leave StartController to start_ex (the old default) */
 static int usb_no_start_ex;             /* usb_no_start_ex=1: skip UsbDevice StartEx, drive the sequence ourselves */
+static int usb_leave_phy;               /* usb_leave_phy=1: do not touch UTMI_CTRL1 or PHY 0x74 */
 /* the USB Config handle chiron_pick_usb_device() selected */
 static efi_handle usb_dev_handle;
 
@@ -9030,8 +9031,16 @@ static void
 chiron_enable_dp_pullup(void)
 {
 	const uint64_t phy = 0xC012000ULL;
-	uint8_t before = *(volatile uint8_t *)(uintptr_t)(phy + 0x74);
-	uint8_t want = (uint8_t)((before | (1u << 3)) & ~(1u << 1));   /* RDP_UP_EN, RDM_UP_EN off */
+	uint8_t before;
+	uint8_t want;
+
+	if (usb_leave_phy) {
+		print("dpup: skipped (usb_leave_phy)\n", 0);
+		return;
+	}
+
+	before = *(volatile uint8_t *)(uintptr_t)(phy + 0x74);
+	want = (uint8_t)((before | (1u << 3)) & ~(1u << 1));   /* RDP_UP_EN, RDM_UP_EN off */
 
 	if (want == before) {
 		print("dpup: 74 already %x\n", (uint64_t)before);
@@ -9342,7 +9351,21 @@ static void
 chiron_enable_termination(void)
 {
 	const uint64_t phy = 0xC012000ULL;
-	uint8_t before = *(volatile uint8_t *)(uintptr_t)(phy + 0xC0);
+	uint8_t before;
+
+	/*
+	 * CHIRON_LEAVE_PHY_ALONE
+	 *
+	 * The entry snapshot, taken while fastboot still had this port working, reads PHY 0x74 = 0x00
+	 * and PHY 0xC0 = 0x00.  This loader sets them to 0x08 and 0x15, which is a real difference
+	 * from a state that demonstrably worked, so usb_leave_phy=1 leaves both alone for comparison.
+	 */
+	if (usb_leave_phy) {
+		print("term: skipped (usb_leave_phy)\n", 0);
+		return;
+	}
+
+	before = *(volatile uint8_t *)(uintptr_t)(phy + 0xC0);
 	/*
 	 * CHIRON_UTMI_CTRL1_FULL
 	 *
@@ -10535,6 +10558,11 @@ usb_start(void)
 				}
 				/* "usb_extra_start=1" is 17 characters */
 				/* "usb_skip_start=1" is 16 characters */
+				if (starts_with(c, "usb_leave_phy=1")) {
+					usb_leave_phy = 1;
+					c += 15;
+					continue;
+				}
 				if (starts_with(c, "usb_no_start_ex=1")) {
 					usb_no_start_ex = 1;
 					c += 16;

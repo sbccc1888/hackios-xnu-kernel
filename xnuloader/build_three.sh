@@ -47,7 +47,7 @@ PY
 echo "=== rebuilding from loader.efi $(stat -c%y "$K/xnuloader/loader.efi" | cut -d. -f1) ==="
 build USB_A.img "debug=0x8 epoch=A"                || exit 1
 build USB_B.img "debug=0x8 epoch=B usb_no_epcfg=1 usb_skip_start=1" || exit 1
-build USB_C.img "debug=0x8 epoch=C usb_noop_startstop=1 usb_no_start_ex=1" || exit 1
+build USB_C.img "debug=0x8 epoch=C usb_noop_startstop=1 usb_no_start_ex=1 usb_leave_phy=1" || exit 1
 
 # --- refuse to leave stale artefacts behind --------------------------
 efi_time=$(stat -c %Y "$K/xnuloader/loader.efi")

@@ -5776,19 +5776,35 @@ chiron_qusb2_init(void)
 	 * The v1 numbers from msm8998.dtsi (0xf0 / 0x0f, no 0xb4 entry) do not match
 	 * what the hardware actually held.
 	 */
+	/*
+	 * CHIRON_SEQ_FROM_THE_VENDOR_START_PATH
+	 *
+	 * Taken from UsbConfigStartController's mode-4 arm rather than from the Linux driver.  The
+	 * firmware builds x19 = 0xc012210 (PWR_CTRL1) and then writes, in this order:
+	 *
+	 *     4374  x19          <- 0x23   PWR_CTRL1     (done by the caller, before this function)
+	 *     43dc  x19 - 0x20c  <- 0x13   0xc012004
+	 *     43e8  x19 - 0x84   <- 0x7c   0xc01218c
+	 *     43f4  x19 - 0x1e4  <- 0x80   0xc01202c
+	 *     4400  x19 - 0x8c   <- 0x0a   0xc012184
+	 *     440c  x19 - 0x15c  <- 0x19   0xc0120b4   PORT_POWERDOWN
+	 *     4418  x19 + 0x30   <- 0x09   0xc012240
+	 *     4424  x19 + 0x2c   <- 0xa5   0xc01223c   TUNE1
+	 *     4430  x19 + 0x0c   <- 0x00   0xc01221c
+	 *
+	 * 0xb4 was removed earlier on the argument that PORT_POWERDOWN is a v1-driver register.  The
+	 * vendor firmware writes 0x19 there on this board, in this path, every time it starts the
+	 * peripheral.  It is back, in the position the firmware writes it.
+	 */
 	static const uint32_t seq[][2] = {
 		{0x13, 0x004},   /* analog_controls_two */
 		{0x7c, 0x18c},   /* pll_clock_inverter */
 		{0x80, 0x02c},   /* pll_cmode */
 		{0x0a, 0x184},   /* pll_lock_delay */
-		{0xa5, 0x23c},   /* tune1, efuse trim folded in afterwards */
+		{0x19, 0x0b4},   /* PORT_POWERDOWN -- as the vendor start path writes it */
 		{0x09, 0x240},   /* tune2 */
-		/*
-		 * 0xB4 removed: PORT_POWERDOWN exists only in the v1 driver
-		 * (phy-msm-qusb.c).  chiron uses the v2 PHY (msm8998-v2.dtsi), whose driver
-		 * never references 0xB4 at all, so writing it here was programming a register
-		 * this PHY does not define.
-		 */
+		{0xa5, 0x23c},   /* tune1 */
+		{0x00, 0x21c},   /* as the vendor sequence ends */
 	};
 	const uint64_t phy = 0xC012000ULL;
 	const uint64_t bcr = 0x112000ULL;
@@ -5846,13 +5862,28 @@ chiron_qusb2_init(void)
 	 * Put back whatever the firmware had when it was found, and only fall back to the computed
 	 * trim if entry was zero (which would mean the PHY was not initialised at all).
 	 */
-	if (g_entry_tune1 != 0) {
-		*(volatile uint8_t *)(uintptr_t)(phy + 0x23C) = g_entry_tune1;
-		__asm__ volatile ("dsb sy" ::: "memory");
-		print("tune1: restored entry %x (init had set 45)\n", (uint64_t)g_entry_tune1);
-	} else {
-		chiron_efuse_tune1();
-	}
+	/*
+	 * CHIRON_TUNE1_IS_A5
+	 *
+	 * This block used to write the entry value (0xf0) back over TUNE1, on the argument that 0xf0
+	 * is what a working fastboot session left behind and 0x45 is a computed trim.
+	 *
+	 * Disassembling UsbConfigDxe's peripheral start path (0x436c..0x4430) settles what the vendor
+	 * firmware actually writes on this board:
+	 *
+	 *     4278/427c  x19 = 0xc012210                    PWR_CTRL1
+	 *     4374       x19          <- 0x23
+	 *     4424       x19 + 0x2c   <- 0xa5    = 0xc01223c  TUNE1
+	 *     4418       x19 + 0x30   <- 0x09    = 0xc012240  TUNE5
+	 *     440c       x19 - 0x15c  <- 0x19    = 0xc0120b4  PORT_POWERDOWN
+	 *
+	 * 0xa5 is the value.  Not 0xf0.  The entry snapshot's 0xf0 is what the firmware left behind
+	 * after its own sequence, which is a different thing from what it writes when it starts the
+	 * peripheral.
+	 *
+	 * So keep 0xa5 from the init sequence and leave it alone.
+	 */
+	print("tune1: left at a5 per the vendor start sequence\n", 0);
 	/*
 	 * CHIRON_QUSB2_PWRUP_KEEPS_POWR_DOWN
 	 *

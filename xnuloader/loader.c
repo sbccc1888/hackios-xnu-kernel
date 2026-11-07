@@ -13663,11 +13663,22 @@ efi_main(efi_handle image, efi_system_table *st)
 			 * DCTL reads 0x90f00000, so bit30 is clear: the core is stopped.  This starts it the way the
 			 * driver does, then reports whether the bit sticks.
 			 */
-			chiron_dwc3_run_core();
+			/*
+			 * CHIRON_DO_NOT_TOUCH_DCTL_HERE
+			 *
+			 * This called chiron_dwc3_run_core(), which wrote bits[23:20] and bit28 of DCTL.  The
+			 * measured effect was to break the connection:
+			 *
+			 *     before that change   DSTS 0x920001   Connected 1
+			 *     after that change    DSTS 0x120000   Connected 0
+			 *
+			 * bit31 (RunStop) was already set in both cases, so the core was running either way and
+			 * the extra field writes only cost the attach.  DCTL is left as the driver set it.
+			 */
 			{
 				uint64_t dwc1 = 0xA800000ULL;
 
-				print("runstop: DCTL %x DSTS %x | bit30 %x\n",
+				print("runstop: DCTL %x DSTS %x (left alone)\n",
 				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704),
 				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC70C),
 				    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704) >> 30) & 1));
@@ -13675,12 +13686,13 @@ efi_main(efi_handle image, efi_system_table *st)
 			}
 
 			print("usb: entering command loop\n", 0);
-			print("usb: state at loop entry: DCFG %x DSTS %x DCTL %x devten %x evtcnt %x\n",
+			print("usb: state at loop entry: DCFG %x DSTS %x DCTL %x devten %x evtcnt %x evtadr %x\n",
 			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC700),
 			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC70C),
 			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC704),
 			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC708),
-			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C));
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C),
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400));
 			flush_log();
 
 			usb_command_loop();

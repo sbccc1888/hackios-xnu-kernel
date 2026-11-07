@@ -4219,9 +4219,47 @@ chiron_reset_notify(void *event, void *ctx)
 	}
 }
 
+/*
+ * CHIRON_APSS_WDT_PET
+ *
+ * wdt_pet() above only ever did anything on platform_redwood -- chiron runs platform_qemu_virt, so
+ * VIRT_WDT_* were never implemented and the pet was a no-op.  The real block at 0x17817000 is what
+ * the Mi 6 platform tree documents, and writing 1 to its reset register resets the count.
+ */
+#define CHIRON_APSS_WDT_BASE 0x17817000ULL
+
+static void
+chiron_apss_wdt_reset(void)
+{
+	*(volatile uint32_t *)(uintptr_t)(CHIRON_APSS_WDT_BASE + 0x04) =
+	    1u | (1u << 1);
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
+/*
+ * Start counting.  The block runs on the always-on clock, so once this is set the SoC resets even
+ * if every CPU is stuck inside vendor code -- which is the case this is meant to survive.
+ */
+static void
+chiron_apss_wdt_arm(uint32_t bite_ticks)
+{
+	*(volatile uint32_t *)(uintptr_t)(CHIRON_APSS_WDT_BASE + 0x08) = 1u;  /* clear status */
+	*(volatile uint32_t *)(uintptr_t)(CHIRON_APSS_WDT_BASE + 0x04) = 1u | (1u << 1);
+	*(volatile uint32_t *)(uintptr_t)(CHIRON_APSS_WDT_BASE + 0x10) = bite_ticks;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	*(volatile uint32_t *)(uintptr_t)(CHIRON_APSS_WDT_BASE + 0x04) =
+	    1u | (1u << 1) | (1u << 3);
+	__asm__ volatile ("dsb sy" ::: "memory");
+}
+
 static void
 wdt_pet(void)
 {
+	/*
+	 * The APSS block is the one that matters here; reset it on every pet so the count never
+	 * reaches the bite while the loop is running normally.
+	 */
+	chiron_apss_wdt_reset();
 	if (wdt_armed) {
 		smc_call(VIRT_WDT_PET, 0, 0, NULL, NULL);
 	}
@@ -4299,6 +4337,56 @@ exception_handler(int64_t type, uint64_t *ctx)
 		 */
 		print("\n== fault: attempting reset ==\n");
 		flush_log();
+
+		/*
+		 * CHIRON_APSS_WATCHDOG_IS_THE_LAST_RESORT
+		 *
+		 * Everything below this point had already been tried and none of it worked: the log from
+		 * the last run ends here, with no reset and no reboot, and the phone stayed wedged until
+		 * the power button was held.
+		 *
+		 * PSCI through SMC and HVC, the runtime service, and BS->set_watchdog_timer are all
+		 * software requests to something that may itself be the thing that crashed.  The APSS
+		 * watchdog is not: once its bite time is programmed it counts on the always-on clock and
+		 * resets the SoC whether or not any code is still running.
+		 *
+		 * MSM8998 puts it at 0x17817000 with a 32765 Hz input clock -- the same device the Mi 6
+		 * platform tree describes and whose bridge takes over as the recovery timer:
+		 *
+		 *     watchdog@17817000 {
+		 *         compatible = "qcom,msm-watchdog";
+		 *         reg = <0 0x17817000 0 0x1000>;
+		 *         clock-frequency = <32765>;
+		 *         status = "okay"; // QcomWatchdog takes over the bridge recovery timer.
+		 *     };
+		 *
+		 * Program the shortest timeout the block allows and then spin.  If anything above did
+		 * work this is never reached; if nothing did, this is what ends the run.
+		 */
+		{
+			const uint64_t wdt = 0x17817000ULL;
+			uint32_t status = *(volatile uint32_t *)(uintptr_t)(wdt + 0x08);
+
+			print("wdt: at %x status %x\n", wdt, (uint64_t)status);
+			flush_log();
+
+			/* clear any pending expiry first, then unreset the block */
+			*(volatile uint32_t *)(uintptr_t)(wdt + 0x08) = 1u;
+			*(volatile uint32_t *)(uintptr_t)(wdt + 0x04) = 0u | (1u << 0);
+			__asm__ volatile ("dsb sy" ::: "memory");
+
+			/* bite = first tick; bark is left alone so the bite is what fires */
+			*(volatile uint32_t *)(uintptr_t)(wdt + 0x10) = 1u;
+			__asm__ volatile ("dsb sy" ::: "memory");
+
+			/* enable: bit0 EN, bit1 UNRESET (already set) */
+			*(volatile uint32_t *)(uintptr_t)(wdt + 0x04) =
+			    1u | (1u << 1) | (1u << 3);
+			__asm__ volatile ("dsb sy" ::: "memory");
+
+			print("wdt: armed, waiting for the bite\n");
+			flush_log();
+		}
 
 		/*
 		 * PSCI SYSTEM_RESET, through whichever conduit this platform uses.  psci_by_hvc is
@@ -15575,6 +15663,24 @@ efi_main(efi_handle image, efi_system_table *st)
 				flush_log();
 			}
 		}
+
+		/*
+		 * CHIRON_ARM_THE_APSS_WATCHDOG_BEFORE_USB_START
+		 *
+		 * This is the only thing that has actually ended a wedged run.  The UEFI timer needs an
+		 * interrupt to be taken, the fault handler's PSCI/HVC/ResetSystem all failed outright
+		 * (its log ends at 'fault: attempting reset' with no reset following), and the virtual
+		 * watchdog the loader already had is a Quest hypervisor call that MSM8998 does not
+		 * implement.
+		 *
+		 * 0x17817000 counts on the always-on clock at 32765 Hz.  0xF0000 ticks is about thirty
+		 * seconds; the loop pets it every pass, so normal operation never gets near it.  If the loop is
+		 * entered the pet keeps resetting the count, and if execution disappears inside a driver
+		 * call the bite fires and the phone comes back on its own.
+		 */
+		chiron_apss_wdt_arm(0xF0000u);   /* 32765 Hz -> ~30 s */
+		print("wdt: apss armed (%d ticks, ~30 s) before usb_start\n", 0xF0000);
+		flush_log();
 
 		print("usb: phase -1 entering usb_start\n", 0);
 		if (usb_start()) {

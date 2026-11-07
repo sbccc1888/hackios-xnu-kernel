@@ -3821,8 +3821,39 @@ chiron_ep0_arm_setup(void)
 
 	memset(g_ep0.setup_buf, 0, 8);
 	memset(g_ep0.out_trb, 0, sizeof(chiron_trb));
+
+	/*
+	 * CHIRON_THE_TRB_NEVER_REACHED_MEMORY
+	 *
+	 * This is the bug the whole hunt was for.  The TRB is written through the cache and nothing ever
+	 * pushed it to memory, and the controller reads TRBs from memory, not from the CPU's cache:
+	 *
+	 *     2044: MMAU 2.0          part of the core, with its own view of memory
+	 *     arm trb ... ctl c23    Owned is set in the CPU's cached copy only
+	 *
+	 * So the controller saw a TRB with Owned clear, treated the ring as empty, and never fetched the
+	 * Setup packet.  That accounts for every symptom at once, and it is why Start kept succeeding
+	 * against a perfectly enabled endpoint (DALEPENA 3, DCTL run 1, lkst 3) while the event ring
+	 * carried nothing but device events:
+	 *
+	 *     ep0: raw cnt 60: 301 50301 30301 30601 101 201 ...
+	 *
+	 * The line above only invalidated the setup buffer -- the direction for a buffer the controller
+	 * writes into.  For anything the CPU writes and the controller reads, the direction is clean.
+	 * Both buffers get invalidate-then-clean now (dc civac does both), which is correct whichever
+	 * way the data is flowing.
+	 */
+	clean_dcache((uint64_t)(uintptr_t)&g_ep0.out_trb[0],
+	    (uint64_t)(uintptr_t)&g_ep0.out_trb[0] + sizeof(chiron_trb));
+	clean_dcache((uint64_t)(uintptr_t)g_ep0.setup_buf,
+	    (uint64_t)(uintptr_t)g_ep0.setup_buf + 8);
 	chiron_invalidate(g_ep0.setup_buf, 8);
+
 	chiron_trb_set(&g_ep0.out_trb[0], g_ep0.setup_dma, 8, CHIRON_TRB_SETUP, 0);
+
+	/* and again after the Owned bit is set, which is the write that matters */
+	clean_dcache((uint64_t)(uintptr_t)&g_ep0.out_trb[0],
+	    (uint64_t)(uintptr_t)&g_ep0.out_trb[0] + sizeof(chiron_trb));
 
 	/*
 	 * Show exactly what is being handed over.  The previous runs armed this and then never saw a

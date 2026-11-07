@@ -15848,6 +15848,27 @@ efi_main(efi_handle image, efi_system_table *st)
 	mute_driver_console();
 
 	BS->set_watchdog_timer(0, 0, 0, NULL);
+
+	/*
+	 * CHIRON_ARM_THE_WATCHDOG_WHERE_NOTHING_CAN_SKIP_IT
+	 *
+	 * The APSS watchdog was armed inside the USB bring-up, behind a switch, on the reasoning that it
+	 * must not perturb the sequence being measured.  That reasoning cost three rounds: the
+	 * usb_no_start_ex run left the phone on a VID_0000&PID_0002 node for two hours with no automatic
+	 * recovery, because that path never reached the arm -- and the watchdog is the only reset on this
+	 * phone that works (PSCI SYSTEM_RESET returns without resetting, and the runtime service faults).
+	 *
+	 * It goes here instead, first thing after the firmware watchdog is turned off, where no branch,
+	 * switch or early return can skip it.  chiron_apss_wdt_reset() is called from wdt_pet() in the
+	 * command loop, so a healthy run never approaches the bite; a wedged one comes back on its own.
+	 *
+	 * 0x2DC6C0 ticks at 32765 Hz is about five minutes: long enough that the slow bring-up
+	 * (PHY, driver binding, event ring) never approaches it even without a pet, short enough that
+	 * a wedged run comes back while the operator is still watching.  Normal operation pets far
+	 * more often than that -- wdt_pet() is called from the command loop every pass.
+	 */
+	chiron_apss_wdt_arm(0x2DC6C0u);
+
 	print("== XNULOADER v3 ==\n");
 	print("CurrentEL=%x MIDR=%x MMFR0=%x CNTFRQ=%d image=%x\n", READ_SYSREG(CurrentEL) >> 2, READ_SYSREG(MIDR_EL1),
 	    READ_SYSREG(ID_AA64MMFR0_EL1), READ_SYSREG(CNTFRQ_EL0), (uint64_t)(uintptr_t)&__ImageBase);

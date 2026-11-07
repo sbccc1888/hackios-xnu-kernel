@@ -4938,8 +4938,20 @@ chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
 		return 0;
 	}
 
+	/*
+	 * CHIRON_SUPPORTED_PROBE
+	 *
+	 * The run stops right after "install peripheral USB Config 0" with no further line, so this
+	 * call either faults or never returns.  Flush before it so the last thing in the log is
+	 * provably the statement before the call, and print the arguments it is about to be given.
+	 */
+	print("hk6: about to call supported(binding %x, controller %x)\n",
+	    (uint64_t)(uintptr_t)binding, (uint64_t)(uintptr_t)controller);
+	flush_log();
+
 	s = binding->supported(binding, controller, NULL);
 	print("hk6: DWC3 Supported -> %x\n", (uint64_t)s);
+	flush_log();
 	if (EFI_ERROR(s)) {
 		return 0;
 	}

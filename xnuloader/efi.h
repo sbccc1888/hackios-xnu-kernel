@@ -214,17 +214,38 @@ static const efi_guid EFI_DRIVER_BINDING_GUID = {0x18a031ab, 0xb443, 0x4d1a,
  * driver bind to it, which needs these structures.
  */
 typedef struct efi_driver_binding efi_driver_binding;
+/*
+ * CHIRON_DRIVER_BINDING_LAYOUT
+ *
+ * The order matters and this had it backwards.  EFI_DRIVER_BINDING_PROTOCOL (EDK2,
+ * MdePkg/Include/Protocol/DriverBinding.h) puts the three function pointers FIRST and the
+ * bookkeeping after them:
+ *
+ *     +0x00  Supported
+ *     +0x08  Start
+ *     +0x10  Stop
+ *     +0x18  Version        UINT32
+ *     +0x20  ImageHandle
+ *     +0x28  DriverBindingHandle
+ *
+ * With version declared at +0x00, binding->supported read +0x18 -- the Version word -- and calling
+ * it jumped to that value.  The log said exactly that:
+ *
+ *     hk6: about to call supported(binding 9bfc4160, controller 9bdaba98)
+ *     UEFI EXCEPTION type=0 elr=30 esr=86000007 far=30
+ *
+ * elr 0x30 is Version, executed as code.  It also meant binding->image_handle read Start, so the
+ * drivers array handed to ConnectController was a function pointer, not a handle.
+ */
 struct efi_driver_binding {
-	uint32_t version;
-	efi_handle image_handle;
-	efi_handle driver_binding_handle;
 	efi_status (EFIAPI *supported)(efi_driver_binding *self, efi_handle controller, void *remaining);
 	efi_status (EFIAPI *start)(efi_driver_binding *self, efi_handle controller,
 	    const void *path);
 	efi_status (EFIAPI *stop)(efi_driver_binding *self, efi_handle controller,
 	    uint64_t children, efi_handle *child);
-	efi_handle driver_binding_handle2;
-	uint32_t version2;
+	uint32_t version;
+	efi_handle image_handle;
+	efi_handle driver_binding_handle;
 };
 
 typedef struct {

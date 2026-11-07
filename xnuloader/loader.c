@@ -10569,10 +10569,32 @@ usb_start(void)
 	 * that validates the set will refuse to configure it, which presents as "no
 	 * enumeration" even though the link comes up fine.
 	 */
+	/*
+	 * CHIRON_SS_SLOTS_MUST_BE_POPULATED
+	 *
+	 * These two were NULL, on the reasoning that chiron is USB2-only and has no SuperSpeed
+	 * descriptors to supply.  The firmware disagrees, and says so in its own function name:
+	 *
+	 *     3a94    descriptor init, called by StartEx at 0x1ccc
+	 *     3adc:   ldr x24, [x20, #0x18]    b4 00 0b 38  cbz x24, 0x3c44
+	 *     3ae8:   ldr x25, [x20, #0x10]    b4 00 0a d9  cbz x25, 0x3c44
+	 *     3c44:   print "%a: Invalid parameter" with %a = "UsbDevDescInitSSDevInfo"
+	 *
+	 * x20 is the descriptor set StartEx receives, so +0x10 and +0x18 are its
+	 * ss_device_descriptor and ss_descriptors, and both are dereferenced without a null check.
+	 * With them NULL the routine takes the 0x3c44 path, returns EFI_INVALID_PARAMETER, and
+	 * StartEx stops at 0x1cd4 before ever reaching stop/start or the endpoint configuration --
+	 * which is exactly what the shims reported: StopController and StartController deadbeef.
+	 *
+	 * On this part the port really is USB2 only, and DCFG will stay at HighSpeed, but the
+	 * driver's descriptor walker still wants something well formed in those slots.  Point them
+	 * at the same USB2 descriptors: the device advertises bcdUSB 0x0200 and never asks the host
+	 * to read a SuperSpeed descriptor, so the contents are never put on the wire.
+	 */
 	set.device_descriptor = usb_dev_desc;
 	set.descriptors = cfg;
-	set.ss_device_descriptor = NULL;
-	set.ss_descriptors = NULL;
+	set.ss_device_descriptor = usb_dev_desc;
+	set.ss_descriptors = cfg;
 	/*
 	 * CHIRON_NO_QUALIFIER_OPTION
 	 *

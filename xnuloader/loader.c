@@ -4178,6 +4178,7 @@ static int usb_no_qualifier;              /* usb_no_qualifier=1: omit the device
 static int usb_no_recover;                /* usb_no_recover=1: return on start_ex failure, no endpoint retry */
 /* the driver publishes revision + nine entry points; see the shim copy below */
 #define CHIRON_USBFN_REAL_SIZE  0x50u
+static efi_usbfn_io *g_orig_usbfn;   /* the vendor's own instance, not our shim copy */
 static int usb_bwt_mode;        /* usb_bwt=1: run the byte-write diagnostic (writes PHY regs) */
 static int usb_no_ring_touch;   /* usb_no_ring_touch=1: never program the event ring ourselves */
 static int usb_noop_startstop;            /* usb_noop_startstop=1: report success for stop/start, let StartEx continue */
@@ -5258,6 +5259,7 @@ chiron_usb_hk6(void)
 		memset(&core, 0, sizeof(core));
 		s = init->query_core_info(init, NULL, &core);
 		print("hk6: query core %x\n", (uint64_t)s);
+
 		if (EFI_ERROR(s)) {
 			return 0;
 		}
@@ -7757,10 +7759,42 @@ chiron_usbfn_configure_only(void)
 		}
 	}
 
-	print("cfgonly: calling ConfigureEnableEndpoints on %x\n", (uint64_t)(uintptr_t)fn);
-	flush_log();
+	/*
+	 * CHIRON_CFGONLY_NEEDS_THE_VENDOR_SELF
+	 *
+	 * This call has now failed two different ways, and the difference is the argument:
+	 *
+	 *   with our shim copy as self:   elr=9bfab924, the address of "DEV_STATE_DETACHED"
+	 *   with the shim copy zeroed:    elr=0, a null dereference, far=0
+	 *
+	 * The only thing that changed between those two runs was that the copy stopped being filled
+	 * with whatever followed the vendor's table and started being zeroed.  So the vendor function
+	 * reads fields past the nine entry points of the structure it was handed -- fields that hold
+	 * state, and a string among them.  The shim copy has no such state; the vendor's own instance
+	 * does.
+	 *
+	 * So pass the vendor's own pointer as self.  The shim exists to intercept the functions the
+	 * driver calls, not to be the object the driver's functions operate on.
+	 */
+	{
+		efi_usbfn_io *self = (g_orig_usbfn != NULL) ? g_orig_usbfn : fn;
+		/*
+		 * StartEx itself never calls configure_enable_endpoints -- it calls 0x78, 0x70 and
+		 * then 0x3a94.  This path is this loader's own attempt, so it needs the vendor's
+		 * instance and the vendor's function together; mixing them is what produced
+		 * elr=0x9bfab924 earlier.
+		 */
+		efi_status (EFIAPI *cfgfn)(efi_usbfn_io *, efi_usb_device_info *) =
+		    (g_orig_usbfn != NULL) ? g_orig_usbfn->configure_enable_endpoints
+		                           : fn->configure_enable_endpoints;
 
-	ce = fn->configure_enable_endpoints(fn, &dev_info);
+		print("cfgonly: self %x fn %x (vendor %x)\n",
+		    (uint64_t)(uintptr_t)self, (uint64_t)(uintptr_t)cfgfn,
+		    (uint64_t)(uintptr_t)g_orig_usbfn);
+		flush_log();
+
+		ce = (cfgfn != NULL) ? cfgfn(self, &dev_info) : (efi_status)0x8000000000000002ULL;
+	}
 	print("cfgonly: ConfigureEnableEndpoints %x\n", (uint64_t)ce);
 	return !EFI_ERROR(ce);
 }
@@ -8604,6 +8638,13 @@ chiron_fnio_slot_is_callable(const efi_usbfn_io *fn, unsigned slot_offset)
 	if (target >= 0xa1000000ULL && target < 0xa2000000ULL) {
 		return 1;             /* our own code; no need to inspect it */
 	}
+	/*
+	 * 0x70 and 0x78 are start_controller and stop_controller, and the disassembly of
+	 * StartEx shows it calls through both.  They live in firmware at 9b......, and they
+	 * are real functions even though offsets 0x50..0x68 in the same table are not.  The
+	 * range check below accepts the firmware image, so this comment is the reminder
+	 * that "the table ends at 0x48" was wrong -- it does not.
+	 */
 	if (target < 0x9b000000ULL || target >= 0x9c000000ULL) {
 		return 0;
 	}
@@ -9575,11 +9616,34 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 		 * truthful answer: this driver does not implement them, and a NULL is checkable where
 		 * a garbage pointer is not.
 		 */
-		memset(&copy, 0, sizeof(copy));
-		memcpy(&copy, orig, CHIRON_USBFN_REAL_SIZE);
+		/*
+		 * CHIRON_TABLE_IS_LONGER_THAN_IT_LOOKED
+		 *
+		 * A previous version of this copied only 0x50 bytes, on the evidence that offset 0x50 of
+		 * the vendor table holds the string "DEV_STATE_DETACHED" rather than a function pointer.
+		 * That evidence was real but the conclusion drawn from it was wrong.
+		 *
+		 * Disassembling the chiron UsbDeviceDxe.efi (Build/.../UsbDeviceDxe.efi, protocol table at
+		 * file offset 0xa0f0, StartEx at 0x1c5c) shows what StartEx actually reads:
+		 *
+		 *     0x1c84:  ldr x0, [x20, #0x410]     ; the UsbFnIo instance, cached in a global
+		 *     0x1c88:  ldr x8,  [x0, #0x78]      ; stop_controller
+		 *     0x1c8c:  blr x8
+		 *     0x1c98:  ldr x0, [x20, #0x410]
+		 *     0x1c9c:  ldr x9,  [x0, #0x70]      ; start_controller
+		 *     0x1ca0:  blr x9
+		 *
+		 * So StartEx calls through 0x70 and 0x78 -- well past the 0x50 bytes this was copying.
+		 * Truncating the copy left those slots NULL, and "blr x8" with x8 == 0 is exactly the
+		 * elr=0, esr=0x86000007 fault that appeared the first time the truncation ran.
+		 *
+		 * Copy the whole structure, as the working build did.
+		 */
+		memcpy(&copy, orig, sizeof(copy));
 		copy.detect_port = usbfn_detect_sdp;
 		copy.get_endpoint_max_packet_size = usbfn_mps_hs;
 
+		g_orig_usbfn = orig;
 		orig_alloc_xfer = orig->allocate_transfer_buffer;
 		orig_free_xfer = orig->free_transfer_buffer;
 		orig_get_dev_info = orig->get_device_info;

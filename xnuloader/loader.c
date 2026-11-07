@@ -8365,6 +8365,34 @@ chiron_usbfn_endpoints(void)
 	print("\n", 0);
 
 	/*
+	 * CHIRON_TRY_THE_EX_VARIANT
+	 *
+	 * StartEx's endpoint step is the _ex entry, not the plain one:
+	 *
+	 *     1cf8: ldr x10, [x0, #0x90]
+	 *     1cfc: blr x10
+	 *
+	 * and +0x90 is populated (measured: 9bfb3584), so that call is real and its 0x02 is a
+	 * rejection by the implementation, most likely of the descriptor set -- the _ex variant takes
+	 * a third argument for the SuperSpeed info, and passing NULL there while ss_descriptors is
+	 * populated is a mismatch worth testing directly.
+	 *
+	 * The plain entry just returned success with the same descriptors, so the two disagree and
+	 * this says which way.
+	 */
+	if (fn->configure_enable_endpoints_ex != NULL) {
+		efi_status ex_null = fn->configure_enable_endpoints_ex(fn, &dev_info, NULL);
+		print("usbfn: ConfigureEnableEndpoints_ex(NULL ss) %x\n", (uint64_t)ex_null);
+
+		if (EFI_ERROR(ex_null)) {
+			efi_status ex_same = fn->configure_enable_endpoints_ex(fn, &dev_info, &dev_info);
+
+			print("usbfn: ConfigureEnableEndpoints_ex(ss=set) %x\n", (uint64_t)ex_same);
+		}
+		flush_log();
+	}
+
+	/*
 	 * CHIRON_DO_NOT_DOUBLE_START
 	 *
 	 * StartEx starts this controller itself -- UsbDeviceDxe.efi carries "Failed to Start
@@ -11295,6 +11323,54 @@ usb_start(void)
 
 			print("fnio: locate_proto %x ptr %x | locate_handles %x n %x\n",
 			    (uint64_t)s1, (uint64_t)(uintptr_t)lp, (uint64_t)s2, fn2);
+			/*
+			 * CHIRON_SLOT_90
+			 *
+			 * StartEx's endpoint step does not call ConfigureEnableEndpoints (+0x10).  It calls
+			 * the _ex variant:
+			 *
+			 *     1cf8: ldr x10, [x0, #0x90]
+			 *     1cfc: blr x10
+			 *
+			 * and the shim table installed by this loader replaces +0x10, +0x70, +0x78 and
+			 * event_handler only.  If +0x90 is null, or points somewhere that rejects the call,
+			 * StartEx fails there and neither stop/start nor +0x10 is ever touched -- which is
+			 * exactly what the shim sentinels report (all deadbeef).
+			 *
+			 * Print every slot from +0x88 onward so the table's real extent is visible.
+			 */
+			if (lp != NULL) {
+				const uint64_t *tab = (const uint64_t *)(uintptr_t)lp;
+
+				/*
+				 * Identify the module that owns +0x90 so its RVA can be mapped back into the
+				 * static image.  Walk the loaded-image list and report every base, then the
+				 * caller can subtract.
+				 */
+				{
+					efi_handle *imgs = NULL;
+					uint64_t ni = 0;
+
+					if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol,
+					    &EFI_LOADED_IMAGE_GUID, NULL, &ni, &imgs))) {
+						for (uint64_t ii = 0; ii < ni; ii++) {
+							efi_loaded_image *l2 = NULL;
+
+							if (!EFI_ERROR(BS->handle_protocol(imgs[ii],
+							    &EFI_LOADED_IMAGE_GUID, (void **)&l2)) && l2 != NULL) {
+								print("img: base %x size %x\n",
+								    (uint64_t)(uintptr_t)l2->image_base,
+								    (uint64_t)l2->image_size);
+							}
+						}
+						BS->free_pool(imgs);
+					}
+				}
+				print("slot90: +88 %x +90 %x +98 %x | +70 %x +78 %x\n",
+				    tab[0x88 / 8], tab[0x90 / 8], tab[0x98 / 8],
+				    tab[0x70 / 8], tab[0x78 / 8]);
+				flush_log();
+			}
 			if (fh != NULL) {
 				BS->free_pool(fh);
 			}

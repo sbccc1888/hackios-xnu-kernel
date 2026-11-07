@@ -4679,6 +4679,29 @@ static const uint8_t usb_bos[42] = {
 	10, 0x10, 0x03, 0x00, 0x0e, 0x00, 0x01, 0x07, 0x65, 0x00,
 	20, 0x10, 0x0a, 0x00, 0x01, 0, 0, 0, 0x00, 0x11, 0, 0, 0x30, 0x40, 0x0a, 0x00, 0xb0, 0x40, 0x0a, 0x00,
 };
+/*
+ * CHIRON_SS_CAPABILITY_FOR_THE_EX_ENTRY
+ *
+ * ConfigureEnableEndpointsEx validates a fourth argument that the three-argument call never supplies,
+ * so x3 arrives as whatever the previous call left in it and the check fails every time.  The
+ * disassembly of the real entry (0x2598, not 0x2584 which is just a ret) is unambiguous:
+ *
+ *     25ac: mov  x19, x3              fourth parameter
+ *     25b8: mov  x1, x19
+ *     25c4: bl   0x26d0               validate it
+ *     26f8: ldrb w9,  [x20]           byte[0], checks bits 5:6
+ *     270c: cbnz w10, fail
+ *     2710: ldrb w3,  [x20, #0x1]     byte[1] is read as bDescriptorType
+ *     2714: cmp  w3,  #0xb
+ *     2750: type - 0x30 < 2 -> ok     so 0x30 and 0x31 are the accepted values
+ *
+ * 0x30 is DEVICE_CAPABILITY_HOST and 0x31 is DEVICE_CAPABILITY_SS, both living inside a BOS.  A
+ * descriptor of that shape is what this needs.
+ */
+static const uint8_t usb_ss_capability[10] = {
+	10, 0x30, 0x00, 0x0e, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00
+};
+
 static const uint8_t usb_str0[4] = { 4, 3, 0x09, 0x04 };
 static const uint8_t usb_str_mfr[8] = { 8, 3, 'X', 0, 'N', 0, 'U', 0 };
 static const uint8_t usb_str_prod[20] = { 20, 3, 'x', 0, 'n', 0, 'u', 0, 'l', 0, 'o', 0, 'a', 0, 'd', 0, 'e', 0, 'r', 0 };
@@ -8951,7 +8974,8 @@ chiron_usbfn_endpoints(void)
 	 * this says which way.
 	 */
 	if (fn->configure_enable_endpoints_ex != NULL) {
-		efi_status ex_null = fn->configure_enable_endpoints_ex(fn, &dev_info, NULL);
+		efi_status ex_null = ((efi_status (EFIAPI *)(efi_usbfn_io *, void *, void *, void *))
+		    fn->configure_enable_endpoints_ex)(fn, &dev_info, NULL, (void *)usb_ss_capability);
 		print("usbfn: ConfigureEnableEndpoints_ex(NULL ss) %x\n", (uint64_t)ex_null);
 
 		/*
@@ -8998,7 +9022,9 @@ chiron_usbfn_endpoints(void)
 		 * config_info the plain entry already accepts, which is the right shape.
 		 */
 		{
-			efi_status ex_cfg = fn->configure_enable_endpoints_ex(fn, &dev_info, &cfg_info);
+			efi_status ex_cfg = ((efi_status (EFIAPI *)(efi_usbfn_io *, void *, void *, void *))
+			    fn->configure_enable_endpoints_ex)(fn, &dev_info, &cfg_info,
+			    (void *)usb_ss_capability);
 
 			print("usbfn: ConfigureEnableEndpoints_ex(ss=cfg_info) %x\n", (uint64_t)ex_cfg);
 		}

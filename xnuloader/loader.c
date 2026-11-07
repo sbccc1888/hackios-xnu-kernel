@@ -4217,6 +4217,7 @@ static int usb_no_recover;                /* usb_no_recover=1: return on start_e
 /* the driver publishes revision + nine entry points; see the shim copy below */
 #define CHIRON_USBFN_REAL_SIZE  0x50u
 static efi_usbfn_io *g_orig_usbfn;   /* the vendor's own instance, not our shim copy */
+static uint64_t usb_dev_base;          /* UsbDeviceDxe module base, for its +0xa410 UsbFnIo cache */
 static int usb_bwt_mode;        /* usb_bwt=1: run the byte-write diagnostic (writes PHY regs) */
 static int usb_no_ring_touch;   /* usb_no_ring_touch=1: never program the event ring ourselves */
 static int usb_noop_startstop;            /* usb_noop_startstop=1: report success for stop/start, let StartEx continue */
@@ -10325,6 +10326,37 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
  * nothing for the driver to report, so asking can only cost a call that may never come back.  Check
  * it before every one of those calls.
  */
+/*
+ * CHIRON_USBDEVICE_BASE
+ *
+ * UsbDeviceDxe has no signature predicate, so its module base is reached through the loaded
+ * image that publishes the UsbDevice protocol rather than by scanning for it.  Both the probe
+ * at start_ex time and the command loop need this: the driver caches its UsbFnIo at
+ * module+0xa410 and handle_event dereferences that cache without a null check.
+ */
+static uint64_t
+chiron_usbdevice_base(void)
+{
+	static const efi_guid dev_guid = QCOM_USB_DEVICE_GUID;
+	efi_handle *hs = NULL;
+	uint64_t n = 0;
+	uint64_t base = 0;
+
+	if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &dev_guid, NULL, &n, &hs)) &&
+	    n != 0) {
+		efi_loaded_image *li = NULL;
+
+		if (!EFI_ERROR(BS->handle_protocol(hs[0], &EFI_LOADED_IMAGE_GUID,
+		    (void **)&li)) && li != NULL) {
+			base = (uint64_t)(uintptr_t)li->image_base;
+		}
+	}
+	if (hs != NULL) {
+		BS->free_pool(hs);
+	}
+	return base;
+}
+
 static int
 chiron_ring_has_events(void)
 {
@@ -12045,6 +12077,70 @@ usb_start(void)
 			 * ring needs invalidating (which chiron_ring_has_events already does internally).
 			 */
 			(void)chiron_ring_has_events();
+			/*
+			 * CHIRON_SEED_THE_DRIVERS_CACHE
+			 *
+			 * Calling handle_event unconditionally faulted at once:
+			 *
+			 *     UEFI EXCEPTION elr=9bfa66b0 esr=96000007 far=48
+			 *
+			 * 9bfa66b0 is UsbDevice base 9bfa5000 + 0x16b0, which is
+			 *
+			 *     16a0: ldr x0, [x8, #0x410]     the driver's UsbFnIo cache
+			 *     16b0: ldr x10, [x0, #0x48]     and dereference it
+			 *
+			 * and the loader's own probe reports what that cache holds:
+			 *
+			 *     startex: dev 9bfa5000 cached 0 ours 9bdc4020
+			 *
+			 * so x0 was 0 and the load at +0x48 is what took the fault.  The driver fills that global
+			 * in its StartEx (0x1f1c); with usb_no_start_ex we never run StartEx, so it stays zero.
+			 *
+			 * Seed it before polling.  The value is the usbfn_io this loader obtained by GUID, which is
+			 * the same object StartEx would have cached.
+			 */
+			{
+				static uint64_t seeded_dev_base;
+				static int seed_reported;
+
+				if (usb_dev_base == 0) {
+					usb_dev_base = chiron_usbdevice_base();
+				}
+				if (usb_dev_base != 0) {
+					uint64_t cur = *(volatile uint64_t *)(uintptr_t)
+					    (usb_dev_base + 0xa410);
+					efi_usbfn_io *want = g_orig_usbfn;
+
+					if (want == NULL) {
+						static const efi_guid sg = QCOM_USBFN_IO_GUID;
+						efi_usbfn_io *tmp = NULL;
+
+						if (usb_dev_handle != NULL &&
+						    !EFI_ERROR(BS->handle_protocol(usb_dev_handle,
+						    &sg, (void **)&tmp))) {
+							want = tmp;
+						}
+					}
+					if (want != NULL &&
+					    cur != (uint64_t)(uintptr_t)want) {
+						*(volatile uint64_t *)(uintptr_t)
+						    (usb_dev_base + 0xa410) =
+						    (uint64_t)(uintptr_t)want;
+						__asm__ volatile ("dsb sy" ::: "memory");
+						if (!seed_reported) {
+							print("loop: seeded driver cache %x -> %x\n",
+							    cur, (uint64_t)(uintptr_t)want);
+							flush_log();
+							seed_reported = 1;
+						}
+					}
+					seeded_dev_base = usb_dev_base;
+				} else if (!seed_reported) {
+					print("loop: UsbDevice base unknown, not seeding\n", 0);
+					seed_reported = 1;
+				}
+				(void)seeded_dev_base;
+			}
 			USB->handle_event(&m, &sz, &d);
 			pumped++;
 

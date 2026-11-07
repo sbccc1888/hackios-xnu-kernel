@@ -956,8 +956,26 @@ request_recovery_boot(void)
 static void
 reset_now(void)
 {
-	if (ST->rt != NULL && ST->rt->reset_system != NULL) {
-		ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+	/*
+	 * CHIRON_RESETSYSTEM_IS_BROKEN
+	 *
+	 * ST->rt->reset_system is non-null but calling it faults, so PSCI is the only reset that
+	 * works.  The brk is at elr offset 12dc8 in the run that had just entered the command loop:
+	 *
+	 *     a1012d84: ldr  x4, [x8, #0x68]     RuntimeServices->ResetSystem
+	 *     a1012d88: cbz  x4, ...             it was not null
+	 *     a1012db4: br   x4
+	 *     a1012db8: brk  #0x1
+	 */
+	{
+		register uint64_t x0 __asm__("x0") = 0x84000009ULL;   /* PSCI SYSTEM_RESET */
+
+		__asm__ volatile ("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
+	}
+	{
+		register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+
+		__asm__ volatile ("hvc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
 	}
 	for (;;) {
 	}
@@ -1151,9 +1169,8 @@ reboot(void)
 
 			__asm__ volatile ("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
 		}
-		if (ST != NULL && ST->rt != NULL && ST->rt->reset_system != NULL) {
-			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
-		}
+/* CHIRON_RESETSYSTEM_IS_BROKEN: the pointer is non-null and calling it faults at
+ * brk #0x1 (elr offset 12dc8).  PSCI above is the only reset that works. */
 		print("\n== reset_system unavailable; halting ==\n");
 	}
 	print("\n== HALTED (halt=1) ==\n");
@@ -4212,9 +4229,8 @@ chiron_reset_notify(void *event, void *ctx)
 
 		__asm__ volatile ("hvc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
 	}
-	if (ST != NULL && ST->rt != NULL && ST->rt->reset_system != NULL) {
-		ST->rt->reset_system(0, 0, 0, NULL);
-	}
+/* CHIRON_RESETSYSTEM_IS_BROKEN: the pointer is non-null and calling it faults at
+ * brk #0x1 (elr offset 12dc8).  PSCI above is the only reset that works. */
 	for (;;) {
 	}
 }
@@ -4417,9 +4433,8 @@ exception_handler(int64_t type, uint64_t *ctx)
 		}
 
 		/* Then the runtime service, if the firmware still has it. */
-		if (ST != NULL && ST->rt != NULL && ST->rt->reset_system != NULL) {
-			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
-		}
+/* CHIRON_RESETSYSTEM_IS_BROKEN: the pointer is non-null and calling it faults at
+ * brk #0x1 (elr offset 12dc8).  PSCI above is the only reset that works. */
 
 		/* Then the watchdog, which most Qualcomm ABL builds honour. */
 		if (BS != NULL && BS->set_watchdog_timer != NULL) {
@@ -5924,11 +5939,40 @@ chiron_psci_reset(void)
 	register uint64_t a2 __asm__("x2") = 0;
 	register uint64_t a3 __asm__("x3") = 0;
 
+	/*
+	 * CHIRON_PSCI_RESET_DOES_NOT_RESET
+	 *
+	 * Measured: the SMC is executed and comes back without resetting.  The disassembly of the
+	 * fault path shows exactly that -- the instruction stream reaches
+	 *
+	 *     a1012c44: mov  w0, #9
+	 *     a1012c48: movk w0, #0x8400, lsl #16     a0 = 0x84000009
+	 *     a1012c4c: smc  #0
+	 *     a1012c50: b    ...                      <- and execution carries on
+	 *
+	 * so whatever answers SMC on this phone does not implement SYSTEM_RESET.  The same is true of
+	 * the runtime service (the pointer is non-null, calling it faults) and of
+	 * BS->set_watchdog_timer.  Every software request has now been tried and none of them resets
+	 * the phone.
+	 *
+	 * The APSS watchdog is not a request: once its bite time is programmed it counts on the
+	 * always-on clock and resets the SoC.  Program the shortest timeout and spin -- if the SMC
+	 * above did work this is never reached.
+	 */
 	__asm__ volatile ("smc #0" : "+r" (a0) : "r" (a1), "r" (a2), "r" (a3) : "memory");
-	/* if the SMC came back, fall through and let UEFI try */
-	if (ST != NULL && ST->rt != NULL && ST->rt->reset_system != NULL) {
-		ST->rt->reset_system(0, 0, 0, NULL);
+
+	{
+		const uint64_t wdt = 0x17817000ULL;
+
+		*(volatile uint32_t *)(uintptr_t)(wdt + 0x08) = 1u;              /* clear status */
+		*(volatile uint32_t *)(uintptr_t)(wdt + 0x04) = 1u | (1u << 1);  /* unreset */
+		__asm__ volatile ("dsb sy" ::: "memory");
+		*(volatile uint32_t *)(uintptr_t)(wdt + 0x10) = 1u;              /* bite = first tick */
+		__asm__ volatile ("dsb sy" ::: "memory");
+		*(volatile uint32_t *)(uintptr_t)(wdt + 0x04) = 1u | (1u << 1) | (1u << 3);
+		__asm__ volatile ("dsb sy" ::: "memory");
 	}
+
 	for (;;) {
 	}
 }
@@ -14849,9 +14893,8 @@ fb_command(char *cmd)
 
 				__asm__ volatile ("smc #0" : "+r"(px0) :: "x1", "x2", "x3", "memory");
 			}
-			if (ST != NULL && ST->rt != NULL && ST->rt->reset_system != NULL) {
-				ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
-			}
+/* CHIRON_RESETSYSTEM_IS_BROKEN: the pointer is non-null and calling it faults at
+ * brk #0x1 (elr offset 12dc8).  PSCI above is the only reset that works. */
 		} else {
 			fb_reply("FAIL", "unknown command");
 		}

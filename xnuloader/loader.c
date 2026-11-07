@@ -3931,6 +3931,40 @@ chiron_ep0_reply(const uint8_t *data, uint32_t total, uint32_t want)
 	__asm__ volatile ("dsb sy" ::: "memory");
 	g_ep0.data_len = n;
 	(void)chiron_ep0_submit(1, g_ep0.data_dma, n, CHIRON_TRB_CONTROLDATA);
+
+	/*
+	 * CHIRON_A_CONTROL_TRANSFER_HAS_THREE_STAGES
+	 *
+	 * SETUP, DATA, STATUS -- and this only ever did the first two.  The descriptor was copied into
+	 * the DMA buffer and handed over, and then nothing: no STATUS stage, so the host received its
+	 * data and never got the handshake that ends the transfer.  It waits, times out, resets the bus,
+	 * and asks again -- the reset/disconnect/reconnect cycle in the raw event dump.
+	 *
+	 * Mi 6 is explicit about the ordering, and about which TRB type to use
+	 * (DWC3Control.h:64-72):
+	 *
+	 *     USB::Result startStatus() {
+	 *         if (state != ControlState::WaitingStatus || !approved || !statusReady || setupPending)
+	 *             return USB::Result::Pending;
+	 *         state = ControlState::Status;
+	 *         auto result = endpoint(statusEndpoint).submit(nullptr, 0, 0, packetSize,
+	 *             setup.length ? TRBType::Status3 : TRBType::Status2, ++serial);
+	 *
+	 * For an IN transfer with data -- every descriptor reply -- the status stage is an OUT
+	 * zero-length packet on EP0, i.e. Status2 on endpoint 0.  Status3 is the IN-direction variant
+	 * used when there is no data stage.
+	 *
+	 * The status endpoint here is endpoint 0 (OUT), so submit SlipStatus2 on ep 0.
+	 */
+	{
+		uint32_t status_ep = (n != 0) ? 0u : 1u;   /* data went IN, so status is OUT on ep0 */
+		uint32_t status_type = (n != 0) ? CHIRON_TRB_STATUS2 : CHIRON_TRB_STATUS3;
+
+		(void)chiron_ep0_submit(status_ep, 0, 0, status_type);
+		print("ep0: status after reply ep%x type%x\n",
+		    (uint64_t)status_ep, (uint64_t)status_type);
+		flush_log();
+	}
 }
 
 /* Build a string descriptor in the data buffer and send it. */

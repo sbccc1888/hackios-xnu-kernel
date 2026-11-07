@@ -3782,15 +3782,16 @@ chiron_ep0_poll(void)
 	const uint64_t d = 0xA800000ULL;
 	unsigned drained = 0;
 	static uint64_t polls;
+	static uint32_t said_ep[16], said_dev[16];
 	uint32_t adr, cnt;
 
 	polls++;
 	adr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
 	cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C) & 0xfffcu;
 
-	if (polls == 1 || polls == 1000 || polls == 100000) {
-		print("ep0: poll %d adr %x cnt %x ready %d\n",
-		    (uint64_t)polls, (uint64_t)adr, (uint64_t)cnt, (uint64_t)g_ep0.ready);
+	if (polls == 1 || polls == 100000) {
+		print("ep0: poll %d adr %x cnt %x\n",
+		    (uint64_t)polls, (uint64_t)adr, (uint64_t)cnt);
 		flush_log();
 	}
 	if (adr == 0 || cnt == 0 || cnt > 0x1000) {
@@ -3800,52 +3801,89 @@ chiron_ep0_poll(void)
 	chiron_invalidate((void *)(uintptr_t)adr, cnt);
 
 	/*
-	 * Bounded: the ring holds at most 4 KB, so no run of records can exceed that many words.
-	 * An earlier version looped until the counter read zero, and a single unexpected record
-	 * shape turned that into a spin that never printed again.
+	 * Event decoding, from DWC3Registers.h:56-64:
+	 *
+	 *     device()          word & 1
+	 *     deviceSpecific()  (word & 0xff) == 1     -- only these carry 3 parameter words
+	 *     endpointNumber()  (word >> 1) & 31
+	 *     type()            device() ? (word >> 8) & 15 : (word >> 6) & 15
+	 *     status()          (word >> 12) & 15
+	 *     parameters()      word >> 16
+	 *
+	 * Everything is in the first word; the width is 16 bytes only for a device-specific event and
+	 * 4 bytes otherwise.  An earlier version tested bit 4 of the word instead of bits 7:0, and
+	 * consumed the wrong number of bytes for every record after the first.
 	 */
-	while (drained < 1024) {
-		uint32_t raw = *(volatile uint32_t *)(uintptr_t)(adr);
+	while (drained < 256) {
+		uint32_t raw = *(volatile uint32_t *)(uintptr_t)adr;
 		uint32_t bytes = 4;
 
 		drained++;
-		if (raw & 1u) {
-			static uint32_t said_dev[8];
-			uint32_t kind = (raw >> 8) & 0xffu;
-			unsigned i, seen = 0;
 
-			/* device event: 1 or 4 words */
-			bytes = (raw & 0x10u) ? 16u : 4u;
-			for (i = 0; i < 8; i++) {
-				if (said_dev[i] == kind) {
-					seen = 1;
+		if ((raw & 0xffu) == 1u) {
+			/* device-specific: 4 words */
+			uint32_t kind = (raw >> 8) & 15u;
+			unsigned i;
+
+			bytes = 16;
+			for (i = 0; i < 16; i++) {
+				if (said_dev[i] == kind + 1u) {
 					break;
 				}
 				if (said_dev[i] == 0) {
-					said_dev[i] = kind;
+					said_dev[i] = kind + 1u;
+					print("ep0: devspec type %x param %x\n",
+					    (uint64_t)kind, (uint64_t)(raw >> 16));
+					flush_log();
 					break;
 				}
 			}
-			if (!seen) {
-				print("ep0: dev ev %x (new)\n", (uint64_t)kind);
-				flush_log();
+		} else if (raw & 1u) {
+			/* device event, 1 word */
+			uint32_t kind = (raw >> 8) & 15u;
+			unsigned i;
+
+			for (i = 0; i < 16; i++) {
+				if (said_dev[i] == kind + 0x100u) {
+					break;
+				}
+				if (said_dev[i] == 0) {
+					said_dev[i] = kind + 0x100u;
+					print("ep0: devev type %x\n", (uint64_t)kind);
+					flush_log();
+					break;
+				}
 			}
 		} else {
 			uint32_t ep = (raw >> 1) & 31u;
-			uint32_t type = (raw >> 6) & 0xfu;
-			uint32_t status = (raw >> 12) & 0xfu;
+			uint32_t type = (raw >> 6) & 15u;
+			uint32_t status = (raw >> 12) & 15u;
+			unsigned i;
 
-			print("ep0: ep ev ep%x type%x st%x\n",
-			    (uint64_t)ep, (uint64_t)type, (uint64_t)status);
+			for (i = 0; i < 16; i++) {
+				uint32_t key = (ep << 8) | (type << 4) | status;
+
+				if (said_ep[i] == key + 1u) {
+					break;
+				}
+				if (said_ep[i] == 0) {
+					said_ep[i] = key + 1u;
+					print("ep0: epev ep%x type%x st%x\n",
+					    (uint64_t)ep, (uint64_t)type, (uint64_t)status);
+					flush_log();
+					break;
+				}
+			}
+
+			/* a completed Setup TRB on EP0 is endpoint event type 1, status 0 */
 			if (ep == 0 && type == 1 && status == 0) {
 				g_ep0.setup_count++;
 				chiron_invalidate(g_ep0.setup_buf, 8);
 				chiron_ep0_handle_setup();
 			}
-			bytes = 4;
 		}
 
-		/* acknowledge */
+		/* acknowledge exactly the words this record occupied */
 		*(volatile uint32_t *)(uintptr_t)(d + 0xC40C) = bytes;
 		__asm__ volatile ("dsb sy" ::: "memory");
 
@@ -3853,6 +3891,8 @@ chiron_ep0_poll(void)
 		if (cnt == 0 || cnt > 0x1000) {
 			break;
 		}
+		adr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
+		chiron_invalidate((void *)(uintptr_t)adr, cnt);
 	}
 }
 
@@ -8323,12 +8363,27 @@ chiron_event_arm(void)
 	 * If the driver has already set it, keep what it set.  Otherwise write 0x277, which is what
 	 * it would have written.
 	 */
-	if (before == 0x277u) {
-		want = before;
-	} else if (before != 0u) {
+	/*
+	 * CHIRON_DEVTEN_IS_25F
+	 *
+	 * 0x277 came from disassembling UsbfnDwc3Dxe's own write at 0x3b18, and it is what that
+	 * driver programmes.  It is not what the working Mi 6 port programmes, and the difference is
+	 * the two events that matter here:
+	 *
+	 *     0x277 = bits 0,1,2,4,5,9        SOF off (bit 3), L1 suspend on (bit 8 off)
+	 *     0xa5f = bits 0,1,2,3,4,6,9,11   SOF on, speed change on, bit 11 on
+	 *
+	 * DWC3Core.h:204 writes exactly (1<<11)|(1<<9)|(1<<6)|(1<<4)|(1<<3)|7 and calls it the mask to
+	 * run with.  Our chiron_mi6_run_device writes 0x25f, but this block runs earlier and every log
+	 * still shows devten 277 afterwards, so 0x277 is what actually reaches the hardware.
+	 *
+	 * Take the Mi 6 mask when nothing has been programmed yet, and leave an existing non-zero
+	 * value alone -- the vendor driver's own choice still wins if it made one.
+	 */
+	if (before != 0u) {
 		want = before;
 	} else {
-		want = (g_entry_devten != 0u) ? g_entry_devten : 0x277u;
+		want = 0x25fu;
 	}
 
 	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC708) = want;

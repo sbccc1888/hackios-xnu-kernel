@@ -3064,6 +3064,383 @@ smc_call(uint64_t id, uint64_t a1, uint64_t a2, uint64_t *r1, uint64_t *r2)
 }
 
 /*
+ * CHIRON_MI6_DWC3_BRINGUP
+ *
+ * Ported from MC-XiaoXiao/ios_sagit (Xiaomi Mi 6, MSM8998) -- a port on the same SoC whose USB device mode is
+ * reported working, with High-Speed enumeration.  It does not use the UEFI Usb*Dxe drivers at all; it drives
+ * DWC3 directly from its own IOKit driver, and drivers/usb/QcomUSB/DWC3Core.h carries the sequence.
+ *
+ * Three things it does that this loader never has, and each one matches a symptom measured here:
+ *
+ * 1. Clear every interrupter's event pointers before reconfiguring (select(), DWC3Core.h:126-134):
+ *
+ *        count = read(eventCount(n));
+ *        if (count) write(eventCount(n), count);
+ *        write(eventSize(n), EventMask);          EventMask = 1 << 31
+ *        write(eventAddressLo(n), 0); write(eventAddressHi(n), 0);
+ *
+ *    The loader only ever wrote GEVNTSIZ = 0x80001000 in one go, leaving whatever address the firmware
+ *    had left behind.  "ring: restored the firmware's own ring" was putting back an address from a
+ *    previous incarnation rather than starting from a known-clear state.
+ *
+ * 2. Device role is GCTL bits 13:12 = 2, with U1/U2 and port-mask bits cleared first (DWC3Core.h:141-143):
+ *
+ *        ctl &= ~(PortMask | (3u << 4) | (1u << 1));
+ *        ctl |= PortDevice;                       PortDevice = 2 << 12
+ *
+ * 3. A real device soft reset, in this order (DWC3Core.h:152-167):
+ *
+ *        write(DCTL, (ctl & ~Run) | SoftReset);   Run = 1<<31, SoftReset = 1<<30
+ *        poll(DCTL, SoftReset, 0, 1000);          wait for the bit to clear itself
+ *        poll(DSTS, Halted, Halted, 10000);       then wait for Halted, DSTS bit 22
+ *        write(DEVTEN, 0); write(DALEPENA, 0);
+ *
+ *    The loader has written DCTL bit 31 and bit 30 separately, at different times, and never waited for
+ *    Halted afterwards.  Without that wait the controller is still mid-reset when the endpoints are
+ *    configured.
+ *
+ * And the event ring itself is installed in a specific order (installEvents, DWC3Core.h:174-188): mask the
+ * size register, drain the count, write address low then high, and only then write size|mask.
+ */
+static void chiron_udelay(uint64_t us);
+static void flush_log(void);
+
+/* the event ring the vendor driver allocated, captured before the Mi 6 sequence clears it */
+static uint32_t g_mi6_evtadr, g_mi6_evtsiz;
+
+static void
+chiron_mi6_dwc3_bringup(void)
+{
+	const uint64_t d = 0xA800000ULL;
+	const uint32_t EventMask = 1u << 31;
+
+	/*
+	 * CHIRON_REMEMBER_THE_RING_BEFORE_CLEARING_IT
+	 *
+	 * The clear below zeroes the address, and installEvents has to put a real one back afterwards.
+	 * Capture what is there now so the installer has something valid to restore -- the driver
+	 * allocated this buffer in its Start, and nothing else knows where it is.
+	 */
+	g_mi6_evtadr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
+	g_mi6_evtsiz = *(volatile uint32_t *)(uintptr_t)(d + 0xC408) & 0xffffu;
+	print("mi6: ring before clear adr %x siz %x cnt %x\n",
+	    (uint64_t)g_mi6_evtadr, (uint64_t)g_mi6_evtsiz,
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC40C));
+
+	/* 1. clear every interrupter's event pointers */
+	for (unsigned n = 0; n < 1; n++) {
+		uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C + n * 16);
+
+		cnt &= 0xfffcu;
+		if (cnt != 0) {
+			*(volatile uint32_t *)(uintptr_t)(d + 0xC40C + n * 16) = cnt;
+		}
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC408 + n * 16) = EventMask;
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC400 + n * 16) = 0;
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC404 + n * 16) = 0;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("mi6: evt cleared, siz %x adr %x cnt %x\n",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC408),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC400),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC40C));
+
+	/* 2. device role, and clear the PHY suspend/park bits the same way */
+	{
+		uint32_t gctl = *(volatile uint32_t *)(uintptr_t)(d + 0xC110);
+		uint32_t usb2 = *(volatile uint32_t *)(uintptr_t)(d + 0xC200);
+		uint32_t pipe = *(volatile uint32_t *)(uintptr_t)(d + 0xC2C0);
+		uint32_t uctl = *(volatile uint32_t *)(uintptr_t)(d + 0xC11C);
+		uint32_t ctl  = *(volatile uint32_t *)(uintptr_t)(d + 0xC704);
+
+		/* stop the device first so a stale Run cannot take effect mid-switch */
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC704) = ctl & ~(1u << 31);
+
+		gctl &= ~((3u << 12) | (3u << 4) | (1u << 1));
+		gctl |= (2u << 12);                       /* PortDevice */
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC110) = gctl;
+
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC200) = usb2 & ~((1u << 6) | (1u << 8));
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC2C0) = pipe & ~(1u << 17);
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC11C) = uctl | (1u << 17);
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		print("mi6: gctl %x usb2 %x pipe %x\n",
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC110),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC200),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC2C0));
+
+		/* 3. device soft reset, then wait for Halted */
+		ctl = *(volatile uint32_t *)(uintptr_t)(d + 0xC704);
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC704) = (ctl & ~(1u << 31)) | (1u << 30);
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		for (unsigned i = 0; i < 100; i++) {
+			if ((*(volatile uint32_t *)(uintptr_t)(d + 0xC704) & (1u << 30)) == 0) {
+				break;
+			}
+			chiron_udelay(10);
+		}
+		print("mi6: after softreset DCTL %x (bit30 %x)\n",
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC704),
+		    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(d + 0xC704) >> 30) & 1));
+
+		for (unsigned i = 0; i < 1000; i++) {
+			if ((*(volatile uint32_t *)(uintptr_t)(d + 0xC70C) & (1u << 22)) != 0) {
+				break;
+			}
+			chiron_udelay(10);
+		}
+		print("mi6: after softreset DSTS %x (Halted bit22 %x)\n",
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC70C),
+		    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(d + 0xC70C) >> 22) & 1));
+
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC708) = 0;      /* DEVTEN */
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC720) = 0;      /* DALEPENA */
+		__asm__ volatile ("dsb sy" ::: "memory");
+	}
+	flush_log();
+}
+
+/*
+ * CHIRON_MI6_ENDPOINTS
+ *
+ * The DWC3 device programming model, from MC-XiaoXiao/ios_sagit drivers/usb/QcomUSB (Mi 6, same SoC):
+ * DWC3Core.h:311-354 and DWC3Endpoint.h:45-59.  Without this the controller stays halted with
+ * DALEPENA = 0 and can never present anything -- which is exactly what the last run logged:
+ *
+ *     mi6: after softreset DSTS d20001 (Halted bit22 1)
+ *     mi6: DALEPENA 0, endpoints not enabled -- not running
+ *
+ * DEPCMD registers live at 0xc800 + ep*16, and the hardware requires PAR2, PAR1, PAR0 before CMDACT
+ * (DWC3Core.h:408-414):
+ *
+ *     base+0  PAR2      base+4  PAR1      base+8  PAR0      base+12 CMD
+ *
+ * StartConfiguration (command 9) resets the endpoint resource allocation; Configure (1) programs one
+ * endpoint; Resource (2) allocates its transfer resource.  DALEPENA is only written once all of that
+ * has succeeded, and it is cleared first.
+ */
+#define CHIRON_DEPCMD_ACTIVE (1u << 10)
+
+static int
+chiron_depcmd_wait(uint32_t base, uint32_t *reply)
+{
+	for (unsigned i = 0; i < 1000; i++) {
+		uint32_t v = *(volatile uint32_t *)(uintptr_t)(base + 12);
+
+		if ((v & CHIRON_DEPCMD_ACTIVE) == 0) {
+			if (reply != NULL) {
+				*reply = v;
+			}
+			/* bits 15:12 carry the command status; non-zero is a failure */
+			return ((v >> 12) & 0xfu) == 0;
+		}
+		chiron_udelay(10);
+	}
+	return 0;
+}
+
+static void
+chiron_mi6_endpoints(void)
+{
+	const uint64_t d = 0xA800000ULL;
+	const uint64_t base0 = d + 0xC800;          /* EP0 out */
+	const uint64_t base1 = d + 0xC810;          /* EP0 in  */
+	uint32_t reply = 0;
+	int ok0, ok1, okres0, okres1;
+
+	/* 1. beginEndpointConfiguration: clear DALEPENA, then StartConfiguration on ep0 */
+	{
+		uint32_t enabled = *(volatile uint32_t *)(uintptr_t)(d + 0xC720);
+
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC720) = enabled & ~0xffffffffu;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	*(volatile uint32_t *)(uintptr_t)(base0 + 0) = 0;
+	*(volatile uint32_t *)(uintptr_t)(base0 + 4) = 0;
+	*(volatile uint32_t *)(uintptr_t)(base0 + 8) = 0;
+	*(volatile uint32_t *)(uintptr_t)(base0 + 12) = 9u | CHIRON_DEPCMD_ACTIVE;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	print("mi6ep: StartConfiguration %d reply %x\n",
+	    (uint64_t)(chiron_depcmd_wait((uint32_t)base0, &reply) ? 1 : 0), (uint64_t)reply);
+
+	/*
+	 * 2. Configure ep0 out and ep0 in.
+	 *
+	 * EndpointConfiguration::parameter0 / parameter1 for a Control endpoint at HighSpeed:
+	 *   type Control = 0, mps 64, physicalEndpoint 0 and 1, burst 0, interval 0
+	 *   PAR0 = 0<<1 | 64<<3 | (ep&1 ? ep/2<<17 : 0) = 0x200
+	 *   PAR1 = ep<<25 | 1<<8 | (ep<2 ? 1<<10 : 0)   = 0x500 / 0x20500
+	 */
+	*(volatile uint32_t *)(uintptr_t)(base0 + 0) = 0;
+	*(volatile uint32_t *)(uintptr_t)(base0 + 4) = 0x500;
+	*(volatile uint32_t *)(uintptr_t)(base0 + 8) = 0x200;
+	*(volatile uint32_t *)(uintptr_t)(base0 + 12) = 1u | CHIRON_DEPCMD_ACTIVE;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	ok0 = chiron_depcmd_wait((uint32_t)base0, &reply);
+	print("mi6ep: Configure ep0out %d reply %x\n", (uint64_t)ok0, (uint64_t)reply);
+
+	*(volatile uint32_t *)(uintptr_t)(base1 + 0) = 0;
+	*(volatile uint32_t *)(uintptr_t)(base1 + 4) = 0x20500;
+	*(volatile uint32_t *)(uintptr_t)(base1 + 8) = 0x200;
+	*(volatile uint32_t *)(uintptr_t)(base1 + 12) = 1u | CHIRON_DEPCMD_ACTIVE;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	ok1 = chiron_depcmd_wait((uint32_t)base1, &reply);
+	print("mi6ep: Configure ep0in %d reply %x\n", (uint64_t)ok1, (uint64_t)reply);
+
+	/* 3. Resource for each: command 2, PAR0 = 1 */
+	*(volatile uint32_t *)(uintptr_t)(base0 + 0) = 0;
+	*(volatile uint32_t *)(uintptr_t)(base0 + 4) = 0;
+	*(volatile uint32_t *)(uintptr_t)(base0 + 8) = 1;
+	*(volatile uint32_t *)(uintptr_t)(base0 + 12) = 2u | CHIRON_DEPCMD_ACTIVE;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	okres0 = chiron_depcmd_wait((uint32_t)base0, &reply);
+	print("mi6ep: Resource ep0out %d reply %x\n", (uint64_t)okres0, (uint64_t)reply);
+
+	*(volatile uint32_t *)(uintptr_t)(base1 + 0) = 0;
+	*(volatile uint32_t *)(uintptr_t)(base1 + 4) = 0;
+	*(volatile uint32_t *)(uintptr_t)(base1 + 8) = 1;
+	*(volatile uint32_t *)(uintptr_t)(base1 + 12) = 2u | CHIRON_DEPCMD_ACTIVE;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	okres1 = chiron_depcmd_wait((uint32_t)base1, &reply);
+	print("mi6ep: Resource ep0in %d reply %x\n", (uint64_t)okres1, (uint64_t)reply);
+
+	/* 4. and only now enable them */
+	{
+		uint32_t enabled = *(volatile uint32_t *)(uintptr_t)(d + 0xC720);
+
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC720) = enabled | 3u;
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	print("mi6ep: DALEPENA now %x\n",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC720));
+	flush_log();
+}
+
+/*
+ * CHIRON_MI6_INSTALL_EVENTS
+ *
+ * The step this loader was missing entirely.  Mi 6 does it between configureEndpoint and runDevice
+ * (QcomUSBDevice.cpp:285-287, installEvents at DWC3Core.h:174-188):
+ *
+ *     write(eventSize,  EventMask);            mask first, so the controller cannot DMA yet
+ *     count = read(eventCount);                drain whatever is pending
+ *     if (count) write(eventCount, count);
+ *     write(eventAddressLo, address);
+ *     write(eventAddressHi, address >> 32);
+ *     write(eventSize, EventMask | bytes);     unmask last
+ *
+ * Without it GEVNTADR stays 0 after the soft reset, and the controller has nowhere to write the
+ * setup packet the host sends -- which is why every run so far ended with an idle core and a silent
+ * host even once the PHY and the endpoints were correct.
+ */
+static void
+chiron_mi6_install_events(void)
+{
+	const uint64_t d = 0xA800000ULL;
+	const uint32_t EventMask = 1u << 31;
+	uint32_t adr = g_mi6_evtadr;
+	uint32_t siz = g_mi6_evtsiz;
+	uint32_t cnt;
+
+	/*
+	 * A ring the driver never allocated cannot be invented here: the buffer has to be DMA-reachable
+	 * and staged for the controller's descriptor layout.  If the capture was empty, say so and let
+	 * the caller see the zero rather than writing a fabricated address.
+	 */
+	if (adr == 0 || siz == 0) {
+		print("mi6ev: no ring to install (adr %x siz %x)\n",
+		    (uint64_t)adr, (uint64_t)siz);
+		flush_log();
+		return;
+	}
+
+	*(volatile uint32_t *)(uintptr_t)(d + 0xC408) = EventMask;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C) & 0xfffcu;
+	if (cnt != 0) {
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC40C) = cnt;
+	}
+
+	*(volatile uint32_t *)(uintptr_t)(d + 0xC400) = adr;
+	*(volatile uint32_t *)(uintptr_t)(d + 0xC404) = 0;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	*(volatile uint32_t *)(uintptr_t)(d + 0xC408) = EventMask | siz;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("mi6ev: installed adr %x siz %x | now adr %x siz %x cnt %x\n",
+	    (uint64_t)adr, (uint64_t)siz,
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC400),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC408),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC40C));
+	flush_log();
+}
+
+/*
+ * CHIRON_MI6_RUN_DEVICE
+ *
+ * runDevice, DWC3Core.h:190-210.  The differences from what the loader was doing are the point:
+ *
+ *   - it requires DALEPENA bits 1:0 both set before running, and returns NotReady otherwise
+ *   - DCFG: clears speed, device address and LPM_CAP together, then sets speed only for Super
+ *   - DEVTEN is a fixed 0xa5f, not 0x277: bits 11, 9, 6, 4, 3 and 0-2
+ *   - it writes GEVNTSIZ again here, after the ring address, before starting
+ *   - DCTL: clears U1/U2 accepts and initiates, then sets Run
+ *   - and then polls DSTS.Halted until it clears, rather than assuming
+ */
+static int
+chiron_mi6_run_device(void)
+{
+	const uint64_t d = 0xA800000ULL;
+	uint32_t enabled = *(volatile uint32_t *)(uintptr_t)(d + 0xC720);
+	uint32_t cfg = *(volatile uint32_t *)(uintptr_t)(d + 0xC700);
+	uint32_t ctl = *(volatile uint32_t *)(uintptr_t)(d + 0xC704);
+
+	if ((enabled & 3u) != 3u) {
+		print("mi6: DALEPENA %x, endpoints not enabled -- not running\n",
+		    (uint64_t)enabled);
+		return 0;
+	}
+
+	cfg &= ~(7u | (127u << 3) | (1u << 22));
+	*(volatile uint32_t *)(uintptr_t)(d + 0xC700) = cfg;
+
+	*(volatile uint32_t *)(uintptr_t)(d + 0xC708) =
+	    (1u << 11) | (1u << 9) | (1u << 6) | (1u << 4) | (1u << 3) | 7u;
+
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	ctl &= ~((1u << 9) | (1u << 10) | (1u << 11) | (1u << 12));   /* U1/U2 */
+	*(volatile uint32_t *)(uintptr_t)(d + 0xC704) = ctl | (1u << 31);
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("mi6: run DCFG %x DCTL %x DEVTEN %x\n",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC700),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC704),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC708));
+
+	for (unsigned i = 0; i < 1000; i++) {
+		if ((*(volatile uint32_t *)(uintptr_t)(d + 0xC70C) & (1u << 22)) == 0) {
+			break;
+		}
+		chiron_udelay(10);
+	}
+	print("mi6: after run DSTS %x (Halted %x) | evtadr %x siz %x cnt %x\n",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC70C),
+	    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(d + 0xC70C) >> 22) & 1),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC400),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC408),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(d + 0xC40C));
+	flush_log();
+	return 1;
+}
+
+/*
  * CHIRON_RESET_NOTIFY
  *
  * The entire body of a timer notify.  It runs in the firmware's timer context, so it must not allocate, log
@@ -6255,23 +6632,60 @@ chiron_qusb2_init(void)
 	 *
 	 * So only ensure the clamp is released and leave bit 0 exactly as entry had it.
 	 */
+	/*
+	 * CHIRON_PHY_MUST_BE_POWERED_UP
+	 *
+	 * The block above used to keep PWR_CTRL1.POWR_DOWN exactly as entry had it, on the argument that
+	 * the entry snapshot is a working reference: "ENTRY: phy ... 210 23 ...", and 0x23 has bit 0 set,
+	 * so a working fastboot reads POWR_DOWN and clearing it is the change rather than the fix.
+	 *
+	 * That argument has a hole.  The entry snapshot is taken after fastboot has finished, not while
+	 * it was enumerating.  0x23 is the state a session leaves behind when the host is done with it,
+	 * not the state that made the session work.
+	 *
+	 * MC-XiaoXiao/ios_sagit has a working USB device mode on the same SoC (Mi 6, MSM8998), and its
+	 * QUSB2 start sequence in drivers/usb/QcomUSB/USBPhy.h:63-100 is unambiguous about the direction:
+	 *
+	 *     update(Power, 1, 1)      set POWR_DOWN      -- hold the block in reset
+	 *     ... write the tuning table ...
+	 *     update(Power, 1, 0)      CLEAR POWR_DOWN    -- release it, this is power-up
+	 *     delay(250);
+	 *     poll(Status==0x1A0, bit0)                  -- wait for CORE_READY / PLL lock
+	 *
+	 * so a running PHY ends with bit 0 clear.  Keeping it set leaves the block powered down and the
+	 * PLL unlocked, and every downstream symptom recorded in this file follows from that: the core
+	 * reports connected, SOF never advances, and the host stays silent because nothing is driving
+	 * the D+ pull-up through a live PHY.
+	 *
+	 * Do what Mi 6 does: assert POWR_DOWN, then release it, then wait for the PLL.
+	 */
 	{
-		uint8_t pw = (g_entry_p210 != 0) ? g_entry_p210
-		                                 : *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
+		uint8_t pw = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
 
-		pw = (uint8_t)(pw | 2u);
+		*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = (uint8_t)(pw | 1u);
+	}
+	__asm__ volatile ("dsb sy" ::: "memory");
+	chiron_udelay(100);
+
+	{
+		uint8_t pw = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
+
+		pw = (uint8_t)((pw & ~1u) | 2u);          /* POWR_DOWN clear, clamp released */
 		*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = pw;
 	}
 	__asm__ volatile ("dsb sy" ::: "memory");
-	chiron_udelay(200);
+	chiron_udelay(250);
 
-	for (int i = 0; i < 100; i++) {
+	for (int i = 0; i < 1000; i++) {
 		ready = *(volatile uint8_t *)(uintptr_t)(phy + 0x1A0);
 		if (ready & 1) {
 			break;
 		}
-		chiron_udelay(100);
+		chiron_udelay(10);
 	}
+	print("qusb2: powered up, 210 %x 1a0 %x (lock %x)\n",
+	    (uint64_t)*(volatile uint8_t *)(uintptr_t)(phy + 0x210),
+	    (uint64_t)ready, (uint64_t)(ready & 1));
 
 	/*
 	 * CHIRON_PHY_AUTO_RESUME
@@ -7547,8 +7961,19 @@ chiron_phy_restore(void)
 	 * the earlier 0x19 here came from msm8998-v2.dtsi, which is not this
 	 * phone's device tree.
 	 */
-	__asm__ volatile ("dsb sy" ::: "memory");
-	*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = 0x23;
+	/*
+	 * CHIRON_RESTORE_DOES_NOT_POWER_DOWN
+	 *
+	 * This wrote 0x23 -- POWR_DOWN set -- and called it the working entry state.  See
+	 * CHIRON_PHY_MUST_BE_POWERED_UP: 0x23 is what a finished session leaves behind, not what a live
+	 * one needs.  Release POWR_DOWN and keep the clamp released instead of restoring a powered-down
+	 * block.
+	 */
+	{
+		uint8_t pw = *(volatile uint8_t *)(uintptr_t)(phy + 0x210);
+
+		*(volatile uint8_t *)(uintptr_t)(phy + 0x210) = (uint8_t)((pw & ~1u) | 2u);
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 
 	print("restore: b4 ", 0);
@@ -12292,7 +12717,28 @@ usb_start(void)
 				}
 				(void)seeded_dev_base;
 			}
+			/*
+			 * CHIRON_IRQS_ON_ACROSS_THE_POLL
+			 *
+			 * Every reset mechanism tried so far has one thing in common: it needs code to run, and
+			 * this loop is where code stops running.  The log ends at "usb: command loop entered"
+			 * and the line right after this call -- "pumped %d" at 12324 -- never appears, so
+			 * handle_event never returns.
+			 *
+			 * A software deadline inside the loop cannot preempt a call that does not return, and
+			 * the Qualcomm watchdog is not available here at all: wdt_arm() returns early unless
+			 * PLAT is platform_redwood, and chiron runs platform_qemu_virt, so wdt_armed is always
+			 * 0 (the note at 13616 says exactly this).
+			 *
+			 * What can preempt it is a hardware interrupt.  UEFI's timer is serviced by the
+			 * firmware's own interrupt path, so enable IRQ around the call: then the firmware's
+			 * timer can run the notify armed earlier even while this call is stuck inside vendor
+			 * code.  Interrupts are masked again immediately afterwards so the rest of the loop
+			 * behaves as before.
+			 */
+			__asm__ volatile ("msr daifclr, #2" ::: "memory");
 			USB->handle_event(&m, &sz, &d);
+			__asm__ volatile ("msr daifset, #2" ::: "memory");
 			pumped++;
 
 			/*
@@ -12470,6 +12916,25 @@ usb_start(void)
 		usb_rx_buf = usb_static_rx;
 		usb_tx_buf = usb_static_tx;
 	}
+	/*
+	 * CHIRON_MI6_SEQUENCE_RUNS_LAST
+	 *
+	 * This has to be the final thing usb_start does.  The legacy steps above -- chiron_qusb2_init,
+	 * chiron_pll_resume, chiron_qusb2_reassert, the RunStop block -- all run after any earlier
+	 * placement and reprogram the PHY and the controller, which is exactly what a first attempt at
+	 * this sequence hit: the Mi 6 endpoints were enabled and the ring was installed, and then
+	 * chiron_qusb2_init ran again over the top of it.
+	 *
+	 * Mi 6 (MC-XiaoXiao/ios_sagit) runs these as the last three steps of online() before it reports
+	 * Running, in this order: select() which soft-resets, configureEndpoint() for EP0 out and in,
+	 * installEvents(), then runDevice().  Nothing runs between them and the host.
+	 */
+	chiron_mi6_dwc3_bringup();
+	chiron_mi6_endpoints();
+	chiron_mi6_install_events();
+	(void)chiron_mi6_run_device();
+	chiron_dwc3_snap("C-after-mi6");
+
 	print("usb: started\n");
 	return 1;
 }
@@ -13034,7 +13499,28 @@ usb_command_loop(void)
 	}
 	chiron_fn_events("final");
 	chiron_event_probe("final");
-	print("usb: command loop entered\n");
+
+	/*
+	 * CHIRON_IRQ_ON_FOR_THE_WHOLE_LOOP
+	 *
+	 * Every reset path in this file has failed for the same reason: it needs code to run, and
+	 * the code stops inside USB->handle_event (called from usb_wait at 12556 and from the
+	 * pre-loop pump).  The log ends at "usb: command loop entered" and never reaches the
+	 * "waiting for a host" line at 13314, so the block is one of those calls.
+	 *
+	 * A software deadline cannot preempt a call that does not return, and the Qualcomm
+	 * watchdog is not available on this platform at all -- wdt_arm() returns early unless PLAT
+	 * is platform_redwood, and chiron runs platform_qemu_virt.
+	 *
+	 * A hardware interrupt can.  UEFI's timer is serviced through the firmware's own interrupt
+	 * path, so unmask IRQ here and leave it unmasked for the rest of the loop: then the notify
+	 * armed before the loop gets to run even while a driver call is stuck, and resets the phone.
+	 *
+	 * This is deliberately different from the earlier attempt, which enabled IRQ only around
+	 * one call in a loop that had already finished.  This one covers every path from here on.
+	 */
+	__asm__ volatile ("msr daifclr, #2" ::: "memory");
+	print("usb: command loop entered (IRQ unmasked)\n");
 	flush_log();
 
 	/*
@@ -13836,66 +14322,21 @@ efi_main(efi_handle image, efi_system_table *st)
 			}
 
 			/*
-			 * CHIRON_SUBMIT_A_TRANSFER
+			 * CHIRON_TRANSFER_SLOT_IS_NOT_A_FUNCTION
 			 *
-			 * An exhaustive search of UsbfnDwc3Dxe for writes to GEVNTADR, GEVNTSIZ and GEVNTCOUNT
-			 * finds exactly two sites, and neither is initialisation:
+			 * A call was added here through the vendor table's +0x50 slot, on the reading that
+			 * UsbFnIo::Transfer lives there.  It faulted at once:
 			 *
-			 *   8b14/8b30/8b50   inside the routine at 0x8a40, which appends a 0x18-byte TRB and
-			 *                    hands it to the controller -- a transfer submission
-			 *   a45c/a460/a464   inside the event handler, on the acknowledge path
+			 *     UEFI EXCEPTION elr=9bfab924 esr=2000000 far=0
 			 *
-			 * So the ring registers are only ever programmed as part of submitting a transfer.  On
-			 * this port no transfer has ever been submitted, which is why GEVNTADR reads 0 and
-			 * GEVNTCOUNT never moves -- and why restoring a ring from the entry snapshot and then
-			 * waiting for events asked for something the driver only sets up during a transfer.
+			 * and 9bfab924 is not code.  The slot dump taken earlier in this effort says what it
+			 * is: "slot 50: 9bfab924 [44 45 56 5f]" -- the bytes are "DEV_", the start of the
+			 * string "DEV_STATE_DETACHED".  The vendor table ends at +0x48; everything past it
+			 * is somebody else's memory, which the loader already had written down and which this
+			 * call ignored.
 			 *
-			 * The interface is the one in efi.h:541, whose order matches the disassembly of
-			 * UsbFnIo+0x50 at 0x3088 exactly:
-			 *
-			 *     Transfer(This, EndpointIndex, Direction, UINTN *BufferSize, VOID *Buffer)
-			 *     309c: mov w19, w2        Direction, validated <= 1
-			 *     30a0: mov w20, w1        EndpointIndex, validated <= 0xf
-			 *     30b4: mov x22, x3        BufferSize, must be non-null
-			 *     30bc: mov x21, x4        Buffer, must be non-null
-			 *
-			 * Submit a zero-length IN on endpoint 0.  A length of 0 is a legal USB control transfer
-			 * and asks the controller to produce a packet, which is what exercises the path that
-			 * programs the ring.  Whatever comes back is reported rather than interpreted.
+			 * Removed rather than fixed: there is no Transfer entry to call on this object.
 			 */
-			{
-				efi_usbfn_io *tfn = NULL;
-				static const efi_guid tg = QCOM_USBFN_IO_GUID;
-				uint64_t tsize = 0;
-				uint8_t *tbuf;
-
-				/* A buffer the controller can DMA to: the loader's own static area is fine. */
-				static uint8_t xfer_buf[512];
-
-				if (usb_dev_handle != NULL &&
-				    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &tg, (void **)&tfn)) &&
-				    tfn != NULL && tfn->transfer != NULL) {
-					efi_status ts;
-					uint64_t ring_before =
-					    *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400);
-
-					tbuf = xfer_buf;
-					tsize = 0;
-					ts = tfn->transfer(tfn, 0, 0, &tsize, tbuf);
-
-					print("xfer: transfer ep0 in size %x -> %x | adr %x->%x siz %x cnt %x\n",
-					    (uint64_t)tsize, (uint64_t)ts,
-					    ring_before,
-					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400),
-					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408),
-					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C));
-					flush_log();
-				} else {
-					print("xfer: no transfer method\n", 0);
-					flush_log();
-				}
-			}
-
 			/*
 			 * CHIRON_GEVNTCOUNT_PROBE
 			 *

@@ -3538,15 +3538,25 @@ chiron_ep0_end_out(uint32_t resource)
 	    8u | CHIRON_DEPCMD_ACTIVE | (1u << 11) | (1u << 8) | ((resource & 127u) << 16);
 	__asm__ volatile ("dsb sy" ::: "memory");
 
-	for (unsigned i = 0; i < 200; i++) {
-		reply = *(volatile uint32_t *)(uintptr_t)(epbase + 12);
-		if ((reply & CHIRON_DEPCMD_ACTIVE) == 0) {
-			break;
-		}
-		chiron_udelay(10);
-	}
-	/* let the controller settle before the next Start */
-	chiron_udelay(200);
+	/*
+	 * CHIRON_END_DOES_NOT_REPORT_THROUGH_CMDACT
+	 *
+	 * Waiting for CMDACT to clear was wrong and made every re-arm after a bus reset hang:
+	 *
+	 *     ep0: Start epa80c800 timed out (cmd 406)
+	 *
+	 * 0x406 still has bit 10 set, so the End never looked finished and the Start behind it never
+	 * ran.  DWC3Core.h:420 is explicit about this: on this revision, CMDACT clearing acknowledges
+	 * that End was accepted, not that the DMA finished -- completion arrives as an End event on
+	 * the ring, and Mi 6 therefore returns Pending from command() for End and keeps the buffers
+	 * until that event shows up.
+	 *
+	 * So issue it, give the controller a moment, and carry on.  The event is drained by the poll
+	 * and the transfer state is rebuilt by the Configure/Resource sequence in chiron_mi6_endpoints
+	 * when needed.
+	 */
+	(void)reply;
+	chiron_udelay(500);
 }
 
 static int
@@ -3554,9 +3564,24 @@ chiron_ep0_arm_setup(void)
 {
 	uint32_t epbase = (uint32_t)(0xA800000ULL + 0xC800);
 
-	/* an outstanding transfer makes Start fail; clear it first if one is running */
+	/*
+	 * CHIRON_REARM_WITHOUT_END
+	 *
+	 * End was tried and made things worse: with no transfer resource recorded it never completed,
+	 * and every Start behind it timed out with CMDACT still set.
+	 *
+	 *     ep0: bus reset, re-arming
+	 *     ep0: Start epa80c800 timed out (cmd 406)
+	 *
+	 * The complaint that started this was 'status 1' -- command abort, the endpoint already
+	 * active.  Re-running Configure + Resource clears that state without needing an End at all,
+	 * and chiron_mi6_endpoints() does both; it is the same sequence this loader already uses
+	 * successfully at startup.  So re-configuring is the way to get back to a startable endpoint.
+	 */
 	if (g_ep0.armed) {
-		chiron_ep0_end_out(g_ep0.resource);
+		print("ep0: re-configuring EP0 before re-arm\n", 0);
+		flush_log();
+		chiron_mi6_endpoints();
 		g_ep0.armed = 0;
 	}
 

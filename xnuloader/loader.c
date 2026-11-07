@@ -11424,13 +11424,29 @@ usb_start(void)
 		 * that has none.
 		 */
 		if (usb_no_start_ex) {
-			efi_status (*f_stop)(void) = (efi_status (*)(void))USB->stop;
 			efi_status (*f_start)(void) = (efi_status (*)(void))USB->start;
-			efi_status s_stop = (f_stop != NULL) ? f_stop() : 0;
 			efi_status s_ep;
 			efi_status s_start;
+			efi_status s_stop = 0;
 
-			print("nostartex: stop %x\n", (uint64_t)s_stop);
+			/*
+			 * CHIRON_CONFIGURE_BEFORE_STOP
+			 *
+			 * This used to stop the controller first, and the configure that followed faulted at
+			 * far=0x50 -- self+0x50, the state area past the nine documented entry points.  The
+			 * stop is what made that area unusable:
+			 *
+			 *     nostartex: stop 8000000000000007
+			 *     cfgonly: self 9bfaf0f0 fn 9bfa65cc (vendor 9bfaf0f0)
+			 *     UEFI EXCEPTION elr=9bfa6600 esr=96000007 far=50
+			 *
+			 * and the file already records the same thing from an earlier attempt: "chiron_usbfn_
+			 * endpoints() stops and starts the controller first, and that is what crashed".
+			 *
+			 * configure_enable_endpoints succeeded before whenever it ran without a stop
+			 * immediately in front of it, so configure first and leave the stop out.
+			 */
+			(void)s_stop;
 
 			s_ep = chiron_usbfn_configure_only() ? 0 : 0x8000000000000002ULL;
 			print("nostartex: configure endpoints %x\n", (uint64_t)s_ep);

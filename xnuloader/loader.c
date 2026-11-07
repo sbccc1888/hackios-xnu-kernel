@@ -4568,12 +4568,20 @@ proto_dump(void)
 /*
  * CHIRON_DEPEX_CHECK
  *
- * UsbfnDwc3Dxe is in the volume and listed after everything it names, yet
- * gEfiUsbfnIoProtocolGuid never appears -- so one of the protocols in its depex
- * is never satisfied and the driver is never dispatched.  The depex is one AND
- * over fifteen GUIDs; check every one of them and say which are missing.
+ * The table below was generated from a 270-byte dependency expression that listed fifteen GUIDs, and the note
+ * that used to sit here claimed it "cannot drift" because it came from the driver's own .depex.
  *
- * The table is generated from the driver's own .depex, so it cannot drift.
+ * It drifted.  The depex shipped with this firmware is two bytes:
+ *
+ *     Mu-Silicium/.../UsbfnDwc3Dxe/UsbfnDwc3Dxe.depex     06 08     TRUE, END
+ *     /root/hk/UsbfnDwc3Dxe.depex.orig                   270 bytes  the fifteen-GUID list
+ *
+ * and the image agrees with the two-byte one: searching UsbfnDwc3Dxe.efi for 06 08 finds it once, at 0x15f9, and
+ * searching for the fifteen-GUID expression's leading bytes finds nothing at all.
+ *
+ * So UsbfnDwc3Dxe has no dependency gate, and the depex check below is reporting on a file that is no longer the
+ * driver's.  It is left in place only so the log keeps showing what it showed before; the "MISSING dep01" line
+ * it prints does not indicate a blocked driver.
  */
 static const struct {
 	const char *name;
@@ -10843,6 +10851,10 @@ usb_start(void)
 		flush_log();
 	}
 
+	/*
+	 * The check reports on a stale dependency list (see CHIRON_DEPEX_CHECK); its "MISSING" lines do not
+	 * mean the driver is blocked.
+	 */
 	chiron_depex_check();
 	chiron_usb_probe_protos("pre");
 	print("usb: native mode ", 0);

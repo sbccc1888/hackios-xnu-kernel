@@ -5485,7 +5485,25 @@ chiron_usb_hk6(void)
 				 * reinstalled in peripheral mode.  Select on that instead of on an
 				 * exact mode value this part does not use.
 				 */
-				if (cfg->revision == 0x10003 && cfg->core_num == core.core_num &&
+				/*
+				 * CHIRON_CLONE_ANY_CORE
+				 *
+				 * This required cfg->core_num == core.core_num, with core.core_num being 0 from
+				 * query_core_info(NULL).  The only config this part publishes reports core_num 1,
+				 * so the test never matched and the clone path returned on every run with
+				 * "no host config to clone on core 0".
+				 *
+				 * The equality is not justified by the disassembly.  UsbConfigStartController
+				 * works on one fixed record at module RVA 0xc218 and never indexes by core:
+				 *
+				 *     3320: adrp x20, 0xc000
+				 *     3324: add  x20, x20, #0x218
+				 *     332c: ldr  w1,  [x20, #0xb4]
+				 *
+				 * so the core number a config reports is a field in that record, not a selector for
+				 * choosing between records.  Take any config that is not already peripheral.
+				 */
+				if (cfg->revision == 0x10003 &&
 				    cfg->mode_type != UsbModePeripheral &&
 				    cfg->mode_type != UsbModePeripheralAlt) {
 					host_cfg = cfg;

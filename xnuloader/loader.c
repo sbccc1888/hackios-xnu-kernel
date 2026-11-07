@@ -6711,9 +6711,157 @@ chiron_usb_hk6(void)
 				(void)mb;
 			}
 
+			/*
+			 * CHIRON_SET_THE_MODE_FIELD_FIRST
+			 *
+			 * UsbConfigDxe's StartController compares the mode the caller asks for against the
+			 * mode already recorded at +0xb4 of the config block, and only some of those
+			 * comparisons lead to the start path:
+			 *
+			 *     38d4: ldr  w4, [x20, #0xb4]      recorded mode
+			 *     38d8: cmp  w4, w9
+			 *     38dc: b.ne 0x3938                not equal -> a different path
+			 *     38e0: cmp  w9, #0x4
+			 *     38e8: ldr  x0, [x20, #0x10]      the controller handle
+			 *     38ec: cbz  x0, 0x3998            no handle -> another path
+			 *
+			 * The log shows the recorded mode as 0x10000 ('hk6: cfg 0 rev 10003 core 1 mode
+			 * 10000'), which is neither 1 nor 4, so the comparison never matches.  Mi 6's
+			 * QcomFastboot sets the field itself before rebinding:
+			 *
+			 *     Config->Mode = 4;
+			 *     gBS->ConnectController(handles[i], NULL, NULL, TRUE);
+			 *
+			 * Do the same: write the requested mode into the config block before calling, so the
+			 * driver sees the mode it is being asked for.
+			 */
+			{
+				efi_handle *mh = NULL;
+				uint64_t mn = 0;
+				static const efi_guid mg = QCOM_USB_CONFIG_GUID;
+
+				if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &mg, NULL, &mn, &mh)) &&
+				    mh != NULL) {
+					for (uint64_t i = 0; i < mn; i++) {
+						efi_qcom_usb_config *c = NULL;
+
+						if (EFI_ERROR(BS->handle_protocol(mh[i], &mg,
+						    (void **)&c)) || c == NULL) {
+							continue;
+						}
+						if (c->core_num == 0 && c->mode_type != UsbModePeripheral) {
+							print("hk6: mode %x -> 4 on core 0\n",
+							    (uint64_t)c->mode_type);
+							c->mode_type = UsbModePeripheral;
+							flush_log();
+						}
+					}
+					BS->free_pool(mh);
+				}
+			}
+
 			/* ask for peripheral */
 			s = init->start_controller(init, core.core_num, UsbModePeripheral);
-			print("hk6: start peripheral %x\n", (uint64_t)s);
+			print("hk6: start peripheral (core %x) %x\n",
+			    (uint64_t)core.core_num, (uint64_t)s);
+
+			/*
+			 * CHIRON_CORE_ZERO_IS_THE_ONE_THAT_TAKES_PERIPHERAL
+			 *
+			 * Mi 6's QcomFastboot does not walk the config list; it asks for core 0 explicitly
+			 * (edk2-judypn/0001-judypn-usb-fastboot.patch, ConnectPeripheral):
+			 *
+			 *     Status = Config->StartController(Config, 0, 4);
+			 *
+			 * and 4 is UsbModePeripheral, which matches the enum here.  The fallback that follows
+			 * in the same function is the part that explains every failure logged so far -- if the
+			 * peripheral interface still does not appear, it rebinds the handle whose Core is 0:
+			 *
+			 *     if (Config->Core != 0) continue;
+			 *     gBS->DisconnectController(Handles[Index], NULL, NULL);
+			 *     PreviousMode = Config->Mode;
+			 *     Config->Mode = 4;
+			 *     gBS->ConnectController(Handles[Index], NULL, NULL, TRUE);
+			 *
+			 * This loader has only ever done the first half, and against whichever core the walk
+			 * returned first -- the log says that is core 1:
+			 *
+			 *     hk6: cfg 0 rev 10003 core 1 mode 10000
+			 *
+			 * So try core 0 as well, and if that also fails, do the rebind Mi 6 does.
+			 */
+			if (EFI_ERROR(s) && core.core_num != 0) {
+				print("hk6: core %x refused, trying core 0\n", (uint64_t)core.core_num);
+				flush_log();
+				s = init->start_controller(init, 0, UsbModePeripheral);
+				print("hk6: start peripheral (core 0) %x\n", (uint64_t)s);
+			}
+
+			/*
+			 * CHIRON_THE_REBIND_MI6_DOES
+			 *
+			 * Mi 6's ConnectPeripheral has a second stage that this loader never had, and it is the
+			 * one written for exactly the case where StartController reports success but no
+			 * UsbFunctionIo interface appears -- which is every run here:
+			 *
+			 *     gBS->LocateHandleBuffer(ByProtocol, &ConfigGuid, ...);
+			 *     for each handle:
+			 *         if (Config->Core != 0) continue;
+			 *         gBS->DisconnectController(handle, NULL, NULL);
+			 *         PreviousMode = Config->Mode;
+			 *         Config->Mode = 4;                          peripheral
+			 *         gBS->ConnectController(handle, NULL, NULL, TRUE);
+			 *         if that failed: restore Mode and reconnect
+			 *
+			 * The point is that the core/mode fields are what DriverBindingSupported reads, so
+			 * setting Mode before ConnectController is what makes UsbfnDwc3Dxe bind in peripheral
+			 * mode rather than reuse the host role it latched during boot.
+			 */
+			{
+				efi_handle *cfgh = NULL;
+				uint64_t cfn = 0;
+				static const efi_guid cg = QCOM_USB_CONFIG_GUID;
+
+				if (!EFI_ERROR(BS->locate_handle_buffer(ByProtocol, &cg, NULL, &cfn, &cfgh)) &&
+				    cfgh != NULL) {
+					for (uint64_t i = 0; i < cfn; i++) {
+						efi_qcom_usb_config *c = NULL;
+
+						if (EFI_ERROR(BS->handle_protocol(cfgh[i], &cg,
+						    (void **)&c)) || c == NULL) {
+							continue;
+						}
+						if (c->core_num != 0) {
+							continue;
+						}
+						print("hk6: rebind core 0 handle %x mode %x\n",
+						    (uint64_t)(uintptr_t)cfgh[i], (uint64_t)c->mode_type);
+						flush_log();
+
+						{
+							efi_status ds = BS->disconnect_controller(cfgh[i], NULL, NULL);
+							uint32_t prev_mode = c->mode_type;
+
+							if (EFI_ERROR(ds)) {
+								print("hk6: disconnect -> %x, skipping\n",
+								    (uint64_t)ds);
+								continue;
+							}
+							c->mode_type = UsbModePeripheral;
+							ds = BS->connect_controller(cfgh[i], NULL, NULL, 1);
+							print("hk6: rebind connect -> %x\n", (uint64_t)ds);
+							if (EFI_ERROR(ds)) {
+								c->mode_type = prev_mode;
+								(void)BS->connect_controller(cfgh[i], NULL, NULL, 1);
+								print("hk6: rebind restored mode %x\n",
+								    (uint64_t)prev_mode);
+							}
+							flush_log();
+						}
+					}
+					BS->free_pool(cfgh);
+				}
+			}
 
 			/*
 			 * CHIRON_WHY_CONNECT_FAILS
@@ -13951,7 +14099,15 @@ usb_start(void)
 		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC720));
 	}
 
-	if (chiron_ep0_init(chiron_ep0_alloc, chiron_ep0_phys)) {
+	/*
+	 * CHIRON_STOP_THE_EP0_EXPERIMENT
+	 *
+	 * Measured conclusion: it is not the way forward.  The chain that works is the vendor one --
+	 * 'usbfn: ConfigureEnableEndpoints 0' succeeds -- and EP0's DEPCMD Start is refused every time
+	 * because the endpoint belongs to UsbfnDwc3Dxe.  Disabled rather than deleted, so the code and
+	 * its measurements stay available.
+	 */
+	if (0 && chiron_ep0_init(chiron_ep0_alloc, chiron_ep0_phys)) {
 		if (chiron_ep0_arm_setup()) {
 			print("ep0: armed, waiting for the host\n", 0);
 		} else {
@@ -14802,7 +14958,7 @@ usb_command_loop(void)
 		 * So when EP0 is up, this loop does exactly one thing per pass: poll EP0.  The fastboot
 		 * command path below stays reachable only when the gadget did not start.
 		 */
-		if (g_ep0.ready) {
+		if (g_ep0.ready && 0) {
 			/*
 			 * CHIRON_THE_DEADLINE_STILL_RUNS_WHILE_EP0_OWNS_THE_RING
 			 *

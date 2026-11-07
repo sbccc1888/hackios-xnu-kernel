@@ -3105,6 +3105,34 @@ smc_call(uint64_t id, uint64_t a1, uint64_t a2, uint64_t *r1, uint64_t *r2)
 static void chiron_udelay(uint64_t us);
 static void flush_log(void);
 static void chiron_invalidate(void *addr, uint64_t len);
+static uint64_t chiron_usbdevice_base(void);
+
+typedef struct {
+	uint32_t address_lo;
+	uint32_t address_hi;
+	uint32_t size;
+	uint32_t control;
+} __attribute__((aligned(16))) chiron_trb;
+
+/* the gadget's whole context, kept in one place so the state is inspectable */
+static struct {
+	chiron_trb *out_trb;        /* EP0 OUT ring (host -> device) */
+	chiron_trb *in_trb;         /* EP0 IN  ring (device -> host) */
+	uint8_t    *setup_buf;      /* 8 bytes, DMA, holds the SETUP packet */
+	uint8_t    *data_buf;       /* reply buffer, DMA */
+	uint64_t    out_dma, in_dma, setup_dma, data_dma;
+	uint32_t    out_cap, in_cap, data_len;
+	uint8_t     address;
+	uint8_t     configuration;
+	uint32_t    speed;          /* 0 = high, 1 = full, 2 = super */
+	uint32_t    out_resource;   /* EP0 OUT transfer resource from Resource */
+	uint32_t    in_resource;    /* EP0 IN transfer resource */
+	int         armed;          /* a Setup TRB is outstanding */
+	int         connected;
+	int         ready;
+	uint64_t    setup_count;
+	uint64_t    last_setup_raw;
+} g_ep0;
 
 /* the event ring the vendor driver allocated, captured before the Mi 6 sequence clears it */
 static uint32_t g_mi6_evtadr, g_mi6_evtsiz;
@@ -3299,7 +3327,9 @@ chiron_mi6_endpoints(void)
 	*(volatile uint32_t *)(uintptr_t)(base0 + 12) = 2u | CHIRON_DEPCMD_ACTIVE;
 	__asm__ volatile ("dsb sy" ::: "memory");
 	okres0 = chiron_depcmd_wait((uint32_t)base0, &reply);
-	print("mi6ep: Resource ep0out %d reply %x\n", (uint64_t)okres0, (uint64_t)reply);
+	g_ep0.out_resource = (reply >> 16) & 127u;
+	print("mi6ep: Resource ep0out %d reply %x res %x\n",
+	    (uint64_t)okres0, (uint64_t)reply, (uint64_t)g_ep0.out_resource);
 
 	*(volatile uint32_t *)(uintptr_t)(base1 + 0) = 0;
 	*(volatile uint32_t *)(uintptr_t)(base1 + 4) = 0;
@@ -3307,7 +3337,9 @@ chiron_mi6_endpoints(void)
 	*(volatile uint32_t *)(uintptr_t)(base1 + 12) = 2u | CHIRON_DEPCMD_ACTIVE;
 	__asm__ volatile ("dsb sy" ::: "memory");
 	okres1 = chiron_depcmd_wait((uint32_t)base1, &reply);
-	print("mi6ep: Resource ep0in %d reply %x\n", (uint64_t)okres1, (uint64_t)reply);
+	g_ep0.in_resource = (reply >> 16) & 127u;
+	print("mi6ep: Resource ep0in %d reply %x res %x\n",
+	    (uint64_t)okres1, (uint64_t)reply, (uint64_t)g_ep0.in_resource);
 
 	/* 4. and only now enable them */
 	{
@@ -3424,12 +3456,7 @@ chiron_mi6_install_events(void)
 #define CHIRON_TRB_STATUS3      4
 #define CHIRON_TRB_CONTROLDATA  5
 
-typedef struct {
-	uint32_t address_lo;
-	uint32_t address_hi;
-	uint32_t size;
-	uint32_t control;
-} __attribute__((aligned(16))) chiron_trb;
+
 
 typedef struct {
 	uint8_t  request_type;
@@ -3439,24 +3466,7 @@ typedef struct {
 	uint16_t length;
 } chiron_setup;
 
-/* the gadget's whole context, kept in one place so the state is inspectable */
-static struct {
-	chiron_trb *out_trb;        /* EP0 OUT ring (host -> device) */
-	chiron_trb *in_trb;         /* EP0 IN  ring (device -> host) */
-	uint8_t    *setup_buf;      /* 8 bytes, DMA, holds the SETUP packet */
-	uint8_t    *data_buf;       /* reply buffer, DMA */
-	uint64_t    out_dma, in_dma, setup_dma, data_dma;
-	uint32_t    out_cap, in_cap, data_len;
-	uint8_t     address;
-	uint8_t     configuration;
-	uint32_t    speed;          /* 0 = high, 1 = full, 2 = super */
-	uint32_t    resource;       /* EP0 OUT transfer resource from Resource */
-	int         armed;          /* a Setup TRB is outstanding */
-	int         connected;
-	int         ready;
-	uint64_t    setup_count;
-	uint64_t    last_setup_raw;
-} g_ep0;
+/* the gadget context is declared earlier, before chiron_mi6_endpoints() needs it */
 
 /*
  * Build one TRB.  DWC3Transfer.h:127-135 writes address, size and control, sets Chain on every
@@ -3578,10 +3588,100 @@ chiron_ep0_arm_setup(void)
 	 * and chiron_mi6_endpoints() does both; it is the same sequence this loader already uses
 	 * successfully at startup.  So re-configuring is the way to get back to a startable endpoint.
 	 */
+	/*
+	 * CHIRON_REARM_STOPS_WITH_END_THEN_STARTS
+	 *
+	 * Three attempts narrowed this down.  Both Configure variants abort with status 1 while EP0
+	 * OUT still owns a transfer -- StartConfiguration resets too much, and Configure-with-modify
+	 * is refused because the endpoint is active:
+	 *
+	 *     ep0: Start epa80c800 status 1
+	 *     ep0: arm rc 0 DGTYPE 1006
+	 *
+	 * DWC3Transfer.h:143 cancel() is the operation meant for exactly this: command End with Force
+	 * and Interrupt, carrying the transfer resource.  It failed earlier only because the resource
+	 * was hard-coded to 0 -- every successful Resource command reports the resource in reply bits
+	 * 22:16, 'Resource ep0out 1 reply 10002' means resource 1.  Record it and pass it.
+	 *
+	 * End is Pending by design (DWC3Core.h:423): CMDACT clearing means accepted, and the End
+	 * completion arrives as an event.  Give the controller time and re-issue rather than polling.
+	 */
+	/*
+	 * CHIRON_EP0_NEGOTIATE_FIRST
+	 *
+	 * Mi 6 does not arm a Setup TRB against whatever packet size happens to be programmed.  It
+	 * calls control.negotiate() first (DWC3Control.h:145), which re-configures EP0 OUT and IN with
+	 * the negotiated maximum packet size before any TRB is submitted:
+	 *
+	 *     EndpointConfiguration config{0, EndpointType::Control, speed, maximum, 0, 0};
+	 *     controller.configureEndpoint(config, true);   modify = true
+	 *     config.physicalEndpoint = 1;
+	 *     controller.configureEndpoint(config, true);
+	 *
+	 * Both descriptors go down with modify set, which is exactly what a re-arm needs: it updates
+	 * the endpoint without tearing down its resource allocation or the DALEPENA bit.
+	 *
+	 * The packet size comes from the speed the host negotiated.  DCFG speed 0 is High Speed and
+	 * the control endpoint is 64 bytes there.
+	 */
 	if (g_ep0.armed) {
-		print("ep0: re-configuring EP0 before re-arm\n", 0);
+		const uint64_t dn = 0xA800000ULL;
+		uint32_t b0 = (uint32_t)(dn + 0xC800);
+		uint32_t b1 = (uint32_t)(dn + 0xC810);
+		uint32_t dcfg = *(volatile uint32_t *)(uintptr_t)(dn + 0xC700);
+		uint32_t mps = ((dcfg & 7u) == 4u) ? 512u : 64u;
+		uint32_t par0 = (mps << 3) | (2u << 30);         /* Control, |modify */
+		uint32_t reply = 0;
+
+		*(volatile uint32_t *)(uintptr_t)(b0 + 0) = 0;
+		*(volatile uint32_t *)(uintptr_t)(b0 + 4) = 0x500;
+		*(volatile uint32_t *)(uintptr_t)(b0 + 8) = par0;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		*(volatile uint32_t *)(uintptr_t)(b0 + 12) = 1u | CHIRON_DEPCMD_ACTIVE;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		(void)chiron_depcmd_wait(b0, &reply);
+
+		*(volatile uint32_t *)(uintptr_t)(b1 + 0) = 0;
+		*(volatile uint32_t *)(uintptr_t)(b1 + 4) = 0x20500;
+		*(volatile uint32_t *)(uintptr_t)(b1 + 8) = par0;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		*(volatile uint32_t *)(uintptr_t)(b1 + 12) = 1u | CHIRON_DEPCMD_ACTIVE;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		(void)chiron_depcmd_wait(b1, &reply);
+
+		print("ep0: negotiated mps %x par0 %x\n", (uint64_t)mps, (uint64_t)par0);
 		flush_log();
-		chiron_mi6_endpoints();
+		g_ep0.armed = 0;
+	}
+
+	if (0) {
+		const uint64_t dd = 0xA800000ULL;
+		uint32_t b0 = (uint32_t)(dd + 0xC800);
+
+		*(volatile uint32_t *)(uintptr_t)(b0 + 0) = 0;
+		*(volatile uint32_t *)(uintptr_t)(b0 + 4) = 0;
+		*(volatile uint32_t *)(uintptr_t)(b0 + 8) = 0;
+		__asm__ volatile ("dsb sy" ::: "memory");
+		*(volatile uint32_t *)(uintptr_t)(b0 + 12) =
+		    8u | CHIRON_DEPCMD_ACTIVE | (1u << 11) | (1u << 8) |
+		    ((g_ep0.out_resource & 127u) << 16);
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		/* wait for the End completion event, which also resets the endpoint state */
+		{
+			unsigned waited = 0;
+
+			while (waited < 200) {
+				uint32_t raw = *(volatile uint32_t *)(uintptr_t)(dd + 0xC40C);
+
+				if ((raw & 0xffffu) == 0) {
+					chiron_udelay(10);
+					waited++;
+					continue;
+				}
+				break;
+			}
+		}
 		g_ep0.armed = 0;
 	}
 
@@ -3987,7 +4087,6 @@ chiron_ep0_poll(void)
 			if (ep == 0 && type == 1 && status == 0) {
 				g_ep0.setup_count++;
 				g_ep0.armed = 0;        /* that TRB has completed */
-				chiron_ep0_end_out(g_ep0.resource);
 				chiron_invalidate(g_ep0.setup_buf, 8);
 				chiron_ep0_handle_setup();
 			}
@@ -9606,9 +9705,41 @@ chiron_usbfn_endpoints(void)
 	 * The plain entry just returned success with the same descriptors, so the two disagree and
 	 * this says which way.
 	 */
+	/*
+	 * CHIRON_THE_EX_ENTRY_TAKES_THE_DEVICE_OBJECT_NOT_USBFN
+	 *
+	 * ConfigureEnableEndpointsEx is a UsbDevice method, not a UsbFnIo one, and the distinction is
+	 * what every attempt so far got wrong.  UsbDeviceDxe's StartEx at 0x200c initialises a module
+	 * global and stores it at +0x1e8 of that object:
+	 *
+	 *     201c: adrp x20, 0xa000
+	 *     2020: add  x20, x20, #0x140     the module's own UsbDevice instance
+	 *     202c: str  x0, [x20, #0x1e8]    points it at the UsbFnIo
+	 *     2040: str  x9, [x20, #0x220]    with w9 = 0x4000, the descriptor buffer size
+	 *
+	 * and later 0x2a64 does 'ldr x0, [x19, #0x1e8]; ldr x4, [x0, #0x40]; blr x4', so the callee
+	 * reads self+0x40 out of the UsbFnIo it was given.  Passing our UsbFnIo pointer as self works,
+	 * but self+0x220 is then read from the UsbFnIo, where there is no such field -- the measurement
+	 * says so exactly:
+	 *
+	 *     usbfn: desc wTotal 8000 | self+0x220 limit 0 | self+0x218 0 +0x230 0
+	 *
+	 * limit 0 means every descriptor is too big, and 0x2a60 takes the failing branch.
+	 *
+	 * The object that owns +0x220 is 基址 + 0xa140.  Pass that.
+	 */
+	/*
+	 * CHIRON_DEV_OBJ_HANGS
+	 *
+	 * Passing 基址+0xa140 as self was tried and froze the loader outright -- the log simply stops
+	 * after 'desc wTotal', with the call never returning -- so that address is not the object this
+	 * entry expects to receive.  Reverted.  self stays the UsbFnIo the driver handed out, which at
+	 * least returns a status instead of hanging.
+	 */
 	if (fn->configure_enable_endpoints_ex != NULL) {
 		efi_status ex_null = ((efi_status (EFIAPI *)(efi_usbfn_io *, void *, void *, void *))
-		    fn->configure_enable_endpoints_ex)(fn, &dev_info, NULL, (void *)usb_ss_capability);
+		    fn->configure_enable_endpoints_ex)(fn, &dev_info, NULL,
+		    (void *)usb_ss_capability);
 		print("usbfn: ConfigureEnableEndpoints_ex(NULL ss) %x\n", (uint64_t)ex_null);
 
 		/*
@@ -9631,6 +9762,40 @@ chiron_usbfn_endpoints(void)
 		print("usbfn: self %x self-8 %x (want 73756662)\n",
 		    (uint64_t)(uintptr_t)fn,
 		    (uint64_t)*(volatile uint32_t *)(uintptr_t)((uintptr_t)fn - 8));
+
+		/*
+		 * CHIRON_WHAT_LIMITS_THE_DESCRIPTOR
+		 *
+		 * ConfigureEnableEndpointsEx decides between two paths by comparing the config
+		 * descriptor's wTotalLength against self+0x220 (UsbDeviceDxe 0x2a58):
+		 *
+		 *     2a48: bfi  x9, x10, #8, #8      x9 = byte[6] | byte[7]<<8   wTotalLength
+		 *     2a58: ldr  x15, [x19, #0x220]
+		 *     2a5c: cmp  x9, x15
+		 *     2a60: b.ls 0x2b38               x9 <= x15, the good path
+		 *     2a64: ...                       otherwise: calls fn[0x40](fn,0,0,1)
+		 *                                     and that call returns 0x02
+		 *
+		 * Our descriptor set is small, so a failure here means self+0x220 is smaller still or
+		 * zero -- the buffer the driver was going to accept descriptors into.  Print both sides.
+		 */
+		{
+			const uint8_t *cd = NULL;
+			uint64_t total = 0;
+
+			if (dev_info.config_info_table != NULL && dev_info.config_info_table[0] != NULL &&
+			    dev_info.config_info_table[0]->config_descriptor != NULL) {
+				cd = (const uint8_t *)(uintptr_t)
+				    dev_info.config_info_table[0]->config_descriptor;
+				total = (uint64_t)cd[6] | ((uint64_t)cd[7] << 8);
+			}
+			print("usbfn: desc wTotal %x | self+0x220 limit %x | self+0x218 %x +0x230 %x\n",
+			    total,
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)((uintptr_t)fn + 0x220),
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)((uintptr_t)fn + 0x218),
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)((uintptr_t)fn + 0x230));
+			flush_log();
+		}
 
 		/*
 		 * ss_info must be a real three-level structure too; 0x8230 dereferences it at 0x8388
@@ -15055,6 +15220,43 @@ efi_main(efi_handle image, efi_system_table *st)
 		 * is the phase that did not finish, on the panel and in the partition both.
 		 */
 		uint64_t usb_t0 = READ_SYSREG(CNTVCT_EL0);
+
+		/*
+		 * CHIRON_ARM_THE_RESET_BEFORE_USB_START
+		 *
+		 * usb_start() calls into the vendor driver, and one of those calls can simply never
+		 * return -- passing the wrong object to ConfigureEnableEndpointsEx froze the loader with
+		 * the log stopping mid-function:
+		 *
+		 *     usbfn: desc wTotal 8000 | self+0x220 limit 0
+		 *     (nothing, and the phone needed a power-button hold)
+		 *
+		 * The UEFI timer that resets after the session deadline used to be armed after
+		 * usb_start() returned, which is useless for exactly this failure: control never comes
+		 * back to arm it.  Arm it first, so a hang inside usb_start still ends with the phone
+		 * rebooting on its own.
+		 */
+		{
+			static void *early_reset_evt;
+
+			if (BS != NULL && BS->create_event != NULL && BS->set_timer != NULL &&
+			    early_reset_evt == NULL) {
+				efi_status es = BS->create_event(0x00000200u /* notify */, 8,
+				    chiron_reset_notify, NULL, &early_reset_evt);
+
+				if (!EFI_ERROR(es) && early_reset_evt != NULL) {
+					uint64_t secs = usb_idle_seconds > 0 ?
+					    (uint64_t)usb_idle_seconds + 30 : 330;
+
+					BS->set_timer(early_reset_evt, 1 /* periodic */,
+					    secs * 10000000ull);
+					print("reset timer: armed early, %d s (before usb_start)\n", secs);
+				} else {
+					print("reset timer: early create failed %x\n", (uint64_t)es);
+				}
+				flush_log();
+			}
+		}
 
 		print("usb: phase -1 entering usb_start\n", 0);
 		if (usb_start()) {

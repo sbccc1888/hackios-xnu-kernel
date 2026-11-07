@@ -8384,11 +8384,38 @@ chiron_usbfn_endpoints(void)
 		efi_status ex_null = fn->configure_enable_endpoints_ex(fn, &dev_info, NULL);
 		print("usbfn: ConfigureEnableEndpoints_ex(NULL ss) %x\n", (uint64_t)ex_null);
 
-		if (EFI_ERROR(ex_null)) {
+		/*
+		 * CHIRON_USBFS_TAG
+		 *
+		 * ConfigureEnableEndpointsEx (RVA 0x2584) opens with a tag check on the object it is
+		 * handed:
+		 *
+		 *     25b0: mov  w8, #0x66620000
+		 *     25b4: movk w8, #0x7375             w8 = "usbfs"
+		 *     25b8: ldr  x9, [x21, #-0x8]!       x21 = self; reads self-8
+		 *     25bc: cmp  x9, x8
+		 *     25c0: b.eq 0x25e0                  tagged -> straight on
+		 *     25c4: ...                          untagged -> logs, then continues with x21 = self
+		 *
+		 * so the tag does not decide success, but it does say whether _ex believes it is talking
+		 * to its own instance.  Print the word at self-8 to see which side of that branch this
+		 * controller is on, before reading 0x8230's ss_info handling any further.
+		 */
+		print("usbfn: self %x self-8 %x (want 73756662)\n",
+		    (uint64_t)(uintptr_t)fn,
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)((uintptr_t)fn - 8));
+
+		/*
+		 * ss_info must be a real three-level structure too; 0x8230 dereferences it at 0x8388
+		 * onward (cbz x1, then ldr from +0x00, +0x08, +0x10).  Try the same structure the plain
+		 * entry accepts, so the two calls differ in nothing but the entry point.
+		 */
+		{
 			efi_status ex_same = fn->configure_enable_endpoints_ex(fn, &dev_info, &dev_info);
 
-			print("usbfn: ConfigureEnableEndpoints_ex(ss=set) %x\n", (uint64_t)ex_same);
+			print("usbfn: ConfigureEnableEndpoints_ex(plain struct) %x\n", (uint64_t)ex_same);
 		}
+		flush_log();
 		flush_log();
 	}
 

@@ -10786,9 +10786,33 @@ usb_start(void)
 		}
 	}
 
-	USB = usbfn_with_sdp_detect(USB);
 	/*
-	 * CHIRON_REINSTALL_FNIO
+	 * CHIRON_DO_NOT_TYPE_PUN_USB
+	 *
+	 * This used to do  USB = usbfn_with_sdp_detect(USB);
+	 *
+	 * USB is a usb_device_protocol* (4181) and chiron_pick_usb_device() fills it from
+	 * QCOM_USB_DEVICE_GUID, so that is the protocol actually in hand.  usbfn_with_sdp_detect takes
+	 * an efi_usbfn_io* and returns a static copy of one, so the assignment replaced a
+	 * usb_device_protocol pointer with a usbfn_io pointer and every later USB-> call read the
+	 * neighbouring slot:
+	 *
+	 *     +0x08  start        / detect_port
+	 *     +0x10  send         / configure_enable_endpoints
+	 *     +0x18  handle_event / get_endpoint_max_packet_size
+	 *     +0x30  stop         / abort_transfer
+	 *     +0x48  start_ex     / event_handler
+	 *
+	 * The log has been reporting that for many rounds without being read as such:
+	 *
+	 *     shim: EventHandler calls 1 pending 0 msg a9bf7bfd ... ret 2
+	 *
+	 * was USB->start_ex(&set) dispatching to shim_evt_handler, not StartEx polling for events.
+	 *
+	 * Keep USB as what it is.  The UsbFnIo shim stays available through g_usbfn for the paths that
+	 * genuinely want that protocol, but it is no longer aliased onto this pointer.
+	 */
+	/* CHIRON_REINSTALL_FNIO
 	 *
 	 * Replacing the global pointer was not enough: StartEx does its own
 	 * handle_protocol(usb_dev_handle, USBFN) and gets the firmware's table back, so the
@@ -10819,18 +10843,32 @@ usb_start(void)
 			 * 0x10002, usb_device_protocol answers 0x10000001 -- so print it for orig and for
 			 * USB right before the reinstall, together with the address of each.
 			 */
-			print("reinstall: orig %x rev %x | USB %x rev %x\n",
+			/*
+			 * orig is the genuine usbfn_io, taken from the handle by its own GUID.  Build the
+			 * shim copy from THAT -- not from USB, which is a usb_device_protocol and must not
+			 * be installed where a usbfn_io is expected.
+			 */
+			print("reinstall: orig %x rev %x (0x10002 = usbfn_io)\n",
 			    (uint64_t)(uintptr_t)orig,
-			    (uint64_t)*(volatile uint32_t *)(uintptr_t)orig,
-			    (uint64_t)(uintptr_t)USB,
-			    (uint64_t)*(volatile uint32_t *)(uintptr_t)USB);
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)orig);
 			flush_log();
 
-			efi_status rs = BS->reinstall_protocol_interface(usb_dev_handle, &fguid,
-			    orig, USB);
+			{
+				efi_usbfn_io *shim = usbfn_with_sdp_detect(orig);
+				efi_status rs;
 
-			print("usbfn: reinstalled table with SDP DetectPort -> %x\n",
-			    (uint64_t)rs);
+				if (shim == NULL) {
+					shim = orig;
+				}
+				print("reinstall: shim %x rev %x\n",
+				    (uint64_t)(uintptr_t)shim,
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)shim);
+				flush_log();
+
+				rs = BS->reinstall_protocol_interface(usb_dev_handle, &fguid, orig, shim);
+				print("usbfn: reinstalled table with SDP DetectPort -> %x\n",
+				    (uint64_t)rs);
+			}
 		}
 	}
 	/* ios-party: say what the revision is and refuse a half-built interface, rather
@@ -11434,7 +11472,7 @@ usb_start(void)
 			static const efi_guid fg = QCOM_USBFN_IO_GUID;
 			efi_usbfn_io *cur = NULL;
 
-			USB = usbfn_with_sdp_detect(USB);
+			/* See CHIRON_DO_NOT_TYPE_PUN_USB above: USB keeps its usb_device_protocol type. */
 
 			/*
 			 * Print every step.  The earlier version only printed inside a branch that

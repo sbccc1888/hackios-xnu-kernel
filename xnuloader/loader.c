@@ -10415,6 +10415,53 @@ usb_start(void)
 		efi_handle cfgimg = chiron_find_image_by_sig(chiron_is_usb_config, NULL);
 
 		chiron_usbconfig_state("pre-start_ex", cfgimg, NULL, NULL);
+
+		/*
+		 * CHIRON_USBCONFIG_PRIVATE_RECORD
+		 *
+		 * UsbConfigStartController (0x32a4) works on the driver's own record at module RVA
+		 * 0xc218, whose first four bytes at rest are "usbc":
+		 *
+		 *     +0x10  handle     written by InstallMultipleProtocolInterfaces
+		 *     +0x28  interface  passed as the protocol data
+		 *     +0xb4  current mode
+		 *
+		 *     332c: ldr w1, [x20, #0xb4]    compared against the requested mode
+		 *     336c: ldr x0, [x20, #0x10]    null -> install
+		 *     33b8: ldr x9, [x11, #0x108]   ConnectController
+		 *     33bc: blr x9
+		 *
+		 * Printing these two is the difference between knowing that start peripheral failed and
+		 * knowing which of its two preconditions was not met.
+		 */
+		{
+			uint64_t mb = chiron_find_usbconfig_base();
+
+			if (mb != 0) {
+				print("usbc: magic %x | +0x10 %x +0x28 %x +0xb0 %x +0xb4 %x\n",
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(mb + 0xc218),
+				    (uint64_t)*(volatile uint64_t *)(uintptr_t)(mb + 0xc228),
+				    (uint64_t)*(volatile uint64_t *)(uintptr_t)(mb + 0xc240),
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(mb + 0xc2c8),
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(mb + 0xc2cc));
+				/*
+				 * 3328: ldp w14, w15, [x20, #0xc8]
+				 * 3330: tst w14, #0xff
+				 * 3334: csel w21, w8, w15, eq
+				 *
+				 * w21 is what 3338 compares the current mode against.  With w14's low byte zero
+				 * it becomes the requested mode (perfect match, returns success); otherwise it is
+				 * w15, a stored value, and the comparison can fail.
+				 */
+				print("usbc: +0xc8 w14 %x w15 %x | +0x08 %x +0x0 %x\n",
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(mb + 0xc2e0),
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(mb + 0xc2e4),
+				    (uint64_t)*(volatile uint64_t *)(uintptr_t)(mb + 0xc220),
+				    (uint64_t)*(volatile uint64_t *)(uintptr_t)(mb + 0xc218));
+			} else {
+				print("usbc: module base not found\n", 0);
+			}
+		}
 	}
 
 	/*

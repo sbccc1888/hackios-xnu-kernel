@@ -4218,6 +4218,7 @@ chiron_ep0_poll(void)
 {
 	const uint64_t d = 0xA800000ULL;
 	static uint32_t event_offset;
+	static uint32_t event_bytes = 0x1000u;   /* GEVNTSIZ low 16 bits, read once */
 	static uint64_t polls;
 	uint32_t adr, raw, count, n;
 
@@ -4252,7 +4253,27 @@ chiron_ep0_poll(void)
 		return;
 	}
 	count = raw & 0xffffu;
-	if (count == 0 || (count & 3u) != 0u || count > 0x1000u) {
+	/*
+	 * CHIRON_RING_SIZE_IS_A_REGISTER
+	 *
+	 * The wrap boundary was written as the literal 0x1000 because that is what GEVNTSIZ happened to
+	 * hold in every run so far:
+	 *
+	 *     evtadr 99f21000 evtsiz 80001000        -> low 16 bits = 0x1000
+	 *
+	 * 0x1000 is what the driver chose, not what this code may assume.  Read the real size, and fall
+	 * back to the literal only if the register answers zero.  Otherwise a driver that asks for a
+	 * larger ring would have this loop walk off the end of it -- or wrap early and re-read events it
+	 * has already acknowledged.
+	 */
+	{
+		uint32_t siz = *(volatile uint32_t *)(uintptr_t)(d + 0xC408) & 0xffffu;
+
+		if (siz != 0) {
+			event_bytes = siz;
+		}
+	}
+	if (count == 0 || (count & 3u) != 0u || count > event_bytes) {
 		return;
 	}
 
@@ -4274,7 +4295,7 @@ chiron_ep0_poll(void)
 			for (n = 0; n < count && n < 64; n += 4) {
 				print(" %x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(adr + off2));
 				off2 += 4;
-				if (off2 >= 0x1000u) {
+				if (off2 >= event_bytes) {
 					off2 = 0;
 				}
 			}
@@ -4300,7 +4321,7 @@ chiron_ep0_poll(void)
 				return;
 			}
 			off += 4;
-			if (off >= 0x1000u) {
+			if (off >= event_bytes) {
 				off = 0;
 			}
 		}
@@ -4310,7 +4331,7 @@ chiron_ep0_poll(void)
 		uint32_t word = *(volatile uint32_t *)(uintptr_t)(adr + event_offset);
 
 		event_offset += 4;
-		if (event_offset >= 0x1000u) {
+		if (event_offset >= event_bytes) {
 			event_offset = 0;
 		}
 

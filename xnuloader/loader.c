@@ -10001,6 +10001,17 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 	if (usb_force_sdp_off || orig == NULL) {
 		return orig;
 	}
+	/*
+	 * CHIRON_SHIM_TRACE
+	 *
+	 * g_orig_usbfn is meant to hold the vendor instance captured before the reinstall, yet
+	 * cfgonly still reports the copy.  Print what this function is handed and what it leaves
+	 * behind, so the overwrite (or the absence of one) is visible instead of inferred.
+	 */
+	print("shimtrace: enter orig %x g_orig %x done %d\n",
+	    (uint64_t)(uintptr_t)orig, (uint64_t)(uintptr_t)g_orig_usbfn, (uint64_t)done);
+	flush_log();
+
 	if (!done) {
 		/*
 		 * CHIRON_MEMCPY_SIZE_IS_A_LIE
@@ -10171,6 +10182,9 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 		done = 1;
 		print("usbfn: DetectPort replaced with SDP (copy of the vendor table)\n", 0);
 	}
+	print("shimtrace: exit g_orig %x copy %x\n",
+	    (uint64_t)(uintptr_t)g_orig_usbfn, (uint64_t)(uintptr_t)&copy);
+	flush_log();
 	return &copy;
 }
 

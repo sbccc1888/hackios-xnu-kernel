@@ -11620,7 +11620,27 @@ usb_start(void)
 		 * that has none.
 		 */
 		if (usb_no_start_ex) {
-			efi_status (*f_start)(void) = (efi_status (*)(void))USB->start;
+			/*
+			 * CHIRON_START_TAKES_SIX_ARGUMENTS
+			 *
+			 * UsbDevice::start at RVA 0x1478 is not a no-argument call.  It saves six:
+			 *
+			 *     1498: mov x20, x5
+			 *     149c: mov w21, w4
+			 *     14a0: mov x22, x3
+			 *     14a4: mov x23, x2
+			 *     14a8: mov x24, x1
+			 *     14ac: mov x25, x0
+			 *     14b4: cbz x25, error
+			 *     14b8: cbz x24, error
+			 *     14bc: cbz x23, error
+			 *     14c8: cbz x20, error      (only when w4's low byte is non-zero)
+			 *     152c-1534: forwards all six to 0x3560
+			 *
+			 * so calling it as f_start() passes whatever happens to be in x1..x5.  The entry that
+			 * takes a single descriptor set is start_ex, which is what the normal path uses and
+			 * what this branch should use too.
+			 */
 			efi_status s_ep;
 			efi_status s_start;
 			efi_status s_stop = 0;
@@ -11647,8 +11667,22 @@ usb_start(void)
 			s_ep = chiron_usbfn_configure_only() ? 0 : 0x8000000000000002ULL;
 			print("nostartex: configure endpoints %x\n", (uint64_t)s_ep);
 
-			s_start = (f_start != NULL) ? f_start() : 0;
-			print("nostartex: start %x\n", (uint64_t)s_start);
+			/*
+			 * CHIRON_NOSTARTEX_DOES_NOT_CALL_START_EX
+			 *
+			 * USB->start_ex IS StartEx: usb_device_protocol +0x48 is RVA 0x1c5c, the very
+			 * function usb_no_start_ex exists to avoid.  Calling it here would defeat the
+			 * switch and land straight back on ConfigureEnableEndpointsEx.
+			 *
+			 * USB->start is not an alternative either: 0x1478 takes six arguments and null-checks
+			 * three of them (14b4/14b8/14bc), so a bare call passes register garbage.
+			 *
+			 * So this branch does the one thing that is well defined against the vendor instance:
+			 * configure the endpoints through usbfn_io, which is the step that was missing in
+			 * every previous attempt.  Starting the controller is left to whatever runs afterwards.
+			 */
+			s_start = 0;
+			print("nostartex: endpoints configured, controller start left to the caller\n", 0);
 			chiron_ring_dump("post-nostartex");
 			flush_log();
 

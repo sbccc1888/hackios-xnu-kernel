@@ -10031,7 +10031,17 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 		copy.detect_port = usbfn_detect_sdp;
 		copy.get_endpoint_max_packet_size = usbfn_mps_hs;
 
-		g_orig_usbfn = orig;
+		/*
+		 * Do not overwrite a vendor pointer captured before this shim was installed.  This
+		 * assignment runs when the copy is built, and by then handle_protocol may already be
+		 * handing back the copy itself -- which is how "vendor" ended up being 9bfaf0f0.
+		 */
+		if (g_orig_usbfn == NULL || g_orig_usbfn == orig) {
+			g_orig_usbfn = orig;
+		} else {
+			print("usbfn: keeping captured vendor %x over %x\n",
+			    (uint64_t)(uintptr_t)g_orig_usbfn, (uint64_t)(uintptr_t)orig);
+		}
 		orig_alloc_xfer = orig->allocate_transfer_buffer;
 		orig_free_xfer = orig->free_transfer_buffer;
 		orig_get_dev_info = orig->get_device_info;
@@ -10676,6 +10686,37 @@ usb_start(void)
 	 * StartEx calls USB->detect_port(); make that answer SDP with a copy of the table, so
 	 * the charger-service circular dependency cannot abort the start.
 	 */
+	/*
+	 * CHIRON_CAPTURE_VENDOR_BEFORE_REINSTALL
+	 *
+	 * usbfn_with_sdp_detect() returns a static copy, and the reinstall below puts that copy
+	 * onto the handle.  After that nothing can reach the vendor instance through the protocol
+	 * database again -- locate_protocol and handle_protocol both start returning the copy:
+	 *
+	 *     fnio: locate_proto 0 ptr 9bdc4020            before the reinstall, vendor
+	 *     cfgonly: self 9bfaf0f0 (vendor 9bfaf0f0)     after, our copy, labelled "vendor"
+	 *
+	 * which is what made the configure fault at elr=9bfa6600, far=0x50: the copied function body
+	 * ran with a self it does not own.
+	 *
+	 * Capture the real instance here, while the handle still carries it.  The two roles stay
+	 * apart from then on: the copy intercepts the driver's outgoing calls, and any vendor
+	 * function that inspects its own state still gets the vendor's own object.
+	 */
+	if (g_orig_usbfn == NULL) {
+		efi_usbfn_io *vend = NULL;
+		static const efi_guid vg = QCOM_USBFN_IO_GUID;
+
+		if (usb_dev_handle != NULL &&
+		    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &vg, (void **)&vend)) &&
+		    vend != NULL) {
+			g_orig_usbfn = vend;
+			print("usbfn: captured vendor instance %x before reinstall\n",
+			    (uint64_t)(uintptr_t)vend);
+			flush_log();
+		}
+	}
+
 	USB = usbfn_with_sdp_detect(USB);
 	/*
 	 * CHIRON_REINSTALL_FNIO

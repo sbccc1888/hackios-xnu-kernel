@@ -3780,50 +3780,79 @@ static void
 chiron_ep0_poll(void)
 {
 	const uint64_t d = 0xA800000ULL;
-	uint32_t adr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
-	uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C) & 0xfffcu;
+	unsigned drained = 0;
+	static uint64_t polls;
+	uint32_t adr, cnt;
 
-	if (adr == 0 || cnt == 0) {
+	polls++;
+	adr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
+	cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C) & 0xfffcu;
+
+	if (polls == 1 || polls == 1000 || polls == 100000) {
+		print("ep0: poll %d adr %x cnt %x ready %d\n",
+		    (uint64_t)polls, (uint64_t)adr, (uint64_t)cnt, (uint64_t)g_ep0.ready);
+		flush_log();
+	}
+	if (adr == 0 || cnt == 0 || cnt > 0x1000) {
 		return;
 	}
+
 	chiron_invalidate((void *)(uintptr_t)adr, cnt);
 
-	while (cnt >= 4) {
-		uint32_t raw = *(volatile uint32_t *)(uintptr_t)adr;
-		uint32_t words = 1;
+	/*
+	 * Bounded: the ring holds at most 4 KB, so no run of records can exceed that many words.
+	 * An earlier version looped until the counter read zero, and a single unexpected record
+	 * shape turned that into a spin that never printed again.
+	 */
+	while (drained < 1024) {
+		uint32_t raw = *(volatile uint32_t *)(uintptr_t)(adr);
+		uint32_t bytes = 4;
 
-		/* device events occupy 4 words when they carry parameters; endpoint events 1 */
+		drained++;
 		if (raw & 1u) {
-			words = (raw & 0x10u) ? 4u : 1u;
-			print("ep0: dev event %x\n", (uint64_t)((raw >> 8) & 0xffu));
+			static uint32_t said_dev[8];
+			uint32_t kind = (raw >> 8) & 0xffu;
+			unsigned i, seen = 0;
+
+			/* device event: 1 or 4 words */
+			bytes = (raw & 0x10u) ? 16u : 4u;
+			for (i = 0; i < 8; i++) {
+				if (said_dev[i] == kind) {
+					seen = 1;
+					break;
+				}
+				if (said_dev[i] == 0) {
+					said_dev[i] = kind;
+					break;
+				}
+			}
+			if (!seen) {
+				print("ep0: dev ev %x (new)\n", (uint64_t)kind);
+				flush_log();
+			}
 		} else {
 			uint32_t ep = (raw >> 1) & 31u;
 			uint32_t type = (raw >> 6) & 0xfu;
 			uint32_t status = (raw >> 12) & 0xfu;
 
+			print("ep0: ep ev ep%x type%x st%x\n",
+			    (uint64_t)ep, (uint64_t)type, (uint64_t)status);
 			if (ep == 0 && type == 1 && status == 0) {
 				g_ep0.setup_count++;
-				__asm__ volatile ("dsb sy" ::: "memory");
 				chiron_invalidate(g_ep0.setup_buf, 8);
 				chiron_ep0_handle_setup();
-				if (g_ep0.address != 0) {
-					chiron_ep0_apply_address();
-					g_ep0.address = 0;   /* applied once */
-				}
-			} else {
-				print("ep0: ep event ep%x type%x st%x\n",
-				    (uint64_t)ep, (uint64_t)type, (uint64_t)status);
 			}
+			bytes = 4;
 		}
-		/* consume these words */
-		*(volatile uint32_t *)(uintptr_t)(d + 0xC40C) =
-		    words * 4u < cnt ? words * 4u : cnt;
+
+		/* acknowledge */
+		*(volatile uint32_t *)(uintptr_t)(d + 0xC40C) = bytes;
+		__asm__ volatile ("dsb sy" ::: "memory");
+
 		cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C) & 0xfffcu;
-		adr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
-		if (cnt == 0) {
+		if (cnt == 0 || cnt > 0x1000) {
 			break;
 		}
-		chiron_invalidate((void *)(uintptr_t)adr, cnt);
 	}
 }
 
@@ -14368,6 +14397,25 @@ usb_command_loop(void)
 		uint64_t pass_now = 0;
 
 		/*
+		 * CHIRON_EP0_IS_THE_FIRST_THING
+		 *
+		 * Everything below this point can block, and one of the branches below does: with
+		 * usb_connected clear the loop calls usb_wait(0xff), which calls USB->handle_event when
+		 * the ring is non-empty, and that is the call that never returns here.  The last run sat
+		 * in it with 28 bytes of host traffic pending and never printed another line:
+		 *
+		 *     ep0: armed, waiting for the host
+		 *     usb: pumped 200000 times during the first second
+		 *     evtcnt probe: 28 28 28 28
+		 *     (nothing)
+		 *
+		 * So serve EP0 before any of it.  This is also the correct order on principle:
+		 * enumeration is what makes usb_connected true, so nothing that waits on that flag may
+		 * run ahead of the code that answers the host.
+		 */
+		chiron_ep0_poll();
+
+		/*
 		 * CHIRON_USB_NO_SPAM
 		 *
 		 * Nothing here may run once per pass without a bound: an unconditional
@@ -14410,23 +14458,6 @@ usb_command_loop(void)
 		}
 
 		usb_session_check();
-
-		/*
-		 * CHIRON_EP0_RUNS_WHETHER_OR_NOT_CONNECTED_IS_SET
-		 *
-		 * This call used to sit below the usb_connected gate, so it never ran: enumeration is
-		 * what makes usb_connected true, so waiting for the flag before answering the host is a
-		 * deadlock.  The log shows both halves of it -- the endpoint armed, the ring holding 28
-		 * bytes, and not one ep0: line afterwards:
-		 *
-		 *     ep0: armed, waiting for the host
-		 *     evtcnt probe: 28 28 28 28
-		 *     state at loop entry: ... evtcnt 28 evtadr 99f26000
-		 *
-		 * EP0 has to be serviced first; the flag is a consequence of doing so, not a
-		 * precondition for it.
-		 */
-		chiron_ep0_poll();
 
 		if (!usb_connected) {
 			/*

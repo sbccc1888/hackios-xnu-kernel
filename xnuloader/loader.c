@@ -5286,9 +5286,56 @@ chiron_usb_hk6(void)
 			print("hk6: start peripheral SKIPPED (left to start_ex)\n", 0);
 			s = 0;
 		} else {
+			/*
+			 * CHIRON_MEASURE_AT_THE_CALL
+			 *
+			 * Every earlier reading of the driver's record was taken AFTER this call, by which
+			 * time our own clone path had already written mode 4 into it.  Measure here, before
+			 * the call, so the three inputs the disassembly branches on are known:
+			 *
+			 *     32c4: cbnz w9, 0x32e0    w9 = core number, must be 0
+			 *     332c: ldr w1, [x20,#0xb4]  current mode
+			 *     336c: ldr x0, [x20,#0x10]  handle, null -> install first
+			 */
+			{
+				uint64_t mb = chiron_find_usbconfig_base();
+
+				print("prestart: core_num %x modeset %x | rec +0xb4 %x +0x10 %x\n",
+				    (uint64_t)core.core_num, (uint64_t)core.mode_type,
+				    mb ? (uint64_t)*(volatile uint32_t *)(uintptr_t)(mb + 0xc2cc) : 0,
+				    mb ? (uint64_t)*(volatile uint64_t *)(uintptr_t)(mb + 0xc228) : 0);
+				    flush_log();
+			}
+
 			/* ask for peripheral */
 			s = init->start_controller(init, core.core_num, UsbModePeripheral);
 			print("hk6: start peripheral %x\n", (uint64_t)s);
+
+			/*
+			 * CHIRON_WHY_CONNECT_FAILS
+			 *
+			 * The record shows the call worked up to the install: +0xb4 went from 0x10000 to 4 and
+			 * +0x10 went from 0 to a handle.  So the failure is ConnectController on that handle,
+			 * and EFI_INVALID_PARAMETER from ConnectController means CoreValidateHandle rejected
+			 * it -- the handle is not in the database.
+			 *
+			 * Test that directly: ask the handle for the very protocol that was installed on it,
+			 * and ask for its device path.  A handle that answers neither is not a live handle.
+			 */
+			{
+				uint64_t mb = chiron_find_usbconfig_base();
+				efi_handle h = (mb != 0) ?
+				    (efi_handle)(uintptr_t)*(volatile uint64_t *)(uintptr_t)(mb + 0xc228) : NULL;
+				static const efi_guid cfg_guid = QCOM_USB_CONFIG_GUID;
+				void *pp = NULL;
+				efi_status hs = 0xffffffffffffffffULL;
+
+				if (h != NULL) {
+					hs = BS->handle_protocol(h, &cfg_guid, &pp);
+				}
+				print("poststart: handle %x cfgproto %x ptr %x\n",
+				    (uint64_t)(uintptr_t)h, (uint64_t)hs, (uint64_t)(uintptr_t)pp);
+			}
 		}
 
 		/*

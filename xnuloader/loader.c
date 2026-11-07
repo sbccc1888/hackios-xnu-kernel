@@ -7351,8 +7351,32 @@ chiron_event_arm(void)
 	 * Use the entry value as the base and widen it, rather than starting from whatever the
 	 * driver left and adding a guess.
 	 */
-	want = before | (g_entry_devten != 0 ? g_entry_devten : 0u) |
-	    (1u << 0) | (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4) | (1u << 5);
+	/*
+	 * CHIRON_DEVTEN_USE_THE_DRIVERS_OWN_VALUE
+	 *
+	 * This used to OR in bits 0-5 on top of the entry value, which turned the firmware's 0x277
+	 * into 0x27f -- an extra SOFEVTEN (bit 3) the vendor driver never enables.
+	 *
+	 * UsbfnDwc3Dxe writes DEVTEN itself, at 0x3b18:
+	 *
+	 *     3b10: mov  w13, #0xc708
+	 *     3b14: add  w0, w28, w13      w28 is the MMIO base
+	 *     3b18: mov  w1, #0x277
+	 *     3b1c: bl   0xccc0            write
+	 *
+	 * a fixed 0x277 -- bits 0, 1, 2, 4, 5 and 9.  No SOF, no vendor request, no L1 suspend.
+	 * The value the driver programs is the one that works; there is nothing to widen.
+	 *
+	 * If the driver has already set it, keep what it set.  Otherwise write 0x277, which is what
+	 * it would have written.
+	 */
+	if (before == 0x277u) {
+		want = before;
+	} else if (before != 0u) {
+		want = before;
+	} else {
+		want = (g_entry_devten != 0u) ? g_entry_devten : 0x277u;
+	}
 
 	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC708) = want;
 	__asm__ volatile ("dsb sy" ::: "memory");

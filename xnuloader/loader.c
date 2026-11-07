@@ -4841,7 +4841,7 @@ chiron_is_dwc3(efi_handle handle, efi_loaded_image *li, uint64_t base)
 static uint64_t chiron_find_usbconfig_base(void);
 static int
 chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
-    efi_qcom_usb_config *original, uint8_t core)
+    efi_qcom_usb_config *original, uint8_t core, efi_handle original_handle)
 {
 	efi_qcom_usb_config *config;
 	efi_handle controller = NULL;
@@ -4972,16 +4972,52 @@ chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
 	 *
 	 * Disconnect first, so the connect below is a real bind.
 	 */
-	if (!usb_rebind_off) {
-		efi_status ds = BS->disconnect_controller(controller, NULL, NULL);
+	/*
+	 * CHIRON_DISCONNECT_THE_ORIGINAL
+	 *
+	 * This disconnected "controller", which install_protocol_interface has just created a few
+	 * lines above -- a brand new handle with nothing bound to it.  Disconnecting that frees
+	 * nothing, while the driver's started state belongs to the OLD handle that carried the
+	 * config we cloned from.  That is why the explicit start right afterwards answers
+	 * EFI_ALREADY_STARTED and DwcConfigureEventBuffer never runs.
+	 *
+	 * Disconnect the source handle instead, then reconnect the same one.
+	 */
+	/*
+	 * CHIRON_INSTALL_ON_ORIGINAL
+	 *
+	 * Disconnecting the source handle and reconnecting it does not work: the disconnect removes
+	 * the UsbConfig interface that made it bindable, and the connect then answers 0xe:
+	 *
+	 *     hk6: disconnect original handle 9c0eae98 -> 0
+	 *     hk6: connect DWC3 on 9c0eae98 -> 800000000000000e
+	 *     hk6: NO UsbFnIo after connect -> nothing actually bound
+	 *
+	 * So leave the source handle alone.  Install the peripheral config ON that same handle
+	 * instead of on a fresh one, letting install_protocol_interface add it alongside the config
+	 * already there.  The binding was started for that handle, so it is the one the driver will
+	 * recognise, and starting it again is what reaches DwcConfigureEventBuffer.
+	 */
+	if (!usb_rebind_off && original_handle != NULL) {
+		efi_handle target = original_handle;
 
-		print("hk6: disconnect before rebind -> %x\n", (uint64_t)ds);
+		s = BS->install_protocol_interface(&target, &QCOM_USB_CONFIG_GUID, 0, config);
+		print("hk6: install peripheral cfg on source handle -> %x\n", (uint64_t)s);
+		if (!EFI_ERROR(s)) {
+			controller = target;
+		}
 	}
 
 	drivers[0] = binding->image_handle;
 	drivers[1] = NULL;
-	s = BS->connect_controller(controller, drivers, NULL, 0);
-	print("hk6: connect DWC3 -> %x\n", (uint64_t)s);
+	/*
+	 * Reconnect the handle the binding was actually started on when there is one, so the driver
+	 * binds to a controller it recognises.  Fall back to the freshly installed handle.
+	 */
+	{
+		s = BS->connect_controller(controller, drivers, NULL, 0);
+		print("hk6: connect DWC3 on %x -> %x\n", (uint64_t)(uintptr_t)controller, (uint64_t)s);
+	}
 
 	/*
 	 * CHIRON_BY_DRIVER_CHECK
@@ -5589,6 +5625,7 @@ chiron_usb_hk6(void)
 		}
 		{
 			efi_qcom_usb_config *host_cfg = NULL;
+			efi_handle host_handle = NULL;
 
 			for (uint64_t i = 0; i < count; i++) {
 				efi_qcom_usb_config *cfg = NULL;
@@ -5637,8 +5674,10 @@ chiron_usb_hk6(void)
 				    cfg->mode_type != UsbModePeripheral &&
 				    cfg->mode_type != UsbModePeripheralAlt) {
 					host_cfg = cfg;
-					print("hk6: clone source core %x mode %x\n",
-					    (uint64_t)cfg->core_num, (uint64_t)cfg->mode_type);
+					host_handle = handles[i];
+					print("hk6: clone source core %x mode %x handle %x\n",
+					    (uint64_t)cfg->core_num, (uint64_t)cfg->mode_type,
+					    (uint64_t)(uintptr_t)handles[i]);
 				}
 			}
 			BS->free_pool(handles);
@@ -5647,7 +5686,7 @@ chiron_usb_hk6(void)
 				    (uint64_t)core.core_num);
 				return 0;
 			}
-			return chiron_usb_clone_config(init, binding, host_cfg, core.core_num);
+			return chiron_usb_clone_config(init, binding, host_cfg, core.core_num, host_handle);
 		}
 	}
 }

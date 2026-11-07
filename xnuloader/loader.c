@@ -10122,6 +10122,24 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 {
 	static efi_usbfn_io copy;
 	static int done;
+	/*
+	 * CHIRON_REBUILD_WHEN_THE_SOURCE_CHANGES
+	 *
+	 * "done" latched the copy to whichever usbfn_io reached this function first, and the log
+	 * shows two different objects reaching it in one boot:
+	 *
+	 *     usbfn: captured vendor instance 9bd40020 before reinstall
+	 *     fnio[0]: handle 9bdaba98 instance 9bdc4020 rev 10002   the live one
+	 *     loop: seeded driver cache 0 -> 9bd40020                what the driver got
+	 *
+	 * 9bd40020 and 9bdc4020 differ by 0x84000, so they are not the same object, and the copy
+	 * was built from the first and then handed back for the second.  Anything the driver sets
+	 * on its own instance therefore never appears in the copy, and the copy's cached function
+	 * pointers refer to a table that was current at a different moment.
+	 *
+	 * Rebuild whenever the source differs from the one the copy was made from.
+	 */
+	static efi_usbfn_io *copy_src;
 
 	if (usb_force_sdp_off || orig == NULL) {
 		return orig;
@@ -10161,7 +10179,12 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 	    (uint64_t)(uintptr_t)orig, (uint64_t)(uintptr_t)g_orig_usbfn, (uint64_t)done);
 	flush_log();
 
-	if (!done) {
+	if (!done || copy_src != orig) {
+		if (done && copy_src != orig) {
+			print("shim: rebuilding copy, source %x -> %x\n",
+			    (uint64_t)(uintptr_t)copy_src, (uint64_t)(uintptr_t)orig);
+			flush_log();
+		}
 		/*
 		 * CHIRON_MEMCPY_SIZE_IS_A_LIE
 		 *
@@ -10328,6 +10351,7 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
 		copy.start_controller = shim_start_ctrl;
 		copy.stop_controller = shim_stop_ctrl;
 		copy.event_handler = shim_evt_handler;
+		copy_src = orig;
 		done = 1;
 		print("usbfn: DetectPort replaced with SDP (copy of the vendor table)\n", 0);
 	}
@@ -13602,16 +13626,42 @@ efi_main(efi_handle image, efi_system_table *st)
 				uint64_t dwc0 = 0xA800000ULL;
 				uint32_t cfg_before = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC200);
 
-				if ((cfg_before & (1u << 8)) != 0) {
-					*(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC200) =
-					    cfg_before & ~(1u << 8);
-					__asm__ volatile ("dsb sy" ::: "memory");
-					chiron_udelay(1000);
-					print("phycfg: %x -> %x (SUSPENDUSB20 cleared)\n",
-					    (uint64_t)cfg_before,
-					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC200));
-				} else {
-					print("phycfg: %x already unsuspended\n", (uint64_t)cfg_before);
+				/*
+				 * CHIRON_CLEAR_SUSPHY_TOO
+				 *
+				 * GUSB2PHYCFG has two suspend bits and this loader has only ever cleared one:
+				 *
+				 *   bit 8  SUSPENDUSB20   the controller's view of a USB2 suspend
+				 *   bit 6  SUSPHY         parks the PHY itself
+				 *
+				 * The driver clears bit 6 explicitly at 0x37f8:
+				 *
+				 *     37cc: mov  w21, #0xc200
+				 *     37ec: add  x22, x9, x21
+				 *     37f0: bl   0xcc88             read GUSB2PHYCFG
+				 *     37f8: and  w1, w0, #0xffffffbf  clear bit 6
+				 *     3800: bl   0xccc0             write
+				 *
+				 * Every previous attempt cleared bit 8, observed no change, and concluded the PHY
+				 * state did not matter.  If bit 6 is the one holding the transceiver down, clearing
+				 * bit 8 alone would have had no effect -- which is exactly what was seen.
+				 */
+				{
+					uint32_t want_cfg = cfg_before & ~((1u << 8) | (1u << 6));
+
+					if (want_cfg != cfg_before) {
+						*(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC200) = want_cfg;
+						__asm__ volatile ("dsb sy" ::: "memory");
+						chiron_udelay(1000);
+						print("phycfg: %x -> %x (SUSPENDUSB20 bit8 %x, SUSPHY bit6 %x)\n",
+						    (uint64_t)cfg_before,
+						    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC200),
+						    (uint64_t)((cfg_before >> 8) & 1u),
+						    (uint64_t)((cfg_before >> 6) & 1u));
+					} else {
+						print("phycfg: %x already clear (bit8 0, bit6 0)\n",
+						    (uint64_t)cfg_before);
+					}
 				}
 
 				/* After clearing it, make sure termination and the pull-up are asserted too. */
@@ -13682,6 +13732,38 @@ efi_main(efi_handle image, efi_system_table *st)
 				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704),
 				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC70C),
 				    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704) >> 30) & 1));
+				flush_log();
+			}
+
+			/*
+			 * CHIRON_GEVNTCOUNT_PROBE
+			 *
+			 * GEVNTCOUNT (0xC40C) is a live DMA byte counter: the driver writes 0 when it
+			 * programs the ring (0x8b74-0x8b78) and the controller increments it as events land.
+			 * If the read has a side effect, or if the counter only moves when something else
+			 * drains it, then a controller that is posting events would still look silent -- and
+			 * that has been the standing conclusion from "evtcnt 0" for many rounds without ever
+			 * being tested.
+			 *
+			 * Read it a series of times with delays and print each value, so movement (or the
+			 * absence of it) is a measurement rather than an assumption.
+			 */
+			{
+				uint64_t dwc2 = 0xA800000ULL;
+				uint32_t v0, v1, v2, v3;
+
+				v0 = *(volatile uint32_t *)(uintptr_t)(dwc2 + 0xC40C);
+				chiron_udelay(1000);
+				v1 = *(volatile uint32_t *)(uintptr_t)(dwc2 + 0xC40C);
+				chiron_udelay(10000);
+				v2 = *(volatile uint32_t *)(uintptr_t)(dwc2 + 0xC40C);
+				chiron_udelay(100000);
+				v3 = *(volatile uint32_t *)(uintptr_t)(dwc2 + 0xC40C);
+
+				print("evtcnt probe: %x %x %x %x over 111 ms | devten %x dctl %x\n",
+				    (uint64_t)v0, (uint64_t)v1, (uint64_t)v2, (uint64_t)v3,
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc2 + 0xC708),
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc2 + 0xC704));
 				flush_log();
 			}
 

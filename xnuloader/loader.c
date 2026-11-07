@@ -3144,11 +3144,21 @@ exception_handler(int64_t type, uint64_t *ctx)
 		print("\n== fault: attempting reset ==\n");
 		flush_log();
 
-		/* PSCI SYSTEM_RESET through SMC: no UEFI services involved at all. */
+		/*
+		 * PSCI SYSTEM_RESET, through whichever conduit this platform uses.  psci_by_hvc is
+		 * set from PLAT->psci_hvc at 2915, so both are tried: SMC first, then HVC.  Neither
+		 * involves a UEFI service call, which matters because the fault was raised inside
+		 * vendor firmware and left BS and ST in an unknown state.
+		 */
 		{
 			register uint64_t x0 __asm__("x0") = 0x84000009ULL;  /* PSCI SYSTEM_RESET */
 
 			__asm__ volatile ("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
+		}
+		{
+			register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+
+			__asm__ volatile ("hvc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
 		}
 
 		/* Then the runtime service, if the firmware still has it. */

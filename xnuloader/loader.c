@@ -12028,9 +12028,24 @@ usb_start(void)
 			}
 
 			memset(&d, 0, sizeof(d));
-			if (chiron_ring_has_events()) {
-				USB->handle_event(&m, &sz, &d);
-			}
+			/*
+			 * CHIRON_POLL_EVEN_WITH_AN_EMPTY_RING
+			 *
+			 * Gating this call on chiron_ring_has_events() makes it a deadlock whenever the
+			 * controller has nothing queued: the ring counter is zero, so handle_event is never
+			 * called, and nothing ever asks the driver whether it has something to hand over.
+			 *
+			 * UsbDevice::handle_event at 0x1660 is itself the polling step.  It clears its output
+			 * word (1694: str wzr, [x21]) and then calls through [x0+0x48] -- UsbFnIo's
+			 * event_handler -- to pull an event out of the controller.  A zero GEVNTCOUNT does
+			 * not mean there is nothing to ask about; it means the DMA ring has not been written
+			 * since the last drain.
+			 *
+			 * So call it every iteration, and keep the ring check only for deciding whether the
+			 * ring needs invalidating (which chiron_ring_has_events already does internally).
+			 */
+			(void)chiron_ring_has_events();
+			USB->handle_event(&m, &sz, &d);
 			pumped++;
 
 			if (m != UsbDeviceEventNoEvent) {

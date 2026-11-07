@@ -3063,6 +3063,39 @@ smc_call(uint64_t id, uint64_t a1, uint64_t a2, uint64_t *r1, uint64_t *r2)
 	return x0;
 }
 
+/*
+ * CHIRON_RESET_NOTIFY
+ *
+ * The entire body of a timer notify.  It runs in the firmware's timer context, so it must not allocate, log
+ * through anything that can block, or call a boot service -- by the time it fires, the loop may have left BS
+ * and ST in any state.  It prints one line and then does the only thing that matters.
+ */
+static void EFIAPI
+chiron_reset_notify(void *event, void *ctx)
+{
+	(void)event;
+	(void)ctx;
+
+	print("\n== reset timer fired: cold reset ==\n");
+	flush_log();
+
+	{
+		register uint64_t x0 __asm__("x0") = 0x84000009ULL;   /* PSCI SYSTEM_RESET */
+
+		__asm__ volatile ("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
+	}
+	{
+		register uint64_t x0 __asm__("x0") = 0x84000009ULL;
+
+		__asm__ volatile ("hvc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
+	}
+	if (ST != NULL && ST->rt != NULL && ST->rt->reset_system != NULL) {
+		ST->rt->reset_system(0, 0, 0, NULL);
+	}
+	for (;;) {
+	}
+}
+
 static void
 wdt_pet(void)
 {
@@ -12262,6 +12295,21 @@ usb_start(void)
 			USB->handle_event(&m, &sz, &d);
 			pumped++;
 
+			/*
+			 * CHIRON_RESET_INSIDE_THE_LOOP
+			 *
+			 * The UEFI timer event armed before this loop did not fire -- the phone stayed off
+			 * every bus past its deadline and needed a power-button hold.  A notify function only
+			 * runs when the firmware gets to service timer events, and this loop can sit in
+			 * handle_event or spin without ever yielding, so relying on one was wrong.
+			 *
+			 * Check the clock here instead, at the one place that is executed on every iteration
+			 * no matter which branch the loop takes.  When the deadline passes, reset from here.
+			 */
+			if ((pumped & 0x3ff) == 0) {
+				usb_session_check();
+			}
+
 			if (m != UsbDeviceEventNoEvent) {
 				last_msg = m;
 			}
@@ -13585,6 +13633,46 @@ efi_main(efi_handle image, efi_system_table *st)
 			flush_log();
 			/* CHIRON_USB_HANDLE_BOUNDED: a session with no host must end by itself */
 			usb_session_begin(usb_idle_seconds > 0 ? (uint64_t)usb_idle_seconds : 300);
+
+			/*
+			 * CHIRON_RESET_TIMER_THAT_DOES_NOT_DEPEND_ON_THE_LOOP
+			 *
+			 * usb_session_check() is called from inside usb_command_loop(), at 13104, which is
+			 * after a wait_for_event on a 10-second timer.  If that wait is where the loop stops,
+			 * the check is never reached and nothing ever resets -- which is what has been
+			 * happening: the log ends at "usb: command loop entered", the phone stays off every
+			 * bus, and only a 15-second power-button hold brings it back.
+			 *
+			 * A UEFI timer event is serviced by the firmware's own timer, not by this loop.  Arm
+			 * one before the loop with a notify function whose entire body is a cold reset.  Then
+			 * wherever the loop stops -- wait_for_event, handle_event, a spin -- the reset still
+			 * happens, and the phone comes back on its own.
+			 *
+			 * This is the same reasoning already recorded for exception_handler(): the fault may
+			 * leave BS and ST unusable, so the reset path must not depend on them.  The handler
+			 * below therefore goes straight to PSCI.
+			 */
+			{
+				static void *reset_evt;
+
+				if (BS != NULL && BS->create_event != NULL && BS->set_timer != NULL &&
+				    reset_evt == NULL) {
+					efi_status es = BS->create_event(0x00000200u /* notify */, 8,
+					    chiron_reset_notify, NULL, &reset_evt);
+
+					if (!EFI_ERROR(es) && reset_evt != NULL) {
+						uint64_t secs = usb_idle_seconds > 0 ?
+						    (uint64_t)usb_idle_seconds + 30 : 330;
+
+						BS->set_timer(reset_evt, 1 /* periodic */,
+						    secs * 10000000ull);
+						print("reset timer: armed %d s\n", secs);
+					} else {
+						print("reset timer: create failed %x\n", (uint64_t)es);
+					}
+					flush_log();
+				}
+			}
 
 			/*
 			 * CHIRON_ANNOUNCE_THE_LOOP

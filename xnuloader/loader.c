@@ -10334,6 +10334,64 @@ usbfn_with_sdp_detect(efi_usbfn_io *orig)
  * at start_ex time and the command loop need this: the driver caches its UsbFnIo at
  * module+0xa410 and handle_event dereferences that cache without a null check.
  */
+/*
+ * CHIRON_DWC3_RUN_CORE
+ *
+ * Start the device core the way UsbfnDwc3Dxe does.  Its sequence at 0x370c is:
+ *
+ *     370c: bl   0xcc88                  read
+ *     3710: orr  w1, w0, #0x40000000     set bit30
+ *     3718: bl   0xccc0                  write
+ *     371c: orr  w1, wzr, #0x40000000
+ *     372c: bl   0xa6d4                  poll until it sticks
+ *     373c: orr  w1, w0, #0x000f0000     bits[23:20]
+ *     3750: and  w8, w0, #0xe0ffffff     clear bits[28:24]
+ *     3754: orr  w1, w8, #0x10000000     bit28
+ *
+ * bit30 is DCTL.RunStop.  The two earlier attempts at this file wrote bit0 (no effect -- the register
+ * read back unchanged) and read bit31 as "run" (a guess with nothing behind it).
+ */
+static void
+chiron_dwc3_run_core(void)
+{
+	const uint64_t dwc = 0xA800000ULL;
+	uint32_t dctl;
+
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+
+	if ((dctl & (1u << 30)) == 0) {
+		*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl | (1u << 30);
+		__asm__ volatile ("dsb sy" ::: "memory");
+
+		for (unsigned i = 0; i < 100; i++) {
+			chiron_udelay(100);
+			if ((*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) &
+			    (1u << 30)) != 0) {
+				break;
+			}
+		}
+		print("runstop: DCTL %x -> %x (bit30 RunStop)\n",
+		    (uint64_t)dctl,
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704));
+	} else {
+		print("runstop: DCTL %x already running (bit30 set)\n", (uint64_t)dctl);
+	}
+
+	/* bits[23:20] and bit28, as the driver also does. */
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) = dctl | 0x000f0000u;
+	__asm__ volatile ("dsb sy" ::: "memory");
+	dctl = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC704);
+	*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704) =
+	    (dctl & 0xe0ffffffu) | 0x10000000u;
+	__asm__ volatile ("dsb sy" ::: "memory");
+
+	print("runstop: final DCTL %x DSTS %x\n",
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC704),
+	    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C));
+	flush_log();
+}
+
 static uint64_t
 chiron_usbdevice_base(void)
 {
@@ -13560,19 +13618,35 @@ efi_main(efi_handle image, efi_system_table *st)
 			 * DSTS, SOFFN and the host's view are all observable.  If the core was halted, this
 			 * starts it.  If bit0 is something else on this part, the only cost is one bit.
 			 */
+			/*
+			 * CHIRON_DCTL_RUNSTOP_IS_BIT30
+			 *
+			 * UsbfnDwc3Dxe's own DCTL sequence starts the core with bit 30:
+			 *
+			 *     370c: bl   0xcc88                  read DCTL
+			 *     3710: orr  w1, w0, #0x40000000     bit30
+			 *     3718: bl   0xccc0                  write DCTL
+			 *     371c: orr  w1, wzr, #0x40000000    and poll for it
+			 *     372c: bl   0xa6d4
+			 *     373c: orr  w1, w0, #0x000f0000     bits[23:20]
+			 *     3750: and  w8, w0, #0xe0ffffff     clear bits[28:24]
+			 *     3754: orr  w1, w8, #0x10000000     bit28
+			 *
+			 * and it never touches bit 0 at all.  That matches the two failed experiments: writing bit 0
+			 * left DCTL unchanged (90f00000 -> 90f00000), and reading bit 31 as "run" was a guess with
+			 * nothing behind it.
+			 *
+			 * DCTL reads 0x90f00000, so bit30 is clear: the core is stopped.  This starts it the way the
+			 * driver does, then reports whether the bit sticks.
+			 */
+			chiron_dwc3_run_core();
 			{
 				uint64_t dwc1 = 0xA800000ULL;
-				uint32_t d_before = *(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704);
-				uint32_t d_after;
 
-				*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704) = d_before | 1u;
-				__asm__ volatile ("dsb sy" ::: "memory");
-				chiron_udelay(2000);
-				d_after = *(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704);
-
-				print("runstop: DCTL %x -> %x (bit0 set) | DSTS %x\n",
-				    (uint64_t)d_before, (uint64_t)d_after,
-				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC70C));
+				print("runstop: DCTL %x DSTS %x | bit30 %x\n",
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704),
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC70C),
+				    (uint64_t)((*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704) >> 30) & 1));
 				flush_log();
 			}
 

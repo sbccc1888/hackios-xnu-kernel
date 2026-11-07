@@ -3129,9 +3129,37 @@ exception_handler(int64_t type, uint64_t *ctx)
 	 * panel.  Same reasoning as c42a676 applied to the final exit path.
 	 */
 	if (!halt_instead) {
-		print("\n== resetting after fault; the log is in the partition ==\n");
-		BS->stall(500000);
-		ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+		/*
+		 * CHIRON_FAULT_RESET_WITHOUT_SERVICES
+		 *
+		 * Every fault log in this session ends at "loader image base ..." and none has the
+		 * "resetting after fault" line that follows it here.  So this path is not reaching the
+		 * print, let alone the reset, and the phone stays wedged on all buses until the power
+		 * button is held -- five rounds of that so far.
+		 *
+		 * The fault happens inside vendor firmware, which may have left BS, ST or BS->stall in
+		 * no state to be called.  Print first, then try the reset through each avenue in turn,
+		 * cheapest and least dependent first, and never call anything before the print.
+		 */
+		print("\n== fault: attempting reset ==\n");
+		flush_log();
+
+		/* PSCI SYSTEM_RESET through SMC: no UEFI services involved at all. */
+		{
+			register uint64_t x0 __asm__("x0") = 0x84000009ULL;  /* PSCI SYSTEM_RESET */
+
+			__asm__ volatile ("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
+		}
+
+		/* Then the runtime service, if the firmware still has it. */
+		if (ST != NULL && ST->rt != NULL && ST->rt->reset_system != NULL) {
+			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+		}
+
+		/* Then the watchdog, which most Qualcomm ABL builds honour. */
+		if (BS != NULL && BS->set_watchdog_timer != NULL) {
+			BS->set_watchdog_timer(1, 0, 0, NULL);
+		}
 	}
 	print("\n== HALTED (halt=1) ==\n");
 	for (;;) {

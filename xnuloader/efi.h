@@ -266,7 +266,34 @@ typedef struct {
 	uint32_t mode_type;
 } efi_qcom_usb_core;
 
-enum { UsbModePeripheral = 0x02, UsbModePeripheralAlt = 0x04, UsbModeHost = 0x01 };
+/*
+ * UsbConfig 的 ModeType 取值，来自 UsbConfigDxe 反汇编（UsbConfigStartController @ 0x32a4）。
+ *
+ * 该函数对第三个参数做的是：
+ *
+ *     32c8:  cmp  w8, #0x10000
+ *     32cc:  b.hs error
+ *     32d0:  cmp  w8, #0x8
+ *     32d8:  orr  w8, wzr, #0x1      ; 8    -> 1 (host)
+ *     3304:  cmp  w8, #0x10
+ *     330c:  orr  w8, wzr, #0x4      ; 0x10 -> 4 (peripheral)
+ *     3314:  cmp  w8, #0x1
+ *     3318:  ccmp w8, #0x4, #0x4, ne
+ *     331c:  b.ne 0x343c             ; 既不是 1 也不是 4 -> 返回 0x8000000000000002
+ *
+ * 所以合法值是 1、4、8、0x10 四个。原本这里写的是 0x02，
+ * 那是凭空假设的，落到 331c 的 b.ne 上，返回 EFI_INVALID_PARAMETER ——
+ * 也就是每次运行看到的 8000000000000002。
+ */
+enum {
+	UsbModeHost            = 0x01,   /* 已经是 host 模式，直接采用 */
+	UsbModePeripheral      = 0x04,   /* 已经是 peripheral 模式，直接采用 */
+	UsbModeHostSS          = 0x08,   /* 请求切到 host */
+	UsbModePeripheralSS    = 0x10,   /* 请求切到 peripheral */
+};
+
+/* 旧名字保留，语义等同于 UsbModePeripheral(4)。原本定义为 0x02 是错的。 */
+#define UsbModePeripheralAlt UsbModePeripheral
 
 /* Block I/O + Partition Info (used to persist the log on the phone) */
 typedef struct {

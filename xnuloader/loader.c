@@ -4017,13 +4017,65 @@ chiron_ep0_apply_address(void)
  * non-overlapping, which is what DWC3Control.h:110 initialize() insists on.
  */
 /* a bump allocator over one page-aligned static region, so the DMA buffers are known-reachable */
+/*
+ * CHIRON_EP0_BUFFERS_MUST_COME_FROM_THE_DRIVER
+ *
+ * These were a static array in the loader image, and that is why no command completion ever arrived
+ * on the ring.  Compare the addresses in one run:
+ *
+ *     ep0: rings out a164e000/a164e000 in a164f000/... setup a1650000
+ *     evtadr 99f21000
+ *
+ * a164e000 is inside the loader's own image (loaded at a1000000); 99f21000 is what the driver handed
+ * the controller for the event ring.  The controller DMAs into the endpoint rings, so they have to be
+ * memory it can reach and that is coherent with it.  A static array in a UEFI image is neither
+ * guaranteed to be DMA-safe nor necessarily in the region the controller was programmed against.
+ *
+ * The driver publishes an allocator for exactly this -- efi_usbfn_io->allocate_transfer_buffer
+ * (efi.h:543) -- and the loader already calls it elsewhere (line 13514).  Use it, and fall back to
+ * the static arena only if it refuses, so a failure there is visible instead of fatal.
+ */
 static uint8_t g_ep0_arena[16384] __attribute__((aligned(4096)));
 static uint64_t g_ep0_arena_used;
+static int g_ep0_using_driver_dma;
+static void *g_ep0_driver_dma[4];
+static unsigned g_ep0_driver_dma_count;
+
+static void *
+chiron_ep0_driver_alloc(uint64_t bytes)
+{
+	static const efi_guid usbfn_guid = QCOM_USBFN_IO_GUID;
+	efi_usbfn_io *fn = NULL;
+	void *buf = NULL;
+
+	if (g_ep0_driver_dma_count >= sizeof(g_ep0_driver_dma) / sizeof(g_ep0_driver_dma[0])) {
+		return NULL;
+	}
+	if (EFI_ERROR(BS->locate_protocol(&usbfn_guid, NULL, (void **)&fn)) || fn == NULL) {
+		return NULL;
+	}
+	if (fn->allocate_transfer_buffer == NULL) {
+		return NULL;
+	}
+	if (EFI_ERROR(fn->allocate_transfer_buffer(fn, bytes, &buf)) || buf == NULL) {
+		return NULL;
+	}
+	g_ep0_driver_dma[g_ep0_driver_dma_count++] = buf;
+	g_ep0_using_driver_dma = 1;
+	return buf;
+}
 
 static void *
 chiron_ep0_alloc(uint64_t bytes)
 {
 	uint64_t base = (uint64_t)(uintptr_t)g_ep0_arena;
+	{
+		void *d = chiron_ep0_driver_alloc(bytes);
+
+		if (d != NULL) {
+			return d;
+		}
+	}
 	uint64_t off = g_ep0_arena_used;
 
 	if (bytes == 0 || bytes > sizeof(g_ep0_arena) || off + bytes > sizeof(g_ep0_arena)) {

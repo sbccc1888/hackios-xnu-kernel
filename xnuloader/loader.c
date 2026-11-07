@@ -3897,6 +3897,24 @@ chiron_ep0_submit(uint32_t ep, uint64_t buf_dma, uint32_t bytes, uint32_t type)
 
 	memset(ring, 0, sizeof(chiron_trb));
 	chiron_trb_set(&ring[0], buf_dma, bytes, type, 0);
+
+	/*
+	 * CHIRON_EVERY_TRB_NEEDS_THIS
+	 *
+	 * The same omission as arm_setup had: a TRB is written by the CPU and read by the controller, so
+	 * the line must be cleaned to memory before Start.  Without it the controller sees Owned clear
+	 * and never touches the ring -- which costs the DATA and STATUS stages of every control transfer,
+	 * not just the Setup.
+	 *
+	 * The payload buffer needs it too when the CPU filled it (DATA/STATUS), for the same reason.
+	 */
+	clean_dcache((uint64_t)(uintptr_t)&ring[0],
+	    (uint64_t)(uintptr_t)&ring[0] + sizeof(chiron_trb));
+	if (type == CHIRON_TRB_CONTROLDATA && bytes != 0 && buf_dma != 0) {
+		uint8_t *cpu = g_ep0.data_buf;
+
+		clean_dcache((uint64_t)(uintptr_t)cpu, (uint64_t)(uintptr_t)cpu + bytes);
+	}
 	return chiron_depcmd_start(epbase, ring_dma, type);
 }
 

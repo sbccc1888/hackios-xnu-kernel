@@ -9960,12 +9960,36 @@ chiron_vbus_override(void)
 	 * tells it.  If CONNECTSTAT is already 1, something is telling it, and overriding can only
 	 * contradict the hardware.  So only override when the controller reports no connection.
 	 */
-	if ((*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC70C) & 1u) != 0) {
-		print("vbus: skipped, conn already up (hs_phy_ctrl %x)\n", (uint64_t)before);
-		return;
-	}
-
+	/*
+	 * CHIRON_VBUS_ALWAYS_SET
+	 *
+	 * The skip above is removed.  CONNECTSTAT is the controller's own view of the wire, and it reads
+	 * 1 whether or not the PHY is actually driving D+ -- which is the state every run here has been
+	 * stuck in: CONNECTSTAT set, DEVLNKST 4, and the PHY's single-ended receivers reading both lines
+	 * low (snap "ln 0").  So gating on CONNECTSTAT suppresses the one write that would make the port
+	 * real.
+	 *
+	 * Mi 6 (MC-XiaoXiao/ios_sagit) sets this unconditionally and has a working device mode.  Its
+	 * setVbusOverride, DWC3Core.h:491-497:
+	 *
+	 *     const uint32_t hs = VbusValid | SessionSelect;            1<<20 | 1<<28
+	 *     write(HSControl, connected ? usb2 | hs : usb2 & ~hs);
+	 *     write(SSControl, connected ? usb3 | PowerPresent : ...);  1<<24
+	 *
+	 * HSControl is QSCRATCH + 0x10 = 0xF8810, which is the register this function already had.
+	 * SSControl is QSCRATCH + 0x30 = 0xF8830.
+	 */
 	*(volatile uint32_t *)(uintptr_t)ctrl = value;
+
+	{
+		const uint64_t ss = 0xA800000ULL + 0xF8830ULL;   /* QSCRATCH_SS_PHY_CTRL */
+		uint32_t ss_before = *(volatile uint32_t *)(uintptr_t)ss;
+
+		*(volatile uint32_t *)(uintptr_t)ss = ss_before | (1u << 24);
+		print("vbus: ss_phy_ctrl %x -> %x\n",
+		    (uint64_t)ss_before,
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)ss);
+	}
 	__asm__ volatile ("dsb sy" ::: "memory");
 
 	print("vbus: hs_phy_ctrl ", 0);
@@ -12535,13 +12559,40 @@ usb_start(void)
 		 * init sequence again -- the same one that runs before HK6 -- and then the
 		 * corrections on top of it.
 		 */
-		print("post-start_ex: full PHY re-init after the driver's soft reset\n", 0);
-		chiron_qusb2_init();
-		chiron_dwc3_highspeed();
-		chiron_qusb2_resume();
-		chiron_vbus_override();
-		chiron_qusb2_reassert();
-		chiron_pll_resume();
+		/*
+		 * CHIRON_DO_NOT_REINIT_A_WORKING_PHY
+		 *
+		 * This block reinitialises the whole PHY after start_ex, on the theory that the driver's
+		 * soft reset returned it to power-on state.  The last run shows what that actually does:
+		 *
+		 *     snap B-after-start_ex ... ln 1     D+ is up, start_ex worked
+		 *     post-start_ex: full PHY re-init
+		 *     snap C-after-recover ... ln 0      and now nothing is driving the bus
+		 *
+		 * The device appeared in Windows and then vanished, which is exactly the interval between
+		 * those two snapshots.  So reinitialising here destroys a working link.
+		 *
+		 * Only do it when the link is actually down.  The test is the same one the Mi 6 fallback
+		 * uses: CONNECTSTAT set, or the PHY's single-ended receivers seeing a line high.
+		 */
+		uint32_t dsts_pre = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
+		uint8_t  istat_pre = *(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0x230);
+		int link_up = ((dsts_pre & 1u) != 0) || ((istat_pre & 3u) != 0);
+
+		print("post-start_ex: link %s (conn %x ln %x)\n",
+		    (uint64_t)(link_up ? (const char *)"live, leaving the PHY alone"
+		                       : (const char *)"down, re-initialising"),
+		    (uint64_t)(dsts_pre & 1u), (uint64_t)(istat_pre & 3u));
+		flush_log();
+
+		if (!link_up) {
+			chiron_qusb2_init();
+			chiron_dwc3_highspeed();
+			chiron_qusb2_resume();
+			chiron_vbus_override();
+			chiron_qusb2_reassert();
+			chiron_pll_resume();
+		}
 		uint32_t st2 = *(volatile uint32_t *)(uintptr_t)(dwc + 0xC70C);
 
 		if (((d >> 31) & 1) == 0 || ((st2 >> 22) & 1) != 0) {
@@ -12862,11 +12913,41 @@ usb_start(void)
 
 		chiron_dwc3_snap("C-after-recover");
 
-		if (!usb_connected) {
-			print("usb: still not connected after endpoint recovery\n", 0);
-			return 0;
+		/*
+		 * CHIRON_A_DRIVEN_LINE_IS_A_CONNECTION
+		 *
+		 * usb_connected only ever becomes true from a UsbDeviceEventDeviceStateChange with
+		 * device_state == Connected.  That event does not arrive here: the ring this controller
+		 * writes is full of DISCONNECT records and the class driver was never given a working EP0 to
+		 * report against, so the flag stays 0 even while the bus is demonstrably alive.
+		 *
+		 * The last run proves the flag and the wire disagree: start_ex left the PHY driving D+
+		 * ("post-start_ex: link live ... conn 0 ln 1"), the PHY stayed driven for the rest of the
+		 * session, and this test then declared "still not connected" and returned 0 -- discarding a
+		 * session that was in fact presenting itself to the host.
+		 *
+		 * So treat a driven line as a connection.  ln comes from QUSB2PHY_INTR_STAT (0x230), whose
+		 * bits 1:0 are the single-ended receivers for D+ and D-; either one high means something is
+		 * driving the bus, which only this device can be.
+		 */
+		{
+			uint32_t dsts_rc = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC70C);
+			uint8_t  istat_rc = *(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0x230);
+			int wire = ((dsts_rc & 1u) != 0) || ((istat_rc & 3u) != 0);
+
+			print("usb: recover view conn %x ln %x wire %d flag %d\n",
+			    (uint64_t)(dsts_rc & 1u), (uint64_t)(istat_rc & 3u),
+			    (uint64_t)(wire != 0), (uint64_t)(usb_connected != 0));
+
+			if (wire) {
+				usb_connected = 1;
+				print("usb: connected after endpoint recovery (by wire)\n", 0);
+			}
+			if (!usb_connected) {
+				print("usb: still not connected after endpoint recovery\n", 0);
+				return 0;
+			}
 		}
-		print("usb: connected after endpoint recovery\n", 0);
 	}
 	/*
 	 * CHIRON_USB_PRESENTED
@@ -12929,10 +13010,87 @@ usb_start(void)
 	 * Running, in this order: select() which soft-resets, configureEndpoint() for EP0 out and in,
 	 * installEvents(), then runDevice().  Nothing runs between them and the host.
 	 */
-	chiron_mi6_dwc3_bringup();
-	chiron_mi6_endpoints();
-	chiron_mi6_install_events();
-	(void)chiron_mi6_run_device();
+	/*
+	 * CHIRON_MI6_IS_A_FALLBACK_NOT_A_REPLACEMENT
+	 *
+	 * The previous run proved this the expensive way.  Its log reads:
+	 *
+	 *     snap B-after-start_ex ... ln 1          the vendor path had D+ up
+	 *     mi6: after run DSTS c680 ... cnt 1c     the host answered within the same instant
+	 *     snap C-after-mi6 ... lkst 0 ln 0        and then D+ was gone
+	 *
+	 * so the vendor controller path -- UsbFnIo::start_controller in the no_start_ex branch,
+	 * StartEx otherwise -- does bring the link up, and the Mi 6 sequence then soft-resets the core
+	 * and tears it back down.  Running it unconditionally destroys working state.
+	 *
+	 * So only run it when the vendor path did not reach a live link.  Those are exactly the states
+	 * that were stuck before: DSTS.CONNECTSTAT clear, or the PHY's single-ended receivers seeing
+	 * both lines low, which is what "ln 0" reports.
+	 */
+	{
+		uint32_t dsts_now = *(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC70C);
+		uint8_t  istat_now = *(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0x230);
+		int live = ((dsts_now & 1u) != 0) || ((istat_now & 3u) != 0);
+
+		print("mi6: gate conn %x ln %x -> %s\n",
+		    (uint64_t)(dsts_now & 1u), (uint64_t)(istat_now & 3u),
+		    (uint64_t)(live ? (const char *)"skip, vendor link is live"
+		                    : (const char *)"run, no live link"));
+		flush_log();
+
+		if (!live) {
+			chiron_mi6_dwc3_bringup();
+			chiron_mi6_endpoints();
+			chiron_mi6_install_events();
+			(void)chiron_mi6_run_device();
+		}
+	}
+
+	/*
+	 * CHIRON_READ_THE_RING_MYSELF
+	 *
+	 * The last run reached a state no previous run had: the PHY drove D+ (ln 1), the host reset the
+	 * bus, and the controller wrote real event records into the ring -- 28 bytes, stuck at 1c for the
+	 * whole 111 ms probe because nothing consumed them.  The class driver does not drain them, so the
+	 * setup packet the host sent is still sitting there, unread.
+	 *
+	 * This reads the ring directly.  GEVNTCOUNT holds bytes; the records are 4 bytes each, and a
+	 * device event is flagged in bit 0 while an endpoint event has it clear (DWC3Registers.h: read,
+	 * Xiaomi Mi 6 port, Event::device() / endpointNumber()).  Dump the raw words so the actual
+	 * traffic is visible instead of inferred:
+	 *
+	 *     TRB type 1 = Control Setup, carrying the 8-byte SETUP packet in the following words
+	 *     TRB type 2 = Control Data
+	 *     TRB type 3 = Control Status
+	 */
+	{
+		const uint64_t d2 = 0xA800000ULL;
+		uint32_t adr = *(volatile uint32_t *)(uintptr_t)(d2 + 0xC400);
+		uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(d2 + 0xC40C) & 0xfffcu;
+
+		print("mi6ring: adr %x cnt %x\n", (uint64_t)adr, (uint64_t)cnt);
+
+		if (adr != 0 && cnt != 0) {
+			unsigned n = cnt / 4u;
+
+			if (n > 16) {
+				n = 16;
+			}
+			chiron_invalidate((void *)(uintptr_t)adr, cnt);
+
+			for (unsigned i = 0; i < n; i++) {
+				print("  ev%x raw %x\n", (uint64_t)i,
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(adr + i * 4u));
+			}
+
+			/* consume them so the counter is seen to move */
+			*(volatile uint32_t *)(uintptr_t)(d2 + 0xC40C) = cnt;
+			__asm__ volatile ("dsb sy" ::: "memory");
+			print("mi6ring: consumed, cnt now %x\n",
+			    (uint64_t)(*(volatile uint32_t *)(uintptr_t)(d2 + 0xC40C) & 0xfffcu));
+		}
+		flush_log();
+	}
 	chiron_dwc3_snap("C-after-mi6");
 
 	print("usb: started\n");

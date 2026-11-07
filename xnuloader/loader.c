@@ -10780,8 +10780,19 @@ usb_start(void)
 		    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &vg, (void **)&vend)) &&
 		    vend != NULL) {
 			g_orig_usbfn = vend;
-			print("usbfn: captured vendor instance %x before reinstall\n",
-			    (uint64_t)(uintptr_t)vend);
+			/*
+			 * CHIRON_CHECK_THE_REVISION
+			 *
+			 * usbfn_io answers 0x10002 to its first word; usb_device_protocol answers
+			 * 0x10000001.  This loader has confused the two before -- USB carried one type and
+			 * was used as the other for many rounds -- so state which object was captured
+			 * instead of trusting the GUID it was looked up with.
+			 */
+			print("usbfn: captured vendor instance %x rev %x (%s)\n",
+			    (uint64_t)(uintptr_t)vend,
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)vend,
+			    (*(volatile uint32_t *)(uintptr_t)vend == 0x10002u) ?
+			        "usbfn_io" : "NOT usbfn_io");
 			flush_log();
 		}
 	}

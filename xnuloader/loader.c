@@ -11248,6 +11248,37 @@ usb_start(void)
 			}
 		}
 
+		/*
+		 * CHIRON_STARTEX_REQUIRES_USBFNIO
+		 *
+		 * StartEx begins by calling 0x1f1c, whose whole job is to LocateProtocol the UsbFnIo
+		 * GUID 32d2963a-fe5d-4f30-b633-6e5dc55803cc into module global +0xa410:
+		 *
+		 *     1c74: bl  0x1f1c
+		 *     1c78: mov x19, x0
+		 *     1c7c: tbnz x19, #0x3f, 0x1d54    fail -> return the error
+		 *
+		 * On failure 0x1f68 does "str xzr, [x20, #0x410]" and prints, and the global stays null.
+		 * The probe read that global as 0 right here, so the locate is failing.  Ask directly,
+		 * through both locate_protocol and locate_handle_buffer, so the answer is which of the
+		 * two disagree with "UsbFnIo handles after connect 1".
+		 */
+		{
+			static const efi_guid fng = QCOM_USBFN_GUID;
+			void *lp = NULL;
+			efi_handle *fh = NULL;
+			uint64_t fn2 = 0;
+			efi_status s1 = BS->locate_protocol(&fng, NULL, &lp);
+			efi_status s2 = BS->locate_handle_buffer(ByProtocol, &fng, NULL, &fn2, &fh);
+
+			print("fnio: locate_proto %x ptr %x | locate_handles %x n %x\n",
+			    (uint64_t)s1, (uint64_t)(uintptr_t)lp, (uint64_t)s2, fn2);
+			if (fh != NULL) {
+				BS->free_pool(fh);
+			}
+			flush_log();
+		}
+
 		s = USB->start_ex(&set);
 		chiron_shim_report();
 		chiron_ring_dump("post-start_ex");

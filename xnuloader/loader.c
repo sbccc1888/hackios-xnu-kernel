@@ -3793,6 +3793,32 @@ chiron_ep0_arm_setup(void)
 		g_ep0.armed = 0;
 	}
 
+	/*
+	 * CHIRON_IS_EP0_EVEN_ENABLED
+	 *
+	 * Every arm now reports success ('arm rc 1 DGTYPE 106'), yet no endpoint event ever appears on
+	 * the ring -- only device events.  Mi 6 guards its Start with endpointActive/endpointStopping
+	 * (DWC3Core.h:369) and would answer Busy if the endpoint were running; ours is never Busy, so
+	 * the controller does not think EP0 is active either, and a Start that never takes effect
+	 * would explain both facts at once.
+	 *
+	 * DALEPENA is the bitmask that enables endpoints at all.  It was set to 3 at startup, but
+	 * start_ex and the driver's ConfigureEnableEndpoints run after that and may have cleared it.
+	 * Print it, plus DCTL and DSTS, immediately before the Start so the state the command is
+	 * issued against is on the record.
+	 */
+	{
+		const uint64_t dp = 0xA800000ULL;
+		uint32_t dalep = *(volatile uint32_t *)(uintptr_t)(dp + 0xC720);
+		uint32_t dctl = *(volatile uint32_t *)(uintptr_t)(dp + 0xC704);
+		uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(dp + 0xC70C);
+
+		print("ep0: pre-arm DALEPENA %x DCTL %x run %x DSTS %x lkst %x\n",
+		    (uint64_t)dalep, (uint64_t)dctl, (uint64_t)((dctl >> 31) & 1),
+		    (uint64_t)dsts, (uint64_t)((dsts >> 18) & 3));
+		flush_log();
+	}
+
 	memset(g_ep0.setup_buf, 0, 8);
 	memset(g_ep0.out_trb, 0, sizeof(chiron_trb));
 	chiron_invalidate(g_ep0.setup_buf, 8);
@@ -4179,6 +4205,34 @@ chiron_ep0_poll(void)
 	count = raw & 0xffffu;
 	if (count == 0 || (count & 3u) != 0u || count > 0x1000u) {
 		return;
+	}
+
+	/*
+	 * CHIRON_SHOW_EVERY_WORD
+	 *
+	 * Device events are decoded and printed below, and they are all that has ever appeared.  If the
+	 * controller is posting endpoint events too, the decoding is losing them; if it is not, the
+	 * words themselves say so.  Dump the raw snapshot for the first few non-empty passes, before
+	 * any of it is interpreted, so the two cases are distinguishable.
+	 */
+	{
+		static unsigned dumps;
+
+		if (dumps < 6) {
+			uint32_t off2 = event_offset;
+
+			print("ep0: raw cnt %x:", (uint64_t)count);
+			for (n = 0; n < count && n < 64; n += 4) {
+				print(" %x", (uint64_t)*(volatile uint32_t *)(uintptr_t)(adr + off2));
+				off2 += 4;
+				if (off2 >= 0x1000u) {
+					off2 = 0;
+				}
+			}
+			print("\n", 0);
+			flush_log();
+			dumps++;
+		}
 	}
 
 	chiron_invalidate((void *)(uintptr_t)adr, count);

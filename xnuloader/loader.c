@@ -3540,7 +3540,16 @@ chiron_depcmd_start(uint32_t epbase, uint64_t ring, uint32_t type)
 	*(volatile uint32_t *)(uintptr_t)(epbase + 4) = (uint32_t)ring;
 	*(volatile uint32_t *)(uintptr_t)(epbase + 8) = 0;
 	__asm__ volatile ("dsb sy" ::: "memory");
-	*(volatile uint32_t *)(uintptr_t)(epbase + 12) = 6u | CHIRON_DEPCMD_ACTIVE;
+	/*
+	 * CHIRON_START_WANTS_THE_EVENT
+	 *
+	 * DWC3Control.h:204 submits Start with the Interrupt option, and that is what makes the
+	 * controller put a Command Complete event on the ring when the endpoint really is running.
+	 * Without it there is nothing to wait for, and the earlier code polled CMDACT instead -- which
+	 * on this revision acknowledges acceptance rather than completion (DWC3Core.h:420).
+	 */
+	*(volatile uint32_t *)(uintptr_t)(epbase + 12) =
+	    6u | CHIRON_DEPCMD_ACTIVE | (1u << 8);
 	__asm__ volatile ("dsb sy" ::: "memory");
 
 	for (unsigned i = 0; i < 1000; i++) {
@@ -3670,7 +3679,7 @@ chiron_ep0_arm_setup(void)
 	 * The packet size comes from the speed the host negotiated.  DCFG speed 0 is High Speed and
 	 * the control endpoint is 64 bytes there.
 	 */
-	if (g_ep0.armed) {
+	if (0 && g_ep0.armed) {
 		const uint64_t dn = 0xA800000ULL;
 		uint32_t b0 = (uint32_t)(dn + 0xC800);
 		uint32_t b1 = (uint32_t)(dn + 0xC810);
@@ -3700,7 +3709,21 @@ chiron_ep0_arm_setup(void)
 		g_ep0.armed = 0;
 	}
 
-	if (0) {
+	/*
+	 * CHIRON_END_THEN_START_IS_THE_MI6_ORDER
+	 *
+	 * DWC3Transfer.h:143 cancel() is the whole of what has to happen between two arms: command End
+	 * with Force and Interrupt, carrying the transfer resource, and then a fresh Start.  The
+	 * resource comes from the Resource command -- the log has it:
+	 *
+	 *     mi6ep: Resource ep0out 1 reply 10002 res 1
+	 *     mi6ep: Resource ep0in  1 reply 20002 res 2
+	 *
+	 * The earlier attempt at this passed resource 0 and the End never completed; with the real
+	 * value it is Pending by design (DWC3Core.h:423 -- CMDACT clearing means accepted, not
+	 * finished), so nothing here waits on CMDACT.
+	 */
+	if (g_ep0.armed) {
 		const uint64_t dd = 0xA800000ULL;
 		uint32_t b0 = (uint32_t)(dd + 0xC800);
 
@@ -3713,19 +3736,58 @@ chiron_ep0_arm_setup(void)
 		    ((g_ep0.out_resource & 127u) << 16);
 		__asm__ volatile ("dsb sy" ::: "memory");
 
-		/* wait for the End completion event, which also resets the endpoint state */
+		/*
+		 * CHIRON_WAIT_FOR_THE_END_EVENT
+		 *
+		 * DWC3Transfer.h:161 handles the completion as an event, not as a register:
+		 *
+		 *     if (event.type() == 7 && ((event.parameters() >> 8) & 15) == unsigned(Command::End))
+		 *
+		 * Event type 7 with command 8 in the parameter means the End is done.  Waiting for any
+		 * event at all -- which is what this did -- returns as soon as the bus reset or the
+		 * connect event lands on the ring, and then the Start is issued against an endpoint that
+		 * is still being stopped.  That is the 'status 1' every re-arm has reported.
+		 *
+		 * Drain the ring here and wait specifically for type 7 / command 8, with a bounded wait so
+		 * a missing event cannot hang the run.
+		 */
 		{
+			uint32_t eadr = *(volatile uint32_t *)(uintptr_t)(dd + 0xC400);
+			uint32_t esiz = *(volatile uint32_t *)(uintptr_t)(dd + 0xC408) & 0xffffu;
 			unsigned waited = 0;
+			int done = 0;
 
-			while (waited < 200) {
-				uint32_t raw = *(volatile uint32_t *)(uintptr_t)(dd + 0xC40C);
+			if (eadr != 0 && esiz >= 0x1000u) {
+				chiron_invalidate((void *)(uintptr_t)eadr, esiz);
+				while (waited < 500 && !done) {
+					uint32_t cnt = *(volatile uint32_t *)(uintptr_t)(dd + 0xC40C) & 0xfffcu;
+					uint32_t off = 0;
 
-				if ((raw & 0xffffu) == 0) {
-					chiron_udelay(10);
-					waited++;
-					continue;
+					while (cnt >= 4) {
+						uint32_t word = *(volatile uint32_t *)(uintptr_t)(eadr + off);
+
+						off += 4;
+						if (off >= 0x1000u) {
+							off = 0;
+						}
+						cnt -= 4;
+						if ((word & 1u) != 0u) {
+							continue;      /* a device event, not a command completion */
+						}
+						if (((word >> 8) & 15u) == 7u &&
+						    (((word >> 16) >> 8) & 15u) == 8u) {
+							done = 1;
+							break;
+						}
+					}
+					if (!done) {
+						chiron_udelay(10);
+						waited++;
+					}
 				}
-				break;
+				print("ep0: end event %d after %d polls\n",
+				    (uint64_t)done, (uint64_t)waited);
+				flush_log();
 			}
 		}
 		g_ep0.armed = 0;
@@ -14461,7 +14523,7 @@ usb_start(void)
 	 * because the endpoint belongs to UsbfnDwc3Dxe.  Disabled rather than deleted, so the code and
 	 * its measurements stay available.
 	 */
-	if (0 && chiron_ep0_init(chiron_ep0_alloc, chiron_ep0_phys)) {
+	if (chiron_ep0_init(chiron_ep0_alloc, chiron_ep0_phys)) {
 		if (chiron_ep0_arm_setup()) {
 			print("ep0: armed, waiting for the host\n", 0);
 		} else {
@@ -15329,7 +15391,7 @@ usb_command_loop(void)
 		 * So when EP0 is up, this loop does exactly one thing per pass: poll EP0.  The fastboot
 		 * command path below stays reachable only when the gadget did not start.
 		 */
-		if (g_ep0.ready && 0) {
+		if (g_ep0.ready) {
 			/*
 			 * CHIRON_THE_DEADLINE_STILL_RUNS_WHILE_EP0_OWNS_THE_RING
 			 *

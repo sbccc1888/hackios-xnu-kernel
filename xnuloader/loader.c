@@ -10801,6 +10801,31 @@ usb_start(void)
 
 		if (!EFI_ERROR(BS->handle_protocol(usb_dev_handle, &fguid, (void **)&orig)) &&
 		    orig != NULL && orig != USB) {
+			/*
+			 * CHIRON_WHICH_TABLE_IS_THIS
+			 *
+			 * The addresses in the cfgonly line resolve against the module bases recorded in
+			 * the same boot:
+			 *
+			 *     UsbDeviceDxe base 9bfa5000
+			 *     9bfa5000 + 0xa0f0 = 9bfaf0f0    UsbDevice protocol table
+			 *     9bfa5000 + 0x15cc = 9bfa65cc    its +0x10 slot, send()
+			 *
+			 * so g_orig_usbfn was holding a usb_device_protocol, and cfgonly called its send()
+			 * as configure_enable_endpoints, which faulted at far=0x50 inside a function that
+			 * was never given that struct.
+			 *
+			 * The revision word tells the two apart with no ambiguity -- usbfn_io answers
+			 * 0x10002, usb_device_protocol answers 0x10000001 -- so print it for orig and for
+			 * USB right before the reinstall, together with the address of each.
+			 */
+			print("reinstall: orig %x rev %x | USB %x rev %x\n",
+			    (uint64_t)(uintptr_t)orig,
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)orig,
+			    (uint64_t)(uintptr_t)USB,
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)USB);
+			flush_log();
+
 			efi_status rs = BS->reinstall_protocol_interface(usb_dev_handle, &fguid,
 			    orig, USB);
 

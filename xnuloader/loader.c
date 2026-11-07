@@ -13357,6 +13357,54 @@ efi_main(efi_handle image, efi_system_table *st)
 			 * The first such check is the earliest point at which a session that never
 			 * attached becomes a phone that comes back on its own.
 			 */
+			/*
+			 * CHIRON_UNSUSPEND_THE_PHY
+			 *
+			 * The loop-entry state shows the PHY left in suspend, and that is the last link in
+			 * a chain the log has been spelling out:
+			 *
+			 *     entry, from fastboot:   GUSB2PHYCFG 0x2400   bit8 SUSPENDUSB20 = 0
+			 *     ours, at loop entry:    GUSB2PHYCFG 0x2500   bit8 SUSPENDUSB20 = 1
+			 *     DSTS 0x920001           Connected 1, ConnectSpd 1, USBLNKST 4 = EarlySuspend
+			 *     DCFG 0x480800           DevAddr 0
+			 *
+			 * 0x2500 - 0x2400 is exactly bit 8.  Nothing in this loader writes GUSB2PHYCFG (it is
+			 * only ever read, at 6752/9379/13171), so the driver sets it during StartController or
+			 * ConfigureEnableEndpoints -- correctly, for a bus it thinks is idle: 3 ms without an
+			 * SOF is a USB2 suspend condition.
+			 *
+			 * But a suspended PHY does not drive the D+ pull-up, so the host never sees an attach,
+			 * never issues a reset, never sends SET_ADDRESS, and DevAddr stays 0.  Clearing the
+			 * bit is what lets the host notice the device at all.
+			 */
+			{
+				uint64_t dwc0 = 0xA800000ULL;
+				uint32_t cfg_before = *(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC200);
+
+				if ((cfg_before & (1u << 8)) != 0) {
+					*(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC200) =
+					    cfg_before & ~(1u << 8);
+					__asm__ volatile ("dsb sy" ::: "memory");
+					chiron_udelay(1000);
+					print("phycfg: %x -> %x (SUSPENDUSB20 cleared)\n",
+					    (uint64_t)cfg_before,
+					    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC200));
+				} else {
+					print("phycfg: %x already unsuspended\n", (uint64_t)cfg_before);
+				}
+
+				/* After clearing it, make sure termination and the pull-up are asserted too. */
+				chiron_enable_termination();
+				chiron_enable_dp_pullup();
+
+				print("loop: DSTS %x DCFG %x utmi1 %x phy74 %x\n",
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC70C),
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc0 + 0xC700),
+				    (uint64_t)*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0xC0),
+				    (uint64_t)*(volatile uint8_t *)(uintptr_t)(0xC012000ULL + 0x74));
+				flush_log();
+			}
+
 			print("usb: entering command loop\n", 0);
 			print("usb: state at loop entry: DCFG %x DSTS %x DCTL %x devten %x evtcnt %x\n",
 			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC700),

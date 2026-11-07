@@ -13433,6 +13433,38 @@ efi_main(efi_handle image, efi_system_table *st)
 				flush_log();
 			}
 
+			/*
+			 * CHIRON_TEST_RUNSTOP_BIT0
+			 *
+			 * The DWC3 databook puts RunStop at DCTL bit0, and this loader has been reading bit31
+			 * as "run" for many rounds.  Both readings cannot be right, and the disagreement
+			 * matters: DCTL reads 0x90f00000, so bit0 is clear and bit31 is set.
+			 *
+			 * UsbfnDwc3Dxe never touches bit0 -- grep of the disassembly for a DCTL orr/and
+			 * against #0x1 finds nothing, and the one "and w1, w0, #0xfffffffe" at 0x381c is on
+			 * GUSB3PIPECTL (0xc2c0), not DCTL.  So the driver is not starting the core by that
+			 * bit either.
+			 *
+			 * Rather than argue from either reading, set bit0 and see whether anything moves:
+			 * DSTS, SOFFN and the host's view are all observable.  If the core was halted, this
+			 * starts it.  If bit0 is something else on this part, the only cost is one bit.
+			 */
+			{
+				uint64_t dwc1 = 0xA800000ULL;
+				uint32_t d_before = *(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704);
+				uint32_t d_after;
+
+				*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704) = d_before | 1u;
+				__asm__ volatile ("dsb sy" ::: "memory");
+				chiron_udelay(2000);
+				d_after = *(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC704);
+
+				print("runstop: DCTL %x -> %x (bit0 set) | DSTS %x\n",
+				    (uint64_t)d_before, (uint64_t)d_after,
+				    (uint64_t)*(volatile uint32_t *)(uintptr_t)(dwc1 + 0xC70C));
+				flush_log();
+			}
+
 			print("usb: entering command loop\n", 0);
 			print("usb: state at loop entry: DCFG %x DSTS %x DCTL %x devten %x evtcnt %x\n",
 			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC700),

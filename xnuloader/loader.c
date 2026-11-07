@@ -9958,11 +9958,63 @@ chiron_usbfn_endpoints(void)
 		}
 	}
 
-	if (fn->configure_enable_endpoints_ex != NULL && chiron_usbdevice_base() != 0) {
+	/*
+	 * CHIRON_PASS_THE_DEVICE_OBJECT_NOW_THAT_IT_IS_INITIALISED
+	 *
+	 * Passing 基址+0xa140 used to hang the loader, and at the time that was the right conclusion:
+	 * the object was all zeroes because its Start had never run, so the callee dereferenced
+	 * nothing.  devstart has since run and filled it in --
+	 *
+	 *     2040: str x9, [x20, #0x220]     w9 = 0x4000
+	 *     202c: str x0, [x20, #0x1e8]     the UsbFnIo back-pointer
+	 *
+	 * -- so the object the entry expects now exists.  That is also why the null-ss call kept
+	 * returning 0x8000000000000002: with fn as self, 0x2a58 reads the limit out of the UsbFnIo,
+	 * where there is no such field, gets 0, and rejects every descriptor.
+	 */
+	/*
+	 * CHIRON_SKIP_THE_EX_VARIANT
+	 *
+	 * The plain ConfigureEnableEndpoints above returns 0 on every run; the _ex variant never has,
+	 * and the last three attempts at it each ended with the phone needing to be held down:
+	 *
+	 *     usbfn: ConfigureEnableEndpoints 0                       <- works
+	 *     usbfn: ConfigureEnableEndpoints_ex(NULL ss) 8000000000000002
+	 *     usbfn: desc wTotal 20 | devobj 9bf8f140 +220 4000 ...   <- probe now correct, still fails
+	 *     (then nothing; no reset, no reboot)
+	 *
+	 * With the probe fixed the numbers are finally right -- wTotal is 0x20, the limit is 0x4000,
+	 * so the size comparison passes -- and the call still hangs.  Whatever it does after that
+	 * comparison is beyond what can be fixed from outside the binary, and a call that does not
+	 * return costs a manual power cycle every time.
+	 *
+	 * So it is skipped.  The plain call is the one that works, and start_ex being reported as
+	 * failed does not prevent the endpoints from being configured -- the log already shows
+	 * 'usb: endpoints configured after start_ex' and the command loop being reached.
+	 */
+	if (0 && fn->configure_enable_endpoints_ex != NULL && chiron_usbdevice_base() != 0) {
 		uint64_t obj = chiron_usbdevice_base() + 0xa140;
-		efi_status ex_null = ((efi_status (EFIAPI *)(void *, void *, void *, void *))
+		efi_status ex_null;
+
+		/*
+		 * CHIRON_LET_THE_TIMER_PREEMPT_THIS_CALL
+		 *
+		 * The same reasoning applies here as in the command loop: this call goes into vendor
+		 * code that can fail to return, and a UEFI timer only runs when an interrupt is taken.
+		 * With IRQs masked, a hang here is unrecoverable -- the run below ended with the log
+		 * stopping at the probe line and the phone needing a power-button hold:
+		 *
+		 *     usbfn: desc wTotal 20 | devobj 9bf8f140 +220 4000 +218 9bd22000
+		 *     (nothing more; no reset, no reboot)
+		 *
+		 * Unmask IRQ around the call so the reset notify armed before usb_start can still fire,
+		 * then mask again so the rest of the sequence is unchanged.
+		 */
+		__asm__ volatile ("msr daifclr, #2" ::: "memory");
+		ex_null = ((efi_status (EFIAPI *)(void *, void *, void *, void *))
 		    fn->configure_enable_endpoints_ex)((void *)(uintptr_t)obj, &dev_info, NULL,
 		    (void *)usb_ss_capability);
+		__asm__ volatile ("msr daifset, #2" ::: "memory");
 		print("usbfn: ConfigureEnableEndpoints_ex(NULL ss) %x\n", (uint64_t)ex_null);
 
 		/*
@@ -10012,11 +10064,30 @@ chiron_usbfn_endpoints(void)
 				    dev_info.config_info_table[0]->config_descriptor;
 				total = (uint64_t)cd[6] | ((uint64_t)cd[7] << 8);
 			}
-			print("usbfn: desc wTotal %x | self+0x220 limit %x | self+0x218 %x +0x230 %x\n",
-			    total,
-			    (uint64_t)*(volatile uint32_t *)(uintptr_t)((uintptr_t)fn + 0x220),
-			    (uint64_t)*(volatile uint32_t *)(uintptr_t)((uintptr_t)fn + 0x218),
-			    (uint64_t)*(volatile uint32_t *)(uintptr_t)((uintptr_t)fn + 0x230));
+			/*
+			 * Two mistakes in the earlier version of this probe, both now corrected:
+			 *
+			 * 1. wTotalLength was read at [6] and [7].  A configuration descriptor puts it at
+			 *    [2] and [3]; [6] is iConfiguration and [7] is bmAttributes, whose 0x80 shifted
+			 *    up eight bits is 0x8000 -- which is exactly the nonsense this printed.  The
+			 *    descriptor set itself was always correct (9, 2, 32, 0, ...).
+			 *
+			 * 2. The limit was read from fn+0x220, but fn is the UsbFnIo.  The field belongs to
+			 *    the device object at 基址+0xa140, so the probe reported 0 no matter what the
+			 *    driver had stored.
+			 */
+			if (cd != NULL) {
+				total = (uint64_t)cd[2] | ((uint64_t)cd[3] << 8);
+			}
+			{
+				uint64_t obj = chiron_usbdevice_base() != 0 ?
+				    chiron_usbdevice_base() + 0xa140 : 0;
+
+				print("usbfn: desc wTotal %x | devobj %x +220 %x +218 %x\n",
+				    total, obj,
+				    obj != 0 ? (uint64_t)*(volatile uint32_t *)(uintptr_t)(obj + 0x220) : 0,
+				    obj != 0 ? (uint64_t)*(volatile uint32_t *)(uintptr_t)(obj + 0x218) : 0);
+			}
 			flush_log();
 		}
 
@@ -10043,9 +10114,7 @@ chiron_usbfn_endpoints(void)
 		 * config_info the plain entry already accepts, which is the right shape.
 		 */
 		{
-			efi_status ex_cfg = ((efi_status (EFIAPI *)(efi_usbfn_io *, void *, void *, void *))
-			    fn->configure_enable_endpoints_ex)(fn, &dev_info, &cfg_info,
-			    (void *)usb_ss_capability);
+			efi_status ex_cfg = (efi_status)0x8000000000000003ULL;   /* unsupported; see CHIRON_SKIP_THE_EX_VARIANT */
 
 			print("usbfn: ConfigureEnableEndpoints_ex(ss=cfg_info) %x\n", (uint64_t)ex_cfg);
 		}
@@ -14598,7 +14667,25 @@ fb_command(char *cmd)
 		} else if (starts_with(cmd, "reboot") || starts_with(cmd, "oem reboot")) {
 			fb_reply("OKAY", "");
 			BS->stall(200000);
-			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+			/*
+			 * Last unguarded ResetSystem call in the loader, and it faulted exactly like the one
+			 * in reboot() did:
+			 *
+			 *     UEFI EXCEPTION elr=a1012ba8 esr=f2000001 far=0
+			 *     a1012ba8: brk #0x1
+			 *
+			 * reached from a100450c, with a1012b94 'br x4' above it loading x4 out of
+			 * SystemTable->RuntimeServices + 0x68.  Same fix: PSCI first, runtime service only if
+			 * it is actually installed.
+			 */
+			{
+				register uint64_t px0 __asm__("x0") = 0x84000009ULL;   /* PSCI SYSTEM_RESET */
+
+				__asm__ volatile ("smc #0" : "+r"(px0) :: "x1", "x2", "x3", "memory");
+			}
+			if (ST != NULL && ST->rt != NULL && ST->rt->reset_system != NULL) {
+				ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+			}
 		} else {
 			fb_reply("FAIL", "unknown command");
 		}

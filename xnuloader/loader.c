@@ -3876,6 +3876,44 @@ chiron_ep0_arm_setup(void)
 		if (rc) {
 			g_ep0.armed = 1;
 		}
+
+		/*
+		 * CHIRON_DID_THE_CONTROLLER_TAKE_IT
+		 *
+		 * The question that decides everything: after Start, did the controller fetch the Setup TRB?
+		 * Two registers and one memory read answer it without inference.
+		 *
+		 *   DEPSTAR (0xC710 + ep*16) holds the TRB dequeue pointer.  If it advanced past the address
+		 *   the ring was started at, the controller walked the ring.
+		 *
+		 *   The TRB's own control word: the controller clears Owned when it retires a TRB.  Reading it
+		 *   requires an invalidate first, because the CPU copy is stale by definition -- the write came
+		 *   from the controller.
+		 *
+		 * Three outcomes, three different bugs:
+		 *   Owned still 1, DEPSTAR unchanged  -> it never looked; the Start did not take effect on the
+		 *                                        endpoint, and the problem is the command or the ring
+		 *                                        address rather than the TRB contents
+		 *   Owned 0, no endpoint event         -> it took the TRB and completed it silently, so the
+		 *                                        event is being lost or never posted
+		 *   Owned 0, endpoint event arrives    -> working
+		 */
+		{
+			const uint64_t dd2 = 0xA800000ULL;
+			uint32_t star = *(volatile uint32_t *)(uintptr_t)(dd2 + 0xC710);
+			uint32_t ring_started;
+
+			chiron_udelay(2000);
+			chiron_invalidate(g_ep0.out_trb, sizeof(chiron_trb));
+			ring_started = (uint32_t)g_ep0.out_dma;
+
+			print("ep0: take-back owned %x ctl %x | DEPSTAR %x vs ring %x %s\n",
+			    (uint64_t)(g_ep0.out_trb[0].control & 1u),
+			    (uint64_t)g_ep0.out_trb[0].control,
+			    (uint64_t)star, (uint64_t)ring_started,
+			    (star != ring_started) ? "ADVANCED" : "unmoved");
+			flush_log();
+		}
 		print("ep0: arm rc %d DGTYPE %x PAR0 %x PAR1 %x PAR2 %x\n",
 		    (uint64_t)rc,
 		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(epbase + 12),

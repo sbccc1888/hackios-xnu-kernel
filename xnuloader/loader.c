@@ -5014,6 +5014,36 @@ chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
 	}
 
 	/*
+	 * CHIRON_EXPLICIT_BINDING_START
+	 *
+	 * connect_controller returned success and one UsbFnIo handle now exists, but the event ring
+	 * is still zero afterwards:
+	 *
+	 *     hk6: ring after rebind adr 0 sz 0 count 0
+	 *
+	 * DwcConfigureEventBuffer is the function that programs GEVNTADR:
+	 *
+	 *     8a40: stp x24, x23, [sp, #-0x40]!      DwcConfigureEventBuffer
+	 *     8b38: add w14, w13, w24, lsl #4
+	 *     8b3c: add w0,  w14, w15        w15 = 0xc400
+	 *     8b40: bl  0xccc0               write GEVNTADR
+	 *
+	 * and no log line from it appears, so DriverBindingStart -- its only caller -- has not run
+	 * for this controller.  connect returning success means it believed a binding already
+	 * existed.  Ask the binding to start explicitly and see whether the ring gets programmed.
+	 */
+	if (!usb_noop_startstop) {
+		efi_status st = binding->start(binding, controller, NULL);
+
+		print("hk6: explicit binding start -> %x\n", (uint64_t)st);
+		print("hk6: ring after explicit start adr %x sz %x count %x\n",
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC400),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC408),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(0xA800000ULL + 0xC40C));
+		flush_log();
+	}
+
+	/*
 	 * Read the ring right here, before anything else can touch it.  This is the value that
 	 * has been zero in every run so far and it decides whether the rest is worth doing.
 	 */

@@ -3449,6 +3449,8 @@ static struct {
 	uint32_t    out_cap, in_cap, data_len;
 	uint8_t     address;
 	uint8_t     configuration;
+	uint32_t    speed;          /* 0 = high, 1 = full, 2 = super */
+	int         connected;
 	int         ready;
 	uint64_t    setup_count;
 	uint64_t    last_setup_raw;
@@ -3517,7 +3519,34 @@ chiron_ep0_arm_setup(void)
 	memset(g_ep0.out_trb, 0, sizeof(chiron_trb));
 	chiron_invalidate(g_ep0.setup_buf, 8);
 	chiron_trb_set(&g_ep0.out_trb[0], g_ep0.setup_dma, 8, CHIRON_TRB_SETUP, 0);
-	return chiron_depcmd_start(epbase, g_ep0.out_dma, CHIRON_TRB_SETUP);
+
+	/*
+	 * Show exactly what is being handed over.  The previous runs armed this and then never saw a
+	 * completion, so the question is whether the controller is looking at the descriptor that was
+	 * written -- print the TRB as the hardware will read it, plus the DEPCMD registers after the
+	 * Start, so a rejected or ignored command is visible instead of inferred.
+	 */
+	print("ep0: arm trb adr %x/%x sz %x ctl %x | ring %x setup %x\n",
+	    (uint64_t)g_ep0.out_trb[0].address_lo,
+	    (uint64_t)g_ep0.out_trb[0].address_hi,
+	    (uint64_t)g_ep0.out_trb[0].size,
+	    (uint64_t)g_ep0.out_trb[0].control,
+	    (uint64_t)g_ep0.out_dma,
+	    (uint64_t)g_ep0.setup_dma);
+	flush_log();
+
+	{
+		int rc = chiron_depcmd_start(epbase, g_ep0.out_dma, CHIRON_TRB_SETUP);
+
+		print("ep0: arm rc %d DGTYPE %x PAR0 %x PAR1 %x PAR2 %x\n",
+		    (uint64_t)rc,
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(epbase + 12),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(epbase + 8),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(epbase + 4),
+		    (uint64_t)*(volatile uint32_t *)(uintptr_t)(epbase + 0));
+		flush_log();
+		return rc;
+	}
 }
 
 /* Submit a DATA or STATUS stage on the given physical endpoint. */
@@ -3789,6 +3818,32 @@ chiron_ep0_poll(void)
 	adr = *(volatile uint32_t *)(uintptr_t)(d + 0xC400);
 	cnt = *(volatile uint32_t *)(uintptr_t)(d + 0xC40C) & 0xfffcu;
 
+	/*
+	 * Dump the raw ring once.  The decoder keeps seeing device type 3 and consuming 16 bytes for
+	 * it, and the same record keeps coming back, so the width is wrong or the acknowledgement is
+	 * not what the controller expects.  The words themselves settle it:
+	 *
+	 *     quarter 1  low nibble 0x1    -> device event, word 3 = (word >> 8) & 15
+	 *     quarter 1  low nibble 0x0    -> endpoint event
+	 */
+	if (polls == 1 && adr != 0 && cnt != 0) {
+		unsigned n = cnt / 4u;
+		unsigned shown = 0, i;
+
+		if (n > 14) {
+			n = 14;
+		}
+		chiron_invalidate((void *)(uintptr_t)adr, cnt);
+		for (i = 0; i < n; i++) {
+			print("  ringw%x %x\n", (uint64_t)i,
+			    (uint64_t)*(volatile uint32_t *)(uintptr_t)(adr + i * 4u));
+			shown++;
+		}
+		print("ep0: ring dumped %d words of %x bytes\n",
+		    (uint64_t)shown, (uint64_t)cnt);
+		flush_log();
+	}
+
 	if (polls == 1 || polls == 100000) {
 		print("ep0: poll %d adr %x cnt %x\n",
 		    (uint64_t)polls, (uint64_t)adr, (uint64_t)cnt);
@@ -3821,22 +3876,56 @@ chiron_ep0_poll(void)
 		drained++;
 
 		if ((raw & 0xffu) == 1u) {
-			/* device-specific: 4 words */
+			/*
+			 * A device-specific event, 4 words.  Mi 6 handles these in QcomUSBDevice.cpp:314-335
+			 * and the switch is short:
+			 *
+			 *     case 0: disconnect
+			 *     case 1: beginBusReset()          re-arm EP0 for the new session
+			 *     case 2: read DSTS, decode speed, negotiate EP0, connect
+			 *     case 3: link state; 3 = suspend, 0 = resume
+			 *     case 6: suspend
+			 *
+			 * Only 1 and 2 need doing here: 1 re-arms the Setup TRB so the next control transfer
+			 * has somewhere to land, and 2 re-negotiates EP0's packet size and says the device is
+			 * connected.  Without 1 a bus reset leaves EP0 with no armed TRB and the host's
+			 * follow-up requests are lost, which is what the ring has been showing.
+			 */
 			uint32_t kind = (raw >> 8) & 15u;
-			unsigned i;
+			uint32_t param = raw >> 16;
 
 			bytes = 16;
-			for (i = 0; i < 16; i++) {
-				if (said_dev[i] == kind + 1u) {
-					break;
-				}
-				if (said_dev[i] == 0) {
-					said_dev[i] = kind + 1u;
-					print("ep0: devspec type %x param %x\n",
-					    (uint64_t)kind, (uint64_t)(raw >> 16));
-					flush_log();
-					break;
-				}
+			print("ep0: devspec type %x param %x\n", (uint64_t)kind, (uint64_t)param);
+			flush_log();
+
+			if (kind == 1u) {
+				/* bus reset: the controller discarded its TRBs, so arm a fresh one */
+				print("ep0: bus reset, re-arming\n", 0);
+				flush_log();
+				(void)chiron_ep0_arm_setup();
+			} else if (kind == 2u) {
+				/*
+				 * connect: USBDeviceIsochronous.h:11 decodes DSTS & 7.
+				 *   0 = High, 1 or 3 = Full, 4 = Super
+				 */
+				uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(d + 0xC70C);
+				uint32_t spd = dsts & 7u;
+
+				g_ep0.speed = (spd == 0u) ? 0u : ((spd == 4u) ? 2u : 1u);
+				g_ep0.connected = 1;
+				print("ep0: connect DSTS %x spd %x\n",
+				    (uint64_t)dsts, (uint64_t)spd);
+				flush_log();
+				/* the connect follows a reset, so EP0 needs its Setup TRB again */
+				(void)chiron_ep0_arm_setup();
+			} else if (kind == 0u) {
+				g_ep0.connected = 0;
+			} else if (kind == 3u) {
+				/* link state: param & 15, 3 = suspend, 0 = resume */
+				uint32_t link = param & 15u;
+
+				print("ep0: link state %x\n", (uint64_t)link);
+				flush_log();
 			}
 		} else if (raw & 1u) {
 			/* device event, 1 word */
@@ -10535,6 +10624,50 @@ chiron_vbus_override(void)
 	 * HSControl is QSCRATCH + 0x10 = 0xF8810, which is the register this function already had.
 	 * SSControl is QSCRATCH + 0x30 = 0xF8830.
 	 */
+	/*
+	 * CHIRON_VBUS_IS_WHAT_BREAKS_THE_CONNECTION
+	 *
+	 * This block used to write both scratch registers unconditionally, on the argument that
+	 * CONNECTSTAT reads 1 whether or not the PHY drives anything so it cannot be trusted as a
+	 * guard.  The step trace says that is backwards:
+	 *
+	 *     STEP after-resume:  conn 1 lkst 4 spd 1     the port is connected
+	 *     vbus: ss_phy_ctrl 0 -> 1000000              this write
+	 *     STEP after-vbus:    conn 0 lkst 0 spd 0     and now it is not
+	 *
+	 * The connection exists before the write and is gone after it, run after run.  So the guard
+	 * was right and removing it was wrong: only override VBUS when nothing reports a connection,
+	 * which is what the original comment said the function was for.
+	 */
+	/*
+	 * CHIRON_DROP_THE_STALE_CONNECTION_FIRST
+	 *
+	 * Two runs, one difference, and the one without the connection reported has the one the host
+	 * actually talks to:
+	 *
+	 *   guarded (conn 1 kept):  ln 0, evtcnt probe 0 0 0 0, no SOF, host silent
+	 *   unguarded (conn 0):     ln 1, evtcnt probe 58 58 58 58, "sof after-dpup: moved yes"
+	 *
+	 * CONNECTSTAT is a leftover from the fastboot session that handed this loader the port.  The
+	 * controller believes it is still connected to that session, so it never goes through the
+	 * attach sequence a fresh device would, and the host never re-enumerates.  Breaking the
+	 * connection is what makes the host start over -- and that is the only state in which this
+	 * port has ever carried real traffic.
+	 *
+	 * So drop it deliberately rather than skipping the override: clear the VBUS-valid and session
+	 * bits, wait, and let the normal path below bring them back up.
+	 */
+	{
+		uint32_t hs = *(volatile uint32_t *)(uintptr_t)ctrl;
+
+		if ((hs & ((1u << 20) | (1u << 28))) != 0 || (before & (1u << 28)) != 0) {
+			print("vbus: dropping stale conn (hs %x)\n", (uint64_t)hs);
+			*(volatile uint32_t *)(uintptr_t)ctrl = hs & ~((1u << 20) | (1u << 28));
+			__asm__ volatile ("dsb sy" ::: "memory");
+			chiron_udelay(50000);
+		}
+	}
+
 	*(volatile uint32_t *)(uintptr_t)ctrl = value;
 
 	{

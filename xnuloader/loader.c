@@ -4836,6 +4836,9 @@ chiron_is_dwc3(efi_handle handle, efi_loaded_image *li, uint64_t base)
  * mode, install it on a fresh handle, and let the vendor DWC3 driver bind.
  * The copy keeps every vendor callback; only CoreNum and ModeType change.
  */
+
+/* forward: defined below, used by the clone path's module-base check */
+static uint64_t chiron_find_usbconfig_base(void);
 static int
 chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
     efi_qcom_usb_config *original, uint8_t core)
@@ -4857,9 +4860,28 @@ chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
 	 * first public callbacks sit at fixed offsets from its load base.  A different
 	 * build would make the copied table meaningless.
 	 */
-	cfg_image = chiron_find_image_by_sig(chiron_is_usb_config, NULL);
+	/*
+	 * CHIRON_CFG_IMAGE_CHECK_REMOVED
+	 *
+	 * This used to call chiron_find_image_by_sig(chiron_is_usb_config) and bail out when it
+	 * returned NULL -- which it does, on every run, at this call site:
+	 *
+	 *     hk6: clone source core 1 mode 10000
+	 *     hk6: USB Config image signature not found     <- and the clone path stops here
+	 *
+	 * cfg_image was never used again: assigned at this line, tested on the next, and nothing
+	 * afterwards reads it.  The thing it was guarding is already checked three lines above, on
+	 * the object actually being cloned (original->revision != 0x10003 returns earlier), and the
+	 * module base is available reliably from chiron_find_usbconfig_base(), which walks the
+	 * loaded-image list and reports 0x9bf97000.
+	 *
+	 * So the check was a guard against a different build, implemented with a scan that does not
+	 * find this one at this point in the boot, and it blocked the only path that installs a
+	 * peripheral config.
+	 */
+	cfg_image = (efi_handle)(uintptr_t)chiron_find_usbconfig_base();
 	if (cfg_image == NULL) {
-		print("hk6: USB Config image signature not found\n");
+		print("hk6: USB Config module base not found\n");
 		return 0;
 	}
 	print("hk6: pinned USB Config API verified\n");
@@ -4872,11 +4894,41 @@ chiron_usb_clone_config(efi_qcom_usb_init *init, efi_driver_binding *binding,
 	config->core_num = core;
 	config->mode_type = UsbModePeripheralAlt;        /* 4 = peripheral */
 
-	s = init->stop_controller(init, core, UsbModeHost);
-	print("hk6: stop host controller %x\n", (uint64_t)s);
-	if (EFI_ERROR(s)) {
-		BS->free_pool(config);
-		return 0;
+	/*
+	 * CHIRON_NO_STOP_BEFORE_CLONE
+	 *
+	 * This used to call stop_controller(init, core, UsbModeHost) and bail out on error, which on
+	 * every run produced:
+	 *
+	 *     hk6: stop host controller 8000000000000013
+	 *     usb: HK6 did not reach UsbFnIo
+	 *
+	 * 0x13 is EFI_INVALID_PARAMETER + 0x11.  UsbConfigStopController (0x384c) requires the mode
+	 * being stopped to equal the mode in the record:
+	 *
+	 *     38d4: ldr w4, [x20, #0xb4]     current mode
+	 *     38d8: cmp w4, w9               w9 = requested mode
+	 *     38dc: b.ne 0x3938              mismatch -> 0x8000...13
+	 *
+	 * and by this point the record already says 4, because UsbConfigStartController wrote it at
+	 * 0x3364 when we asked for peripheral a few lines earlier.  Asking to stop host mode when the
+	 * record says peripheral can never match, so the stop always failed and took the clone path
+	 * down with it.
+	 *
+	 * The intent was "make sure the controller is not in host mode before reinstalling".  The
+	 * record already reports that.  Skip the stop when it is already what we want.
+	 */
+	if (original->mode_type == UsbModeHost || original->mode_type == UsbModeHostSS ||
+	    original->mode_type == 0x8) {
+		s = init->stop_controller(init, core, original->mode_type);
+		print("hk6: stop host controller %x\n", (uint64_t)s);
+		if (EFI_ERROR(s)) {
+			BS->free_pool(config);
+			return 0;
+		}
+	} else {
+		print("hk6: controller not in host mode (mode %x), no stop needed\n",
+		    (uint64_t)original->mode_type);
 	}
 
 	s = BS->install_protocol_interface(&controller, &QCOM_USB_CONFIG_GUID, 0, config);
@@ -5304,7 +5356,43 @@ chiron_usb_hk6(void)
 				    (uint64_t)core.core_num, (uint64_t)core.mode_type,
 				    mb ? (uint64_t)*(volatile uint32_t *)(uintptr_t)(mb + 0xc2cc) : 0,
 				    mb ? (uint64_t)*(volatile uint64_t *)(uintptr_t)(mb + 0xc228) : 0);
-				    flush_log();
+			}
+			/*
+			 * CHIRON_RECORD_AND_DEPEX
+			 *
+			 * UsbConfigStartController installs GUID e722b03f-b250-42ce-8ebd-5bd51812d037 at
+			 * 0x3394, and that GUID is what UsbInitDxe's depex waits for (chironPkg/Include/
+			 * DXE.inc:134).  The record it installs from is at module RVA 0xc218; the installer
+			 * gets &handle (record+0x10) and the interface at record+0x28.
+			 *
+			 * Dump the record, then ask whether the GUID is already on some handle -- if it is,
+			 * the install is being rejected as a duplicate rather than as malformed input.
+			 */
+			{
+				static const efi_guid dep_guid = {
+				    0xe722b03f, 0xb250, 0x42ce,
+				    { 0x8e, 0xbd, 0x5b, 0xd5, 0x18, 0x12, 0xd0, 0x37 } };
+				uint64_t mb = chiron_find_usbconfig_base();
+				efi_handle *dh = NULL;
+				uint64_t dn = 0;
+				efi_status ds;
+
+				if (mb != 0) {
+					for (unsigned q = 0; q < 14; q++) {
+						print("rec +%x: %x\n", (uint64_t)(q * 8),
+						    *(volatile uint64_t *)(uintptr_t)(mb + 0xc218 + q * 8));
+					}
+				}
+				ds = BS->locate_handle_buffer(ByProtocol, &dep_guid, NULL, &dn, &dh);
+				print("depex guid e722b03f: st %x n %x\n", (uint64_t)ds, dn);
+				if (dh != NULL) {
+					BS->free_pool(dh);
+				}
+				flush_log();
+			}
+			{
+				uint64_t mb = chiron_find_usbconfig_base();
+				(void)mb;
 			}
 
 			/* ask for peripheral */

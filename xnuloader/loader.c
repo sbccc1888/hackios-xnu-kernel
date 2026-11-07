@@ -1124,8 +1124,37 @@ reboot(void)
 	 */
 	if (auto_reboot || !halt_instead) {
 		print("\n== REBOOTING to Android; the log is in the partition ==\n");
-		BS->stall(500000);
-		ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+		flush_log();
+
+		/*
+		 * CHIRON_RESET_NEEDS_A_NULL_CHECK
+		 *
+		 * This dereferenced ST->rt->reset_system without checking anything, and with the standard
+		 * fastboot modules built into the firmware that call now faults:
+		 *
+		 *     UEFI EXCEPTION elr=a1012c10 esr=f2000001 far=0
+		 *     loader image base a1000000 (elr offset 12c10)
+		 *
+		 * and a1012c10 disassembles to a single 'brk #0x1' reached by
+		 *
+		 *     a1012bcc: ldr  x8, [x8]            x8 = SystemTable
+		 *     a1012bdc: ldr  x8, [x8, #0x58]    x8 = SystemTable->RuntimeServices
+		 *     a1012bf0: ldr  x4, [x8, #0x68]    x4 = RuntimeServices->ResetSystem
+		 *     a1012bfc: br   x4                 x4 was not a function
+		 *
+		 * chiron_reset_notify already guards this call; reboot() did not.  Use the same PSCI path
+		 * the notify uses first, and only fall back to the runtime service when it is actually
+		 * there.
+		 */
+		{
+			register uint64_t x0 __asm__("x0") = 0x84000009ULL;   /* PSCI SYSTEM_RESET */
+
+			__asm__ volatile ("smc #0" : "+r"(x0) :: "x1", "x2", "x3", "memory");
+		}
+		if (ST != NULL && ST->rt != NULL && ST->rt->reset_system != NULL) {
+			ST->rt->reset_system(0 /* EfiResetCold */, 0, 0, NULL);
+		}
+		print("\n== reset_system unavailable; halting ==\n");
 	}
 	print("\n== HALTED (halt=1) ==\n");
 	for (;;) {
@@ -9739,7 +9768,7 @@ chiron_usbfn_endpoints(void)
 		}
 
 		if (dbase != 0) {
-			uint64_t cached = *(volatile uint64_t *)(uintptr_t)(dbase + 0xa410);
+			uint64_t cached = *(volatile uint64_t *)(uintptr_t)(dbase + 0xa328);
 
 			print("startex: dev %x cached %x ours %x\n",
 			    dbase, cached, (uint64_t)(uintptr_t)fn);
@@ -9884,9 +9913,55 @@ chiron_usbfn_endpoints(void)
 	 * entry expects to receive.  Reverted.  self stays the UsbFnIo the driver handed out, which at
 	 * least returns a status instead of hanging.
 	 */
-	if (fn->configure_enable_endpoints_ex != NULL) {
-		efi_status ex_null = ((efi_status (EFIAPI *)(efi_usbfn_io *, void *, void *, void *))
-		    fn->configure_enable_endpoints_ex)(fn, &dev_info, NULL,
+	/*
+	 * CHIRON_RUN_USBDEVICEDXE_START
+	 *
+	 * The probe printed 'limit 0' because the object that owns +0x220 has never been
+	 * initialised, and the reason is that UsbDeviceDxe's driver-binding Start never ran.
+	 * Mi 6 makes it run the ordinary way -- ConnectController on the config handle, after
+	 * writing Mode = 4 (QcomFastboot ConnectPeripheral) -- and that Start is what fills the
+	 * structure in.  Its code, at module+0x200c:
+	 *
+	 *     adrp x20, 0xa000
+	 *     add  x20, x20, #0x140        the module's own object
+	 *     str  x0, [x20, #0x1e8]       object->0x1e8 = the UsbFnIo it was given
+	 *     orr  w9, wzr, #0x4000
+	 *     str  x9, [x20, #0x220]       object->0x220 = 0x4000, the descriptor buffer size
+	 *     ldr  x10, [x0, #0x60]
+	 *     blr  x10                     and then fn->fn[0x60]
+	 *
+	 * ConnectController here does not reach it, so call it directly with the UsbFnIo.  Note the
+	 * earlier probe read module+0xa410 for that back-pointer; the field is at 0xa140+0x1e8 =
+	 * 0xa328, so it always reported 0 and the measurement was misleading.
+	 */
+	if (chiron_usbdevice_base() != 0) {
+		uint64_t db = chiron_usbdevice_base();
+		uint64_t obj = db + 0xa140;
+		uint64_t before220 = *(volatile uint64_t *)(uintptr_t)(obj + 0x220);
+		uint64_t before1e8 = *(volatile uint64_t *)(uintptr_t)(obj + 0x1e8);
+
+		print("devstart: obj %x | 1e8 %x 220 %x before\n",
+		    obj, before1e8, before220);
+		flush_log();
+
+		/* only once: repeated calls re-run fn[0x60] against a live controller */
+		if (before220 != 0x4000ull) {
+			typedef efi_status (EFIAPI *chiron_devstart_fn)(void *);
+			chiron_devstart_fn ds = (chiron_devstart_fn)(uintptr_t)(db + 0x200c);
+			efi_status dst = ds((void *)(uintptr_t)fn);
+
+			print("devstart: called -> %x | 1e8 %x 220 %x after\n",
+			    (uint64_t)dst,
+			    (uint64_t)*(volatile uint64_t *)(uintptr_t)(obj + 0x1e8),
+			    (uint64_t)*(volatile uint64_t *)(uintptr_t)(obj + 0x220));
+			flush_log();
+		}
+	}
+
+	if (fn->configure_enable_endpoints_ex != NULL && chiron_usbdevice_base() != 0) {
+		uint64_t obj = chiron_usbdevice_base() + 0xa140;
+		efi_status ex_null = ((efi_status (EFIAPI *)(void *, void *, void *, void *))
+		    fn->configure_enable_endpoints_ex)((void *)(uintptr_t)obj, &dev_info, NULL,
 		    (void *)usb_ss_capability);
 		print("usbfn: ConfigureEnableEndpoints_ex(NULL ss) %x\n", (uint64_t)ex_null);
 

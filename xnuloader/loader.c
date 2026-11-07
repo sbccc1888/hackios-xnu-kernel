@@ -4322,8 +4322,30 @@ chiron_ep0_poll(void)
 			flush_log();
 
 			if (kind == 1u) {
+				/*
+				 * CHIRON_BUS_RESET_DISOWNS_THE_ARM
+				 *
+				 * A bus reset resets the device side of the controller: the address goes back to 0
+				 * and the endpoints are torn down by hardware.  So the TRB that was armed before
+				 * the reset no longer exists, and asking for an End for it is asking about a
+				 * transfer that is already gone.
+				 *
+				 * That is not free.  arm_setup() takes the armed path, issues End, and then waits
+				 * out its bounded poll for a completion that can never arrive:
+				 *
+				 *     ep0: bus reset, re-arming
+				 *     ep0: end event 0 after 500 polls        <- 500 x 10 us
+				 *
+				 * and during those five milliseconds the host has already sent its first SETUP --
+				 * it allows roughly one millisecond before it gives up and resets the bus again,
+				 * which is the reset/disconnect/reconnect cycle the raw dump shows over and over.
+				 *
+				 * Clear the flag first, so the re-arm is the plain path: write the TRB, clean it,
+				 * Start.  Nothing to end, nothing to wait for.
+				 */
 				print("ep0: bus reset, re-arming\n", 0);
 				flush_log();
+				g_ep0.armed = 0;
 				(void)chiron_ep0_arm_setup();
 			} else if (kind == 2u) {
 				uint32_t dsts = *(volatile uint32_t *)(uintptr_t)(d + 0xC70C);
@@ -4334,6 +4356,9 @@ chiron_ep0_poll(void)
 				print("ep0: connect DSTS %x spd %x\n",
 				    (uint64_t)dsts, (uint64_t)spd);
 				flush_log();
+				/* same reasoning as the bus reset: connect comes after a reset, so the
+				 * previous arm is gone and an End for it would only cost the poll. */
+				g_ep0.armed = 0;
 				(void)chiron_ep0_arm_setup();
 			} else if (kind == 0u) {
 				g_ep0.connected = 0;

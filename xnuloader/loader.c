@@ -11483,13 +11483,25 @@ usb_start(void)
 			if (usb_dev_handle != NULL &&
 			    !EFI_ERROR(BS->handle_protocol(usb_dev_handle, &fg, (void **)&cur)) &&
 			    cur != NULL) {
-				print("usbfn: before start_ex handle gives %x, our copy is %x (%s)\n",
-				    (uint64_t)(uintptr_t)cur, (uint64_t)(uintptr_t)USB,
-				    (cur == USB) ? "same" : "DIFFERENT");
+				/*
+				 * cur is the usbfn_io on the handle.  Build the shim from it, never from USB:
+				 * USB is a usb_device_protocol, and installing that here was the second half of
+				 * the aliasing described above.  Compare against the shim instead, so the
+				 * "same" case means the copy is already in place.
+				 */
+				efi_usbfn_io *want = usbfn_with_sdp_detect(cur);
+				efi_status rs;
 
-				if (cur != USB) {
-					efi_status rs = BS->reinstall_protocol_interface(usb_dev_handle,
-					    &fg, cur, USB);
+				if (want == NULL) {
+					want = cur;
+				}
+				print("usbfn: before start_ex handle gives %x, shim %x (%s)\n",
+				    (uint64_t)(uintptr_t)cur, (uint64_t)(uintptr_t)want,
+				    (cur == want) ? "same" : "DIFFERENT");
+
+				if (cur != want) {
+					rs = BS->reinstall_protocol_interface(usb_dev_handle,
+					    &fg, cur, want);
 
 					print("usbfn: reinstall %x\n", (uint64_t)rs);
 

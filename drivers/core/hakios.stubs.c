@@ -71,6 +71,7 @@ void hakios_ddr_quiesce(void) {}
 
 #ifndef HAKIOS_ADRENO
 void hakios_adreno_init(void) {}
+void hakios_adreno_a540(void) {}
 void hakios_adreno_quiesce(void) {}
 void hakios_adreno_stop(void) {}
 void hakios_adreno_minute(void) {}

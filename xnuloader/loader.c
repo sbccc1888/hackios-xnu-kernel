@@ -12832,6 +12832,24 @@ usb_start(void)
 				if (starts_with(c, "wdt=1")) {
 					usb_wdt_enable = 1;
 				}
+				/*
+				 * CHIRON_FORCE_SDP_WAS_NEVER_WIRED
+				 *
+				 * usb_force_sdp_off is declared (11858) and read three times, but nothing ever set
+				 * it -- the switch the comment describes ("usb_force_sdp=0 turns it off for
+				 * comparison") did not exist in the parser.  So usbfn_with_sdp_detect() always ran,
+				 * and on the P5 run the boot stopped inside it:
+				 *
+				 *     shimtrace: enter orig 9bd40020 g_orig 9bd40020 done 0
+				 *     (nothing further; the APSS watchdog ended the run)
+				 *
+				 * The shim only rewrites detect_port so the driver reports a standard downstream
+				 * port.  That is a nicety, and it is not worth a call that can wedge the boot.
+				 * Wire the switch, so the shim can be skipped and the landing point measured again.
+				 */
+				if (starts_with(c, "usb_force_sdp=0")) {
+					usb_force_sdp_off = 1;
+				}
 				if (starts_with(c, "usb_no_start_ex=1")) {
 					usb_no_start_ex = 1;
 					c += 16;
